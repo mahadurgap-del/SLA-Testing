@@ -792,15 +792,17 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
     }
   }
 
-  // 2. is the TEST traffic actually crossing the overlay links? Measuring on
-  // the netem VM's candidate link NICs is the authoritative signal — the
-  // spoke's aggregate counters also count mgmt/SSH noise and false-positive.
-  if (cfg.netemCandidates.length) {
+  // 2. is the TEST traffic actually crossing the netem links? Measuring on
+  // the netem VM's NICs is the authoritative signal — the spoke's aggregate
+  // counters also count mgmt/SSH noise and give false results both ways.
+  if (cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath)) {
+    const scope = cfg.netemCandidates.length
+      ? cfg.netemCandidates.join("/") : "auto-detected netem NICs";
     for (let i = 1; i <= attempts; i++) {
       if (isAborted()) throw new Error("aborted by user during traffic verification");
       const best = await netemCandidatePps(cfg, sampleSeconds);
       log(`traffic check ${i}/${attempts}: ${best.pps} pps on netem link ` +
-          `${best.iface ?? "(none)"} (threshold ${cfg.trafficMinPps} pps)`);
+          `${best.iface ?? "(none)"} (threshold ${cfg.trafficMinPps} pps, scope: ${scope})`);
       if (best.pps >= cfg.trafficMinPps) {
         log(`traffic confirmed flowing over ${best.iface}`);
         setStatus({ trafficVerified: best.pps });
@@ -809,15 +811,15 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
     }
     const c2 = sshHandles ? await checkTrafficClient(cfg, sshHandles) : null;
     throw new Error(
-      `traffic is NOT crossing the overlay links (below ${cfg.trafficMinPps} pps on ` +
-      `${cfg.netemCandidates.join("/")} after ${attempts} checks). Check the traffic ` +
+      `traffic is NOT crossing the netem links (below ${cfg.trafficMinPps} pps on ` +
+      `${scope} after ${attempts} checks). Check the traffic ` +
       `destination is the server's DATA-plane IP, not its mgmt IP.` +
       (c2?.tail ? ` Client output: ${c2.tail}` : ""));
   }
 
-  // fallback (no candidate list): aggregate byte rate on the spoke
-  log("WARN: NETEM_CANDIDATE_IFACES not set — falling back to spoke byte counters " +
-      "(weak signal, can false-positive on mgmt traffic)");
+  // fallback (no netem VM SSH access): aggregate byte rate on the spoke
+  log("WARN: no netem VM SSH access — falling back to spoke byte counters " +
+      "(weak signal, can misreport in both directions)");
   const conn = await sshConnect(cfg.spoke);
   try {
     for (let i = 1; i <= attempts; i++) {
@@ -992,15 +994,20 @@ async function checkTrafficClient(cfg, handles) {
   }
 }
 
-/** Peak pps across the netem VM's candidate link interfaces over one sample. */
+/** Peak pps across the netem VM's link interfaces (candidate list if set,
+ *  otherwise every non-lo/non-bridge/non-excluded NIC) over one sample. */
 async function netemCandidatePps(cfg, sampleSeconds = 5) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
     const a = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
     await sleep(sampleSeconds * 1000);
     const b = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    const ifaces = cfg.netemCandidates.length
+      ? cfg.netemCandidates
+      : Object.keys(b).filter((i) =>
+          i !== "lo" && !i.startsWith("br") && !cfg.netemExclude.includes(i));
     let best = { iface: null, pps: 0 };
-    for (const iface of cfg.netemCandidates) {
+    for (const iface of ifaces) {
       if (!a[iface] || !b[iface]) continue;
       const pps = Math.round(
         (b[iface].rxPkts - a[iface].rxPkts + b[iface].txPkts - a[iface].txPkts) / sampleSeconds);
@@ -1012,8 +1019,10 @@ async function netemCandidatePps(cfg, sampleSeconds = 5) {
   }
 }
 
-/** Stop SSH-driven traffic on both ends; downloads the tool logs into destDir. */
+/** Stop SSH-driven traffic on both ends; downloads the tool logs into destDir.
+ *  Returns the list of locally saved log files. */
 async function stopTrafficViaSsh(cfg, traffic, handles, destDir) {
+  const saved = [];
   for (const [side, creds, pid, cmd, logName] of [
     ["client", cfg.clientSsh, handles?.clientPid, traffic.clientCmd, "sla_traffic_client.log"],
     ["server", cfg.serverSsh, handles?.serverPid, traffic.serverCmd, "sla_traffic_server.log"],
@@ -1028,7 +1037,9 @@ async function stopTrafficViaSsh(cfg, traffic, handles, destDir) {
         log(`traffic ${side} stopped on ${creds.host}`);
         if (destDir) {
           try {
-            await sftpGet(conn, `/tmp/${logName}`, path.join(destDir, logName));
+            const localPath = path.join(destDir, logName);
+            await sftpGet(conn, `/tmp/${logName}`, localPath);
+            saved.push(localPath);
           } catch { /* log file may not exist */ }
         }
       } finally {
@@ -1038,6 +1049,7 @@ async function stopTrafficViaSsh(cfg, traffic, handles, destDir) {
       log(`WARN: stopping traffic ${side} failed: ${e.message}`);
     }
   }
+  return saved;
 }
 
 /* ========================================================================= *
@@ -1065,10 +1077,22 @@ function parsePacketCounters(text) {
  * NETEM_CANDIDATE_IFACES="ens192,ens193"); otherwise lo, bridges, and
  * cfg.netemExclude are skipped. Returns {iface, pps, table}.
  */
+/** Parse `ip -o link show` output into {iface: masterBridge}. */
+function parseIfaceMasters(text) {
+  const masters = {};
+  for (const line of String(text).split("\n")) {
+    const m = line.match(/^\d+:\s+([^:@\s]+)[@:]?.*?\smaster\s+(\S+)/);
+    if (m) masters[m[1]] = m[2];
+  }
+  return masters;
+}
+
 async function detectActiveLink(cfg, sampleSeconds = 3) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
     const a = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    // bridge membership: two legs of the same bridge are the SAME link
+    const masters = parseIfaceMasters((await sshExec(conn, "ip -o link show")).stdout);
     await sleep(sampleSeconds * 1000);
     const b = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
     const table = [];
@@ -1081,13 +1105,16 @@ async function detectActiveLink(cfg, sampleSeconds = 3) {
       }
       const ca = a[iface] ?? { rxPkts: 0, txPkts: 0 };
       const pps = Math.round((cb.rxPkts - ca.rxPkts + cb.txPkts - ca.txPkts) / sampleSeconds);
-      table.push({ iface, pps });
+      table.push({ iface, pps, master: masters[iface] ?? null });
     }
     table.sort((x, y) => y.pps - x.pps);
     if (!table.length) throw new Error("no candidate interfaces found on the netem VM");
-    for (const row of table.slice(0, 6)) log(`  ${row.iface.padEnd(12)} ${row.pps} pps`);
+    for (const row of table.slice(0, 6)) {
+      log(`  ${row.iface.padEnd(12)} ${String(row.pps).padStart(6)} pps${row.master ? `  (bridge ${row.master})` : ""}`);
+    }
     const active = table[0];
-    log(`active link on netem VM: ${active.iface} (${active.pps} pps)`);
+    log(`active link on netem VM: ${active.iface} (${active.pps} pps` +
+        `${active.master ? `, bridge ${active.master}` : ""})`);
     return { ...active, table };
   } finally {
     conn.end();
@@ -1226,7 +1253,15 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
     if (cfg.netemCandidates.length === 2) {
       other = cfg.netemCandidates.find((i) => i !== det.iface) || null;
     } else if (det.table.length >= 2) {
-      other = det.table[1].iface;
+      // the standby link must be on a DIFFERENT bridge — the second-busiest
+      // NIC is usually just the other leg of the active bridge
+      const differentBridge = det.table.find(
+        (r) => r.iface !== det.iface && (r.master ?? r.iface) !== (det.master ?? det.iface));
+      other = differentBridge ? differentBridge.iface : det.table[1].iface;
+      if (!differentBridge) {
+        log("WARN: no NIC on a different bridge found — standby pick may be the " +
+            "active link's other leg; set NETEM_CANDIDATE_IFACES to be safe");
+      }
     }
     if (other) {
       await applyNetemImpairment(cfg, other, { delayMs: lo });
@@ -1462,6 +1497,38 @@ async function collectHourlogSnapshot(creds, destDir, tag) {
   }
 }
 
+/** End-of-test evidence collection from spoke and hub (DMTS logs + diag
+ *  packs). Also runs for early-failed cases so failures are analyzable. */
+async function collectEndOfTest(cfg, browser, tcName, result, spokeDir, hubDir) {
+  for (const [label, creds, dir] of [
+    ["spoke", cfg.spoke, spokeDir],
+    ["hub", cfg.hub, hubDir],
+  ]) {
+    setStatus({ collection: { ...status.collection, [label]: "collecting" } });
+    try {
+      const logs = await withRetry(() => collectDmtsLogs(creds, dir, label, tcName),
+        { label: `${label} DMTS log collection`, attempts: 2 });
+      result.artifacts[label].push(...logs);
+      setStatus({ collection: { ...status.collection, [label]: "logs done" } });
+    } catch (e) {
+      result.errors.push(`${label} DMTS logs: ${e.message}`);
+      setStatus({ collection: { ...status.collection, [label]: "logs FAILED" } });
+      log(`ERROR: ${e.message}`);
+    }
+    try {
+      const pack = await collectDiagPack(cfg, browser, label, dir, tcName);
+      if (pack) {
+        result.artifacts[label].push(pack);
+        setStatus({ collection: { ...status.collection, [label]: "done" } });
+      }
+    } catch (e) {
+      result.errors.push(`${label} diag pack: ${e.message}`);
+      setStatus({ collection: { ...status.collection, [label]: "diag FAILED" } });
+      log(`ERROR: ${e.message}`);
+    }
+  }
+}
+
 /* ========================================================================= *
  * Run metadata
  * ========================================================================= */
@@ -1533,7 +1600,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     switches: [],
     switchObserved: false,
     expectSwitch: tc.expectSwitch,
-    artifacts: { spoke: [], hub: [] },
+    artifacts: { spoke: [], hub: [], traffic: [] },
     screenshots: [],
     errors: [],
     result: "FAIL",
@@ -1562,8 +1629,12 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     else await startTrafficViaUi(page, cfg, traffic);
   };
   const stopTraffic = async () => {
-    if (cfg.trafficDriver === "ssh") await stopTrafficViaSsh(cfg, traffic, sshHandles, tcDir);
-    else await stopTrafficViaUi(page);
+    if (cfg.trafficDriver === "ssh") {
+      const logs = await stopTrafficViaSsh(cfg, traffic, sshHandles, tcDir);
+      if (logs?.length) result.artifacts.traffic.push(...logs);
+    } else {
+      await stopTrafficViaUi(page);
+    }
   };
 
   await startTraffic();
@@ -1574,8 +1645,12 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     result.errors.push(e.message);
     await shot("99_traffic_not_flowing");
     try { await stopTraffic(); } catch (e2) { result.errors.push(`stop traffic: ${e2.message}`); }
+    // still collect DMTS evidence so a failed case can be analyzed
+    log(`${tc.name} failed traffic verification — collecting logs for evidence anyway`);
+    await collectEndOfTest(cfg, browser, tc.name, result, spokeDir, hubDir);
     result.endTime = new Date().toISOString();
-    fs.writeFileSync(path.join(tcDir, "observations.txt"), observationsText(result));
+    result.observationsFile = path.join(tcDir, "observations.txt");
+    fs.writeFileSync(result.observationsFile, observationsText(result));
     log(`${tc.name} FAILED EARLY: ${e.message}`);
     return result;
   }
@@ -1635,33 +1710,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     return result;
   }
 
-  for (const [label, creds, dir] of [
-    ["spoke", cfg.spoke, spokeDir],
-    ["hub", cfg.hub, hubDir],
-  ]) {
-    setStatus({ collection: { ...status.collection, [label]: "collecting" } });
-    try {
-      const logs = await withRetry(() => collectDmtsLogs(creds, dir, label, tc.name),
-        { label: `${label} DMTS log collection`, attempts: 2 });
-      result.artifacts[label].push(...logs);
-      setStatus({ collection: { ...status.collection, [label]: "logs done" } });
-    } catch (e) {
-      result.errors.push(`${label} DMTS logs: ${e.message}`);
-      setStatus({ collection: { ...status.collection, [label]: "logs FAILED" } });
-      log(`ERROR: ${e.message}`);
-    }
-    try {
-      const pack = await collectDiagPack(cfg, browser, label, dir, tc.name);
-      if (pack) {
-        result.artifacts[label].push(pack);
-        setStatus({ collection: { ...status.collection, [label]: "done" } });
-      }
-    } catch (e) {
-      result.errors.push(`${label} diag pack: ${e.message}`);
-      setStatus({ collection: { ...status.collection, [label]: "diag FAILED" } });
-      log(`ERROR: ${e.message}`);
-    }
-  }
+  await collectEndOfTest(cfg, browser, tc.name, result, spokeDir, hubDir);
 
   result.endTime = new Date().toISOString();
   result.result =
@@ -1801,7 +1850,7 @@ function writeHtmlReport(baseDir, results, meta) {
           `<li><b>${escapeHtml(offsetStr(r.startTime, ev.t))}</b> — ${escapeHtml(ev.event)} ` +
           `on ${escapeHtml(ev.iface)}</li>`).join("") + `</ol>`
       : "";
-    const artifacts = [...r.artifacts.spoke, ...r.artifacts.hub].map((p) =>
+    const artifacts = [...r.artifacts.spoke, ...r.artifacts.hub, ...(r.artifacts.traffic ?? [])].map((p) =>
       `<li><a href="${escapeHtml(rel(p))}">${escapeHtml(path.basename(p))}</a></li>`).join("")
       || "<li>(none)</li>";
     const shots = r.screenshots.map((p) =>
@@ -1965,7 +2014,7 @@ function buildStorageBody(results, meta) {
     "<th>Switch observed</th><th>Switch time</th><th>Artifacts</th><th>Result</th></tr>";
   const rows = results
     .map((r) => {
-      const artifacts = [...r.artifacts.spoke, ...r.artifacts.hub]
+      const artifacts = [...r.artifacts.spoke, ...r.artifacts.hub, ...(r.artifacts.traffic ?? [])]
         .map((p) => `<ac:link><ri:attachment ri:filename="${escapeXml(path.basename(p))}"/></ac:link>`)
         .join("<br/>") || "-";
       return (
@@ -2046,7 +2095,7 @@ function buildCaseSection(r) {
     `<h4>Artifacts</h4><ul>` +
     artifactChecklist(r).map(([name, ok]) => `<li>${ok ? "&#10003;" : "&#10007;"} ${escapeXml(name)}</li>`).join("") +
     `</ul><p>` +
-    [...r.artifacts.spoke, ...r.artifacts.hub]
+    [...r.artifacts.spoke, ...r.artifacts.hub, ...(r.artifacts.traffic ?? [])]
       .map((p) => `<ac:link><ri:attachment ri:filename="${escapeXml(path.basename(p))}"/></ac:link>`)
       .join(" &nbsp; ") +
     `</p>`;
@@ -2129,12 +2178,13 @@ async function publishToConfluence(conf, results, meta, extraFiles = []) {
   }
 
   const files = [
-    ...results.flatMap((r) => [...r.artifacts.spoke, ...r.artifacts.hub, ...r.screenshots]),
+    ...results.flatMap((r) => [...r.artifacts.spoke, ...r.artifacts.hub, ...(r.artifacts.traffic ?? []), ...r.screenshots]),
     ...extraFiles,
   ];
   // generic filenames (observations.txt, report.html, ...) collide across
   // TC folders/modes — prefix them with their parent directory name
-  const GENERIC = ["observations.txt", "summary.json", "summary.md", "report.html"];
+  const GENERIC = ["observations.txt", "summary.json", "summary.md", "report.html",
+    "sla_traffic_client.log", "sla_traffic_server.log"];
   const uploadName = (f) => {
     const b = path.basename(f);
     return GENERIC.includes(b) ? `${path.basename(path.dirname(f))}_${b}` : b;
@@ -2495,7 +2545,7 @@ module.exports = {
   parsePort, parsePosInt, parseConfPageId, confApiBase, resolveConfApiBase,
   // traffic generation + interface discovery
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
-  checkTrafficClient, netemCandidatePps,
+  checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
   runPacketLossSchedule, applyLatencyViaTc, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
