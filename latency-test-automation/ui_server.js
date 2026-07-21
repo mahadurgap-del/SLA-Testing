@@ -192,6 +192,12 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (req.method === "POST" && url.pathname === "/api/stop") {
+      if (!running) return json(res, 409, { ok: false, error: "no run in progress" });
+      engine.requestAbort("stopped from the panel");
+      return json(res, 200, { ok: true });
+    }
+
     if (req.method === "POST" && url.pathname === "/api/start") {
       if (running) {
         return json(res, 409, { ok: false, errors: { _global: "a run is already in progress" } });
@@ -261,6 +267,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
   button { padding:8px 18px; font-size:14px; font-weight:600; border:0; border-radius:7px; background:#1d4ed8; color:#fff; cursor:pointer; }
   button.small { padding:4px 10px; font-size:12px; }
   button.grey { background:#64748b; }
+  button.red { background:#dc2626; }
   button:disabled { background:#94a3b8; cursor:not-allowed; }
   .panel { border:1px solid var(--line); border-radius:8px; padding:14px; margin-bottom:14px; }
   .stat { display:grid; grid-template-columns: 190px 1fr; gap:6px 10px; font-size:14px; }
@@ -391,6 +398,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
 
   <div class="errmsg" id="globalerr"></div>
   <button id="start" type="submit">Start Test</button>
+  <button id="stop" type="button" class="red" disabled>Stop</button>
 </form>
 
 <div>
@@ -478,7 +486,15 @@ function render(running, s) {
     '<span class="badge ' + (r.result === "PASS" ? "pass" : "fail") + '">' + r.name + " " + r.result + "</span>").join("") || "—";
   if (s.error) $("globalerr").textContent = s.error;
   startBtn.disabled = running;
+  $("stop").disabled = !running;
 }
+$("stop").addEventListener("click", async () => {
+  if (!confirm("Stop the current test run? Traffic is stopped and netem impairments " +
+               "are cleared; remaining test cases are skipped.")) return;
+  $("stop").disabled = true;
+  const out = await (await fetch("/api/stop", { method: "POST" })).json();
+  if (!out.ok) $("globalerr").textContent = out.error;
+});
 const es = new EventSource("/api/events");
 es.addEventListener("status", (e) => { const { running, status } = JSON.parse(e.data); render(running, status); });
 es.addEventListener("log", (e) => {

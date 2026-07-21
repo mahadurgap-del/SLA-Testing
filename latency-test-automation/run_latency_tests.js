@@ -109,6 +109,26 @@ function getStatus() {
   return { ...status, collection: { ...status.collection } };
 }
 
+/* --- user-requested abort (Stop button / Ctrl+C) --- */
+const abortState = { requested: false, reason: null };
+
+function requestAbort(reason = "stopped by user") {
+  if (abortState.requested) return;
+  abortState.requested = true;
+  abortState.reason = reason;
+  log(`ABORT requested: ${reason} — finishing up (traffic stop + netem cleanup)`);
+  bus.emit("status", getStatus());
+}
+
+function isAborted() {
+  return abortState.requested;
+}
+
+function clearAbort() {
+  abortState.requested = false;
+  abortState.reason = null;
+}
+
 /* ========================================================================= *
  * Logging + retry
  * ========================================================================= */
@@ -686,7 +706,7 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch) {
   let file = await newestHourlogFile(conn);
   log(`monitoring hourlog ${file ?? "(none yet)"} for ${Math.round(durationMs / 1000)}s`);
 
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !isAborted()) {
     try {
       const current = await newestHourlogFile(conn);
       if (current && current !== file) {
@@ -777,6 +797,7 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
   // spoke's aggregate counters also count mgmt/SSH noise and false-positive.
   if (cfg.netemCandidates.length) {
     for (let i = 1; i <= attempts; i++) {
+      if (isAborted()) throw new Error("aborted by user during traffic verification");
       const best = await netemCandidatePps(cfg, sampleSeconds);
       log(`traffic check ${i}/${attempts}: ${best.pps} pps on netem link ` +
           `${best.iface ?? "(none)"} (threshold ${cfg.trafficMinPps} pps)`);
@@ -800,6 +821,7 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
   const conn = await sshConnect(cfg.spoke);
   try {
     for (let i = 1; i <= attempts; i++) {
+      if (isAborted()) throw new Error("aborted by user during traffic verification");
       const before = await ifaceByteTotals(conn);
       await sleep(sampleSeconds * 1000);
       const after = await ifaceByteTotals(conn);
@@ -1102,12 +1124,14 @@ async function clearNetemImpairment(cfg, iface) {
   }
 }
 
-/** Sleep, but never past the deadline. */
+/** Sleep, but never past the deadline — and wake early on abort. */
 async function sleepWithin(deadline, ms) {
-  const remain = deadline - Date.now();
-  if (remain <= 0) return false;
-  await sleep(Math.min(ms, remain));
-  return Date.now() < deadline;
+  const end = Math.min(deadline, Date.now() + ms);
+  while (Date.now() < end) {
+    if (isAborted()) return false;
+    await sleep(Math.min(2000, end - Date.now()));
+  }
+  return Date.now() < deadline && !isAborted();
 }
 
 const randInt = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
@@ -1136,7 +1160,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     // increasing loss (and possibly returning) is exactly what we measure.
     const { iface } = await detectActiveLink(cfg);
     let pct = 0;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !isAborted()) {
       pct += s.rampStepPct;
       await applyNetemImpairment(cfg, iface, { lossPct: pct });
       impairedIfaces.add(iface);
@@ -1144,7 +1168,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       if (!(await sleepWithin(deadline, s.rampIntervalSec * 1000))) break;
     }
   } else if (plType === "burst") {
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !isAborted()) {
       const { iface } = await detectActiveLink(cfg);
       await applyNetemImpairment(cfg, iface, { lossPct: s.burstLossPct });
       impairedIfaces.add(iface);
@@ -1156,7 +1180,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
         Math.max(1, s.burstIntervalSec - s.burstDurationSec) * 1000))) break;
     }
   } else if (plType === "random") {
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !isAborted()) {
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
       const { iface } = await detectActiveLink(cfg);
@@ -1599,6 +1623,17 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     log(`WARN: failed to stop traffic: ${e.message}`);
   }
   await shot("04_test_complete");
+
+  // aborted: clean exit without the (slow) end-of-test collection
+  if (isAborted()) {
+    result.errors.push("aborted by user");
+    result.endTime = new Date().toISOString();
+    result.result = "ABORTED";
+    result.observationsFile = path.join(tcDir, "observations.txt");
+    fs.writeFileSync(result.observationsFile, observationsText(result));
+    log(`${tc.name} ABORTED (switches so far: ${result.switches.length})`);
+    return result;
+  }
 
   for (const [label, creds, dir] of [
     ["spoke", cfg.spoke, spokeDir],
@@ -2137,6 +2172,7 @@ async function runSuite(cfg, params) {
   const tcFilter = parseTcChoice(params.tcChoice);
   const durationMs = parseDuration(params.durationSec) * 1000;
 
+  clearAbort();
   await preflight(cfg);
 
   const meta = await collectRunMetadata(cfg, traffic.type, traffic.tos);
@@ -2168,6 +2204,10 @@ async function runSuite(cfg, params) {
 
       const results = [];
       for (const [i, tc] of cases.entries()) {
+        if (isAborted()) {
+          log(`skipping ${tc.name} — run aborted`);
+          continue;
+        }
         setStatus({ caseIndex: i + 1 });
         try {
           const r = await runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs);
@@ -2211,9 +2251,11 @@ async function runSuite(cfg, params) {
   }
 
   const failed = allResults.filter((r) => r.result !== "PASS");
-  log(`run complete: ${allResults.length - failed.length}/${allResults.length} PASS` +
-      (failed.length ? ` — failed: ${failed.map((r) => r.name).join(", ")}` : ""));
-  setStatus({ phase: "done" });
+  log(`run ${isAborted() ? "ABORTED" : "complete"}: ` +
+      `${allResults.length - failed.length}/${allResults.length} PASS` +
+      (failed.length ? ` — not passed: ${failed.map((r) => `${r.name} (${r.result})`).join(", ")}` : ""));
+  setStatus({ phase: isAborted() ? "aborted" : "done" });
+  clearAbort();
   return { results: allResults, meta, reportFiles, pageId, failed: failed.length };
 }
 
@@ -2426,6 +2468,11 @@ async function main() {
   }
 
   const cfg = buildConfig(p);
+  // Ctrl+C = graceful abort (traffic stop + netem cleanup); twice = hard exit
+  process.on("SIGINT", () => {
+    if (isAborted()) { console.error("\nforced exit"); process.exit(130); }
+    requestAbort("Ctrl+C");
+  });
   const { failed } = await runSuite(cfg, p);
   if (failed) process.exitCode = 1;
 }
@@ -2442,7 +2489,7 @@ module.exports = {
   // engine
   runSuite, buildConfig, paramsFromEnv, preflight,
   // events / status (web UI)
-  bus, getStatus, setStatus,
+  bus, getStatus, setStatus, requestAbort, isAborted, clearAbort,
   // validators
   isValidIp, parseTos, parseBandwidth, parseDuration, parseTcChoice, validateParams,
   parsePort, parsePosInt, parseConfPageId, confApiBase, resolveConfApiBase,
