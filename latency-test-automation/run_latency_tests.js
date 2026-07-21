@@ -237,6 +237,18 @@ function validateParams(p) {
   if (p.spokeKey && !fs.existsSync(p.spokeKey)) errors.spokeKey = `key file not found: ${p.spokeKey}`;
   if (p.hubKey && !fs.existsSync(p.hubKey)) errors.hubKey = `key file not found: ${p.hubKey}`;
   if (!["TCP", "UDP"].includes(String(p.trafficType).toUpperCase())) errors.trafficType = "must be TCP or UDP";
+  if (!["upstream", "downstream"].includes(String(p.trafficDirection).toLowerCase()))
+    errors.trafficDirection = "upstream | downstream";
+  if (["packet-loss", "all"].includes(p.mode)) {
+    if (!isValidIp(p.netemHost)) errors.netemHost = "invalid IPv4 address";
+    if (!p.netemUser) errors.netemUser = "required";
+    if (!p.netemPass && !p.netemKey) errors.netemAuth = "password or key path required";
+    if (p.netemKey && !fs.existsSync(p.netemKey)) errors.netemKey = `key file not found: ${p.netemKey}`;
+    for (const f of ["rampStepPct", "rampIntervalSec", "burstIntervalSec", "burstDurationSec",
+                     "burstLossPct", "randomLossPct"]) {
+      if (!parsePosInt(p[f]).ok) errors[f] = "positive integer required";
+    }
+  }
   if (!parseTos(p.tos)) errors.tos = "must be 0xNN hex or decimal 0-255";
   if (!parseDuration(p.durationSec)) errors.durationSec = "must be a positive integer (seconds)";
   if (!parseBandwidth(p.bandwidth).ok) errors.bandwidth = "e.g. 10M, 500K, 1G, or empty";
@@ -271,6 +283,21 @@ function buildConfig(p) {
     serverIface: p.serverIface || null,
     spoke: creds(p.spokeHost, p.spokeUser, p.spokePass, p.spokeKey),
     hub: creds(p.hubHost, p.hubUser, p.hubPass, p.hubKey),
+    netemSsh: creds(p.netemHost, p.netemUser, p.netemPass, p.netemKey),
+    netemCandidates: String(p.netemCandidates || "").split(",").map((s) => s.trim()).filter(Boolean),
+    netemExclude: String(p.netemExclude || "").split(",").map((s) => s.trim()).filter(Boolean),
+    plSchedule: {
+      rampStepPct: parseInt(p.rampStepPct, 10) || 2,
+      rampIntervalSec: parseInt(p.rampIntervalSec, 10) || 60,
+      burstIntervalSec: parseInt(p.burstIntervalSec, 10) || 30,
+      burstDurationSec: parseInt(p.burstDurationSec, 10) || 7,
+      burstLossPct: parseInt(p.burstLossPct, 10) || 5,
+      randomLossPct: parseInt(p.randomLossPct, 10) || 5,
+      randomMinGapSec: parseInt(p.randomMinGapSec, 10) || 20,
+      randomMaxGapSec: parseInt(p.randomMaxGapSec, 10) || 60,
+      randomMinDurSec: parseInt(p.randomMinDurSec, 10) || 5,
+      randomMaxDurSec: parseInt(p.randomMaxDurSec, 10) || 15,
+    },
     meoMs: parseInt(envOr("MEO_LATENCY_MS", "325"), 10),
     geoMs: parseInt(envOr("GEO_LATENCY_MS", "560"), 10),
     lossLow: parseFloat(envOr("LOSS_LOW_PCT", "1")),
@@ -308,6 +335,7 @@ function paramsFromEnv() {
     trafficDriver: envOr("TRAFFIC_DRIVER", "ssh"), // ssh | netem-ui
     trafficTool: envOr("TRAFFIC_TOOL", "iperf3"),  // iperf3 | scapy | tcpreplay | custom
     trafficType: "UDP",
+    trafficDirection: envOr("TRAFFIC_DIRECTION", "upstream"), // upstream | downstream (-R)
     tos: "0xB8",
     durationSec: 600,
     bandwidth: envOr("TRAFFIC_BANDWIDTH", ""),
@@ -315,6 +343,26 @@ function paramsFromEnv() {
     packetSize: envOr("PACKET_SIZE", ""),
     serverCmd: "",   // advanced override — empty = auto-generate
     clientCmd: "",   // advanced override — empty = auto-generate
+    // netem VM SSH (dynamic packet-loss impairment via tc + active-link detection)
+    netemHost: envOr("NETEM_HOST", "172.16.226.199"),
+    netemUser: envOr("NETEM_USER", "espace"),
+    netemPass: envOr("NETEM_PASS", ""),
+    netemKey: envOr("NETEM_KEY", ""),
+    // restrict active-link detection to the overlay link interfaces (csv, e.g.
+    // "ens192,ens193"); empty = consider all non-lo, non-bridge interfaces
+    netemCandidates: envOr("NETEM_CANDIDATE_IFACES", ""),
+    netemExclude: envOr("NETEM_EXCLUDE_IFACES", ""),
+    // packet-loss schedules
+    rampStepPct: envOr("PL_RAMP_STEP_PCT", "2"),        // TC1: +2% ...
+    rampIntervalSec: envOr("PL_RAMP_INTERVAL_SEC", "60"), // ...every 60 s
+    burstIntervalSec: envOr("PL_BURST_INTERVAL_SEC", "30"),
+    burstDurationSec: envOr("PL_BURST_DURATION_SEC", "7"),
+    burstLossPct: envOr("PL_BURST_LOSS_PCT", "5"),
+    randomLossPct: envOr("PL_RANDOM_LOSS_PCT", "5"),
+    randomMinGapSec: envOr("PL_RANDOM_MIN_GAP_SEC", "20"),
+    randomMaxGapSec: envOr("PL_RANDOM_MAX_GAP_SEC", "60"),
+    randomMinDurSec: envOr("PL_RANDOM_MIN_DUR_SEC", "5"),
+    randomMaxDurSec: envOr("PL_RANDOM_MAX_DUR_SEC", "15"),
     // interface selection (iface name; bind IP discovered from the iface)
     clientIface: envOr("CLIENT_IFACE", ""),
     clientBindIp: envOr("CLIENT_BIND_IP", ""),
@@ -365,11 +413,21 @@ function buildTestCases(cfg, mode = "latency") {
     ];
   }
   if (mode === "packet-loss") {
+    // Dynamic cases: traffic starts FIRST, the active link is auto-detected
+    // from live netem VM counters, and loss is applied only on that link.
+    const s = cfg.plSchedule ?? {};
+    const none = { delayMs: 0, lossPct: 0 }; // impairment is applied at runtime
     return [
-      { n: 1, name: `PL1_0pct_0pct`, mode, link1: P(0), link2: P(0), expectSwitch: false },
-      { n: 2, name: `PL2_0pct_${cfg.lossLow}pct`, mode, link1: P(0), link2: P(cfg.lossLow), expectSwitch: true },
-      { n: 3, name: `PL3_${cfg.lossLow}pct_${cfg.lossMed}pct`, mode, link1: P(cfg.lossLow), link2: P(cfg.lossMed), expectSwitch: true },
-      { n: 4, name: `PL4_${cfg.lossMed}pct_${cfg.lossHigh}pct`, mode, link1: P(cfg.lossMed), link2: P(cfg.lossHigh), expectSwitch: true },
+      { n: 1, name: "PL_TC1_Constant", mode, plType: "constant", link1: none, link2: none,
+        expectSwitch: true,
+        describe: `+${s.rampStepPct ?? 2}% loss every ${s.rampIntervalSec ?? 60}s on the active link` },
+      { n: 2, name: "PL_TC2_Burst", mode, plType: "burst", link1: none, link2: none,
+        expectSwitch: true,
+        describe: `${s.burstLossPct ?? 5}% loss bursts of ${s.burstDurationSec ?? 7}s every ${s.burstIntervalSec ?? 30}s` },
+      { n: 3, name: "PL_TC3_Random", mode, plType: "random", link1: none, link2: none,
+        expectSwitch: true,
+        describe: `${s.randomLossPct ?? 5}% loss at random intervals for random durations` },
+      // TODO: confirm expectSwitch per case against the pass criteria.
     ];
   }
   throw new Error(`unknown mode: ${mode}`);
@@ -740,6 +798,7 @@ function buildTrafficCommands(p) {
       let c = `iperf3 -c ${p.serverIp}`;
       if (sPort) c += ` -p ${sPort}`;
       if (udp) c += " -u";
+      if (String(p.trafficDirection).toLowerCase() === "downstream") c += " -R";
       if (bw) c += ` -b ${bw}`;
       c += ` -t ${dur}`;
       if (streams && streams > 1) c += ` -P ${streams}`;
@@ -837,6 +896,161 @@ async function stopTrafficViaSsh(cfg, traffic, handles, destDir) {
       log(`WARN: stopping traffic ${side} failed: ${e.message}`);
     }
   }
+}
+
+/* ========================================================================= *
+ * Netem VM: active-link detection + dynamic impairment via tc (SSH)
+ * ========================================================================= */
+
+/** Parse /proc/net/dev into {iface: {rxPkts, txPkts}}. */
+function parsePacketCounters(text) {
+  const out = {};
+  for (const line of String(text).split("\n")) {
+    if (!line.includes(":")) continue;
+    const [name, rest] = line.split(":", 2);
+    const f = rest.trim().split(/\s+/);
+    if (f.length >= 10) {
+      out[name.trim()] = { rxPkts: parseInt(f[1], 10), txPkts: parseInt(f[9], 10) };
+    }
+  }
+  return out;
+}
+
+/**
+ * Detect the interface carrying the test traffic on the netem VM: sample the
+ * packet counters twice and rank by pps. cfg.netemCandidates (if set)
+ * restricts the ranking to the overlay link interfaces (recommended —
+ * NETEM_CANDIDATE_IFACES="ens192,ens193"); otherwise lo, bridges, and
+ * cfg.netemExclude are skipped. Returns {iface, pps, table}.
+ */
+async function detectActiveLink(cfg, sampleSeconds = 3) {
+  const conn = await sshConnect(cfg.netemSsh);
+  try {
+    const a = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    await sleep(sampleSeconds * 1000);
+    const b = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    const table = [];
+    for (const [iface, cb] of Object.entries(b)) {
+      if (iface === "lo") continue;
+      if (cfg.netemCandidates.length) {
+        if (!cfg.netemCandidates.includes(iface)) continue;
+      } else {
+        if (iface.startsWith("br") || cfg.netemExclude.includes(iface)) continue;
+      }
+      const ca = a[iface] ?? { rxPkts: 0, txPkts: 0 };
+      const pps = Math.round((cb.rxPkts - ca.rxPkts + cb.txPkts - ca.txPkts) / sampleSeconds);
+      table.push({ iface, pps });
+    }
+    table.sort((x, y) => y.pps - x.pps);
+    if (!table.length) throw new Error("no candidate interfaces found on the netem VM");
+    for (const row of table.slice(0, 6)) log(`  ${row.iface.padEnd(12)} ${row.pps} pps`);
+    const active = table[0];
+    log(`active link on netem VM: ${active.iface} (${active.pps} pps)`);
+    return { ...active, table };
+  } finally {
+    conn.end();
+  }
+}
+
+/** Apply a netem impairment ({lossPct} and/or {delayMs}) to one interface. */
+async function applyNetemImpairment(cfg, iface, spec) {
+  const parts = [];
+  if (spec.delayMs) parts.push(`delay ${spec.delayMs}ms`);
+  if (spec.lossPct) parts.push(`loss ${spec.lossPct}%`);
+  const conn = await sshConnect(cfg.netemSsh);
+  try {
+    const cmd = parts.length
+      ? `tc qdisc replace dev ${iface} root netem ${parts.join(" ")}`
+      : `tc qdisc del dev ${iface} root`;
+    const r = await sudoExec(conn, cfg.netemSsh, cmd);
+    if (r.code !== 0 && parts.length) {
+      throw new Error(`tc failed on ${iface} (rc=${r.code}): ${(r.stderr || r.stdout).slice(0, 200)}`);
+    }
+    log(`netem ${iface}: ${parts.join(" ") || "cleared"}`);
+  } finally {
+    conn.end();
+  }
+}
+
+async function clearNetemImpairment(cfg, iface) {
+  const conn = await sshConnect(cfg.netemSsh);
+  try {
+    await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root 2>/dev/null; true`);
+    log(`netem ${iface}: cleared`);
+  } finally {
+    conn.end();
+  }
+}
+
+/** Sleep, but never past the deadline. */
+async function sleepWithin(deadline, ms) {
+  const remain = deadline - Date.now();
+  if (remain <= 0) return false;
+  await sleep(Math.min(ms, remain));
+  return Date.now() < deadline;
+}
+
+const randInt = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
+
+/**
+ * Run the packet-loss impairment schedule for one dynamic test case.
+ * plType: "constant" (ramp +step% every interval on the initially-active
+ * link), "burst" (loss for burstDuration every burstInterval on the
+ * currently-active link), "random" (loss at random intervals for random
+ * durations). Records every event via onEvent and returns the event list.
+ */
+async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, onEvent) {
+  const s = cfg.plSchedule;
+  const deadline = Date.now() + durationMs;
+  const events = [];
+  const note = (iface, event) => {
+    const ev = { t: new Date().toISOString(), iface, event };
+    events.push(ev);
+    setStatus({ netem: `${event} on ${iface}` });
+    log(`impairment: ${event} on ${iface}`);
+    if (onEvent) onEvent(ev);
+  };
+
+  if (plType === "constant") {
+    // The ramp stays on the initially-active link: traffic leaving it under
+    // increasing loss (and possibly returning) is exactly what we measure.
+    const { iface } = await detectActiveLink(cfg);
+    let pct = 0;
+    while (Date.now() < deadline) {
+      pct += s.rampStepPct;
+      await applyNetemImpairment(cfg, iface, { lossPct: pct });
+      impairedIfaces.add(iface);
+      note(iface, `loss ${pct}%`);
+      if (!(await sleepWithin(deadline, s.rampIntervalSec * 1000))) break;
+    }
+  } else if (plType === "burst") {
+    while (Date.now() < deadline) {
+      const { iface } = await detectActiveLink(cfg);
+      await applyNetemImpairment(cfg, iface, { lossPct: s.burstLossPct });
+      impairedIfaces.add(iface);
+      note(iface, `burst loss ${s.burstLossPct}%`);
+      await sleepWithin(deadline, s.burstDurationSec * 1000);
+      await clearNetemImpairment(cfg, iface);
+      note(iface, "clear");
+      if (!(await sleepWithin(deadline,
+        Math.max(1, s.burstIntervalSec - s.burstDurationSec) * 1000))) break;
+    }
+  } else if (plType === "random") {
+    while (Date.now() < deadline) {
+      if (!(await sleepWithin(deadline,
+        randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
+      const { iface } = await detectActiveLink(cfg);
+      await applyNetemImpairment(cfg, iface, { lossPct: s.randomLossPct });
+      impairedIfaces.add(iface);
+      note(iface, `random loss ${s.randomLossPct}%`);
+      await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000);
+      await clearNetemImpairment(cfg, iface);
+      note(iface, "clear");
+    }
+  } else {
+    throw new Error(`unknown packet-loss type: ${plType}`);
+  }
+  return events;
 }
 
 /* ========================================================================= *
@@ -1089,9 +1303,13 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     startTime: new Date().toISOString(),
     endTime: null,
     trafficDriver: cfg.trafficDriver,
+    direction: traffic.direction,
+    plType: tc.plType || null,
+    plDescribe: tc.describe || null,
     serverCmd: traffic.serverCmd || null,
     clientCmd: traffic.clientCmd || null,
     trafficVerifiedBps: null,
+    impairments: [],
     switches: [],
     switchObserved: false,
     expectSwitch: tc.expectSwitch,
@@ -1105,9 +1323,15 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     if (p) result.screenshots.push(p);
   };
 
+  const isDynamicPL = !!tc.plType;
   await shot("01_before_netem");
-  await configureNetemViaUi(page, tc);
-  await shot("02_after_netem");
+  if (!isDynamicPL) {
+    // static latency case: configure both links up front via the netem UI
+    await configureNetemViaUi(page, tc);
+    await shot("02_after_netem");
+  } else {
+    log(`${tc.name}: ${tc.describe} — impairment is applied at runtime to the auto-detected active link`);
+  }
 
   let sshHandles = null;
   const startTraffic = async () => {
@@ -1133,17 +1357,28 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     return result;
   }
 
+  const impairedIfaces = new Set();
   const spokeMonitor = await sshConnect(cfg.spoke);
   try {
-    result.switches = await monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
+    const monitorP = monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
       await shot(`03_switch_${result.switches.length}`);
       if (isFirst) {
         const snapTar = await collectHourlogSnapshot(cfg.spoke, spokeDir, `${tc.name}_switch`);
         if (snapTar) result.artifacts.spoke.push(snapTar);
       }
     });
+    const scheduleP = isDynamicPL
+      ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null)
+      : Promise.resolve([]);
+    const [switches, impairments] = await Promise.all([monitorP, scheduleP]);
+    result.switches = switches;
+    result.impairments = impairments;
   } finally {
     spokeMonitor.end();
+    for (const iface of impairedIfaces) {
+      try { await clearNetemImpairment(cfg, iface); }
+      catch (e) { log(`WARN: clearing netem on ${iface} failed: ${e.message}`); }
+    }
   }
   result.switchObserved = result.switches.length > 0;
 
@@ -1189,16 +1424,43 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       ? "PASS"
       : "FAIL";
 
-  fs.writeFileSync(path.join(tcDir, "observations.txt"), observationsText(result));
+  result.observationsFile = path.join(tcDir, "observations.txt");
+  fs.writeFileSync(result.observationsFile, observationsText(result));
   log(`${tc.name} finished: ${result.result} (switches: ${result.switches.length})`);
   return result;
+}
+
+/** mm:ss offset of t from start (falls back to the raw value). */
+function offsetStr(start, t) {
+  const ms = new Date(t) - new Date(start);
+  if (!isFinite(ms) || ms < 0) return String(t);
+  const s = Math.floor(ms / 1000);
+  return `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** "00:00 SES-1 / 01:42 Switched SES-2 / 03:15 Returned SES-1" rows. */
+function trafficMovement(r) {
+  if (!r.switches.length) return [];
+  const first = r.switches[0].fromLink;
+  const rows = [{ at: "00:00", what: `${first}` }];
+  for (const sw of r.switches) {
+    const label = sw.toLink === first ? `Returned ${sw.toLink}` : `Switched ${sw.toLink}`;
+    rows.push({ at: offsetStr(r.startTime, sw.wallClock ?? sw.time), what: label });
+  }
+  return rows;
 }
 
 function observationsText(r) {
   return [
     `Test case:        ${r.name} (TC${r.tc}, mode=${r.mode})`,
-    `Impairment:       link1=${describeLink(r.link1)}, link2=${describeLink(r.link2)}`,
-    `Traffic:          ${r.trafficType} ToS=${r.tos}` +
+    r.plType
+      ? `Impairment:       dynamic packet loss (${r.plType}) — ${r.plDescribe}`
+      : `Impairment:       link1=${describeLink(r.link1)}, link2=${describeLink(r.link2)}`,
+    ...(r.impairments?.length
+      ? ["Impairment schedule:",
+         ...r.impairments.map((ev) => `  ${offsetStr(r.startTime, ev.t)}  ${ev.event} (${ev.iface})`)]
+      : []),
+    `Traffic:          ${r.trafficType} ${r.direction ?? ""} ToS=${r.tos}` +
       (r.trafficVerifiedBps != null ? ` (verified ${Math.round(r.trafficVerifiedBps)} B/s)` : " (NOT verified)"),
     ...(r.serverCmd ? [`Server command:   ${r.serverCmd}`] : []),
     ...(r.clientCmd ? [`Client command:   ${r.clientCmd}`] : []),
@@ -1289,6 +1551,11 @@ function writeHtmlReport(baseDir, results, meta) {
           `(from-link latency95P=${escapeHtml(s.fromLinkLatency95P)} ms, ` +
           `pl95P=${escapeHtml(s.fromLinkPacketLoss95P)} %)</li>`).join("") + `</ol>`
       : `<p>No link switch observed.</p>`;
+    const schedule = r.impairments?.length
+      ? `<h3>Impairment schedule</h3><ol class="timeline">` + r.impairments.map((ev) =>
+          `<li><b>${escapeHtml(offsetStr(r.startTime, ev.t))}</b> — ${escapeHtml(ev.event)} ` +
+          `on ${escapeHtml(ev.iface)}</li>`).join("") + `</ol>`
+      : "";
     const artifacts = [...r.artifacts.spoke, ...r.artifacts.hub].map((p) =>
       `<li><a href="${escapeHtml(rel(p))}">${escapeHtml(path.basename(p))}</a></li>`).join("")
       || "<li>(none)</li>";
@@ -1303,10 +1570,12 @@ function writeHtmlReport(baseDir, results, meta) {
     return `
     <section>
       <h2>${escapeHtml(r.name)} ${badge(r.result)}</h2>
-      <p>Impairment: ${escapeHtml(describeLink(r.link1))} / ${escapeHtml(describeLink(r.link2))}
-         — Traffic ${escapeHtml(r.trafficType)} ToS ${escapeHtml(r.tos)}
+      <p>Impairment: ${r.plType ? escapeHtml(`dynamic packet loss (${r.plType}) — ${r.plDescribe}`)
+          : escapeHtml(describeLink(r.link1)) + " / " + escapeHtml(describeLink(r.link2))}
+         — Traffic ${escapeHtml(r.trafficType)} ${escapeHtml(r.direction ?? "")} ToS ${escapeHtml(r.tos)}
          ${r.trafficVerifiedBps != null ? `(verified ${Math.round(r.trafficVerifiedBps)} B/s)` : "(traffic NOT verified)"}</p>
       ${cmds}
+      ${schedule}
       <h3>Switch timeline</h3>${timeline}
       <h3>Artifacts</h3><ul>${artifacts}</ul>
       ${shots ? `<h3>Screenshots</h3><div class="shots">${shots}</div>` : ""}
@@ -1410,36 +1679,90 @@ function buildStorageBody(results, meta) {
     })
     .join("");
 
-  const sections = results
-    .map((r) => {
-      const sw = r.switches
-        .map((s) => `link ${escapeXml(s.fromLink)} &rarr; ${escapeXml(s.toLink)} at ${escapeXml(s.time)} ` +
-          `(from-link latency95P=${escapeXml(s.fromLinkLatency95P)} ms, pl95P=${escapeXml(s.fromLinkPacketLoss95P)} %)`)
-        .join("; ") || "no switch observed";
-      const errs = r.errors.length ? ` Errors: ${escapeXml(r.errors.join(" | "))}` : "";
-      const shots = r.screenshots
-        .map((p) => `<ac:image ac:width="480"><ri:attachment ri:filename="${escapeXml(path.basename(p))}"/></ac:image>`)
-        .join(" ");
-      const cmds = r.clientCmd
-        ? `<p><code>${r.serverCmd ? escapeXml("server: " + r.serverCmd) + "<br/>" : ""}${escapeXml("client: " + r.clientCmd)}</code></p>`
-        : "";
-      return `<h4>${escapeXml(r.name)} — ${r.result}</h4><p>${sw}.${errs}</p>${cmds}${shots}`;
-    })
-    .join("");
+  const sections = results.map(buildCaseSection).join("");
 
   return (
     `<h2>Impairment validation run — ${escapeXml(meta.executedAt)}</h2>` +
     metaTable +
     `<h3>Results</h3><table><tbody>${header}${rows}</tbody></table>` +
-    `<h3>Observations</h3>${sections}`
+    sections
   );
 }
 
-async function confUploadAttachment(conf, pageId, filepath) {
+/** Which of the standard artifacts were actually collected for this case. */
+function artifactChecklist(r) {
+  const spoke = r.artifacts.spoke.map((p) => path.basename(p).toLowerCase());
+  const hub = r.artifacts.hub.map((p) => path.basename(p).toLowerCase());
+  return [
+    ["Spoke hourLog", spoke.some((f) => f.includes("hourlog"))],
+    ["Spoke DMTS archive", spoke.some((f) => f.includes("dmts_today"))],
+    ["Hub DMTS archive", hub.some((f) => f.includes("dmts_today"))],
+    ["Spoke Diag Pack", spoke.some((f) => f.startsWith("diagpack_spoke"))],
+    ["Hub Diag Pack", hub.some((f) => f.startsWith("diagpack_hub"))],
+  ];
+}
+
+/** One Confluence section per test case: Configuration / Schedule /
+ *  Traffic Movement / Artifacts / Result. */
+function buildCaseSection(r) {
+  const row = (k, v) => `<tr><th>${escapeXml(k)}</th><td>${escapeXml(v)}</td></tr>`;
+  const config =
+    `<h4>Configuration</h4><table><tbody>` +
+    row("Traffic", r.trafficType) +
+    row("Direction", r.direction ? r.direction[0].toUpperCase() + r.direction.slice(1) : "-") +
+    row("ToS", r.tos) +
+    row("Impairment", r.plType ? `dynamic packet loss (${r.plType}) — ${r.plDescribe}` :
+      `${describeLink(r.link1)} / ${describeLink(r.link2)}`) +
+    (r.clientCmd ? row("Client command", r.clientCmd) : "") +
+    row("Window", `${r.startTime ?? "-"} .. ${r.endTime ?? "-"}`) +
+    `</tbody></table>`;
+
+  const schedule = r.impairments?.length
+    ? `<h4>Packet Loss Schedule</h4><table><tbody>` +
+      `<tr><th>Time</th><th>Event</th><th>Interface</th></tr>` +
+      r.impairments.map((ev) =>
+        `<tr><td>${escapeXml(offsetStr(r.startTime, ev.t))}</td>` +
+        `<td>${escapeXml(ev.event)}</td><td>${escapeXml(ev.iface)}</td></tr>`).join("") +
+      `</tbody></table>`
+    : "";
+
+  const moves = trafficMovement(r);
+  const movement =
+    `<h4>Traffic Movement</h4>` +
+    (moves.length
+      ? `<table><tbody><tr><th>Time</th><th>Link</th></tr>` +
+        moves.map((m) => `<tr><td>${escapeXml(m.at)}</td><td>${escapeXml(m.what)}</td></tr>`).join("") +
+        `</tbody></table>`
+      : `<p>No link switch observed.</p>`);
+
+  const artifacts =
+    `<h4>Artifacts</h4><ul>` +
+    artifactChecklist(r).map(([name, ok]) => `<li>${ok ? "&#10003;" : "&#10007;"} ${escapeXml(name)}</li>`).join("") +
+    `</ul><p>` +
+    [...r.artifacts.spoke, ...r.artifacts.hub]
+      .map((p) => `<ac:link><ri:attachment ri:filename="${escapeXml(path.basename(p))}"/></ac:link>`)
+      .join(" &nbsp; ") +
+    `</p>`;
+
+  const shots = r.screenshots
+    .map((p) => `<ac:image ac:width="480"><ri:attachment ri:filename="${escapeXml(path.basename(p))}"/></ac:image>`)
+    .join(" ");
+  const errs = r.errors.length
+    ? `<p><strong>Errors:</strong> ${escapeXml(r.errors.join(" | "))}</p>` : "";
+
+  return (
+    `<h3>${escapeXml(r.name)}${r.plDescribe ? " — " + escapeXml(r.plDescribe) : ""}</h3>` +
+    config + schedule + movement + artifacts +
+    `<h4>Result</h4><p><strong>${r.result}</strong></p>` +
+    errs + shots
+  );
+}
+
+async function confUploadAttachment(conf, pageId, filepath, asName = null) {
   const url = `${conf.base}/wiki/rest/api/content/${pageId}/child/attachment?allowDuplicated=true`;
   const form = new FormData();
   const buf = fs.readFileSync(filepath);
-  form.append("file", new Blob([buf]), path.basename(filepath));
+  form.append("file", new Blob([buf]), asName || path.basename(filepath));
   form.append("minorEdit", "true");
   const resp = await confFetch(conf, url, {
     method: "POST",
@@ -1501,9 +1824,16 @@ async function publishToConfluence(conf, results, meta, extraFiles = []) {
     ...results.flatMap((r) => [...r.artifacts.spoke, ...r.artifacts.hub, ...r.screenshots]),
     ...extraFiles,
   ];
+  // generic filenames (observations.txt, report.html, ...) collide across
+  // TC folders/modes — prefix them with their parent directory name
+  const GENERIC = ["observations.txt", "summary.json", "summary.md", "report.html"];
+  const uploadName = (f) => {
+    const b = path.basename(f);
+    return GENERIC.includes(b) ? `${path.basename(path.dirname(f))}_${b}` : b;
+  };
   for (const f of files) {
     try {
-      await confUploadAttachment(conf, pageId, f);
+      await confUploadAttachment(conf, pageId, f, uploadName(f));
     } catch (e) {
       log(`WARN: ${e.message}`);
     }
@@ -1523,6 +1853,7 @@ async function runSuite(cfg, params) {
   }
   const traffic = {
     type: params.trafficType.toUpperCase(),
+    direction: String(params.trafficDirection || "upstream").toLowerCase(),
     tos: parseTos(params.tos),
     bandwidth: parseBandwidth(params.bandwidth).value,
     serverCmd: cmds.serverCmd ?? null,
@@ -1572,6 +1903,8 @@ async function runSuite(cfg, params) {
       }
       writeSummary(baseDir, results, meta);
       reportFiles.push(writeHtmlReport(baseDir, results, meta));
+      reportFiles.push(path.join(baseDir, "summary.json"));
+      reportFiles.push(...results.map((r) => r.observationsFile).filter(Boolean));
       allResults.push(...results);
     }
   } finally {
@@ -1688,6 +2021,8 @@ async function interactiveSetup(p) {
   }
   p.trafficType = (await askValidated("Protocol (TCP/UDP)", p.trafficType,
     (s) => (["tcp", "udp"].includes(s.toLowerCase()) ? s.toUpperCase() : null)));
+  p.trafficDirection = await askValidated("Traffic direction (upstream/downstream)", p.trafficDirection,
+    (s) => (["upstream", "downstream"].includes(s.toLowerCase()) ? s.toLowerCase() : null));
   p.tos = await askValidated("ToS/DSCP value (hex 0xNN or decimal)", p.tos, (s) => parseTos(s));
   p.durationSec = await askValidated("Traffic duration seconds", p.durationSec, (s) => parseDuration(s));
   p.bandwidth = await askValidated("Bandwidth (e.g. 10M, empty = tool default)", p.bandwidth,
@@ -1710,6 +2045,15 @@ async function interactiveSetup(p) {
     (s) => (parseTcChoice(s) !== null ? s : null));
   p.mode = await askValidated("Mode (latency/packet-loss/all)", p.mode,
     (s) => (["latency", "packet-loss", "all"].includes(s.toLowerCase()) ? s.toLowerCase() : null));
+  if (["packet-loss", "all"].includes(p.mode)) {
+    p.netemHost = await askValidated("Netem VM SSH IP", p.netemHost, ipRequired);
+    p.netemUser = await askValidated("Netem VM SSH username", p.netemUser, (s) => (s ? s : null));
+    p.netemPass = await askValidated("Netem VM SSH password", p.netemPass ? "(from env)" : "",
+      (s) => (s ? (s === "(from env)" ? p.netemPass : s) : null), { hidden: true });
+    p.netemCandidates = await askValidated(
+      "Overlay link interfaces on netem VM (csv, e.g. ens192,ens193; empty = auto)",
+      p.netemCandidates, (s) => s);
+  }
   p.confluence = (await askValidated("Upload to Confluence? (yes/no)",
     p.confluence ? "yes" : "no",
     (s) => (["yes", "no", "y", "n"].includes(s.toLowerCase()) ? s.toLowerCase() : null)))
@@ -1818,6 +2162,9 @@ module.exports = {
   parsePort, parsePosInt,
   // traffic generation + interface discovery
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
+  // netem impairment + dynamic packet loss
+  parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
+  runPacketLossSchedule, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // parsing / cases / reports (tests)
   lastCompleteRecord, findBalancedEnd, activeTc, linkStats,
   buildTestCases, describeLink, buildStorageBody, escapeXml, escapeHtml,

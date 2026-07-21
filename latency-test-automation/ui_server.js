@@ -39,7 +39,7 @@ let running = false;
 
 /* ------------------------------------------------------------------------ */
 
-const SECRET_FIELDS = ["clientPass", "serverPass", "spokePass", "hubPass", "confToken"];
+const SECRET_FIELDS = ["clientPass", "serverPass", "spokePass", "hubPass", "netemPass", "confToken"];
 
 function formDefaults() {
   const p = engine.paramsFromEnv();
@@ -319,6 +319,21 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <div><label>Parallel streams</label><input name="parallelStreams" value="${esc(d.parallelStreams)}"><div class="errmsg"></div></div>
     <div><label>ToS / DSCP</label><input name="tos" value="${esc(d.tos)}"><div class="errmsg"></div></div>
     <div><label>Packet size (bytes)</label><input name="packetSize" value="${esc(d.packetSize)}" placeholder="tool default"><div class="errmsg"></div></div>
+    <div style="grid-column: 1 / -1;"><label>Traffic direction</label>
+      <label style="display:inline; margin-right:16px;"><input type="radio" name="trafficDirection" value="upstream" style="width:auto"${d.trafficDirection !== "downstream" ? " checked" : ""}> Upstream (iperf3 -c)</label>
+      <label style="display:inline;"><input type="radio" name="trafficDirection" value="downstream" style="width:auto"${d.trafficDirection === "downstream" ? " checked" : ""}> Downstream (iperf3 -c -R)</label>
+      <div class="errmsg"></div></div>
+  </div></fieldset>
+
+  <fieldset><legend>3b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid4">
+    <div><label>TC1 ramp step (%)</label><input name="rampStepPct" value="${esc(d.rampStepPct)}"><div class="errmsg"></div></div>
+    <div><label>TC1 ramp interval (s)</label><input name="rampIntervalSec" value="${esc(d.rampIntervalSec)}"><div class="errmsg"></div></div>
+    <div><label>TC2 burst interval (s)</label><input name="burstIntervalSec" value="${esc(d.burstIntervalSec)}"><div class="errmsg"></div></div>
+    <div><label>TC2 burst duration (s)</label><input name="burstDurationSec" value="${esc(d.burstDurationSec)}"><div class="errmsg"></div></div>
+    <div><label>TC2 burst loss (%)</label><input name="burstLossPct" value="${esc(d.burstLossPct)}"><div class="errmsg"></div></div>
+    <div><label>TC3 random loss (%)</label><input name="randomLossPct" value="${esc(d.randomLossPct)}"><div class="errmsg"></div></div>
+    <div style="grid-column: 1 / -1;"><label>Overlay link interfaces on netem VM (csv, e.g. ens192,ens193 — empty = auto-detect among non-bridge NICs)</label>
+      <input name="netemCandidates" value="${esc(d.netemCandidates)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
   <fieldset><legend>4 — Traffic command</legend>
@@ -330,9 +345,9 @@ const PAGE = (d, profileNames) => `<!doctype html>
   </fieldset>
 
   <fieldset><legend>5 — SSH details</legend><div class="sshgrid">
-    ${["client", "server", "spoke", "hub"].map((side) => `
-    <div class="sshbox"><h4>${side[0].toUpperCase() + side.slice(1)}${side === "spoke" || side === "hub" ? "" : " (uses IP above)"}</h4>
-      ${side === "spoke" || side === "hub"
+    ${["client", "server", "spoke", "hub", "netem"].map((side) => `
+    <div class="sshbox"><h4>${side === "netem" ? "Netem VM" : side[0].toUpperCase() + side.slice(1)}${["spoke", "hub", "netem"].includes(side) ? "" : " (uses IP above)"}</h4>
+      ${["spoke", "hub", "netem"].includes(side)
         ? `<label>IP</label><input name="${side}Host" value="${esc(d[side + "Host"])}"><div class="errmsg"></div>` : ""}
       <label>Username</label><input name="${side}User" value="${esc(d[side + "User"])}"><div class="errmsg"></div>
       <label>Password ${d[side + "PassSet"] ? "(blank = env)" : ""}</label><input name="${side}Pass" type="password"><div class="errmsg"></div>
@@ -413,7 +428,8 @@ function clearErrors() {
   $("globalerr").textContent = "";
 }
 function showErrors(errors) {
-  const alias = { clientAuth: "clientPass", serverAuth: "serverPass", spokeAuth: "spokePass", hubAuth: "hubPass" };
+  const alias = { clientAuth: "clientPass", serverAuth: "serverPass", spokeAuth: "spokePass",
+                  hubAuth: "hubPass", netemAuth: "netemPass" };
   for (const [field, msg] of Object.entries(errors || {})) {
     if (field === "_global") { $("globalerr").textContent = msg; continue; }
     const input = form.querySelector('[name="' + (alias[field] || field) + '"]');
@@ -481,6 +497,8 @@ async function refreshCommands() {
   const el = form.querySelector('[name="' + n + '"]');
   if (el) el.addEventListener("change", refreshCommands);
 });
+document.querySelectorAll('[name="trafficDirection"]').forEach((el) =>
+  el.addEventListener("change", refreshCommands));
 refreshCommands();
 
 /* ---------- interface discovery ---------- */
