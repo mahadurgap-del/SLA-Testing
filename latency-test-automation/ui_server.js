@@ -327,9 +327,12 @@ const PAGE = (d, profileNames) => `<!doctype html>
   </div></fieldset>
 
   <fieldset><legend>4 — Traffic generation</legend><div class="grid3">
-    <div><label>Driver</label><select name="trafficDriver">
+    <div><label>Traffic via</label><select name="trafficDriver">
       <option value="ssh"${d.trafficDriver === "ssh" ? " selected" : ""}>SSH (this tool)</option>
       <option value="netem-ui"${d.trafficDriver === "netem-ui" ? " selected" : ""}>netem UI page</option></select><div class="errmsg"></div></div>
+    <div><label>Netem via</label><select name="impairmentDriver">
+      <option value="ssh-tc"${d.impairmentDriver === "ssh-tc" ? " selected" : ""}>SSH tc (auto-detect link)</option>
+      <option value="netem-ui"${d.impairmentDriver === "netem-ui" ? " selected" : ""}>netem UI page</option></select><div class="errmsg"></div></div>
     <div><label>Tool</label><select name="trafficTool">
       ${["iperf3", "scapy", "tcpreplay", "custom"].map((t) =>
         `<option${d.trafficTool === t ? " selected" : ""}>${t}</option>`).join("")}

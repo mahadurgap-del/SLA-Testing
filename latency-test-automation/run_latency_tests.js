@@ -252,7 +252,8 @@ function validateParams(p) {
   if (!["TCP", "UDP"].includes(String(p.trafficType).toUpperCase())) errors.trafficType = "must be TCP or UDP";
   if (!["upstream", "downstream"].includes(String(p.trafficDirection).toLowerCase()))
     errors.trafficDirection = "upstream | downstream";
-  if (["packet-loss", "all"].includes(p.mode)) {
+  if (!["ssh-tc", "netem-ui"].includes(p.impairmentDriver)) errors.impairmentDriver = "ssh-tc | netem-ui";
+  if (["packet-loss", "all"].includes(p.mode) || p.impairmentDriver === "ssh-tc") {
     if (!isValidIp(p.netemHost)) errors.netemHost = "invalid IPv4 address";
     if (!p.netemUser) errors.netemUser = "required";
     if (!p.netemPass && !p.netemKey) errors.netemAuth = "password or key path required";
@@ -300,6 +301,7 @@ function buildConfig(p) {
     serverIface: p.serverIface || null,
     spoke: creds(p.spokeHost, p.spokeUser, p.spokePass, p.spokeKey),
     hub: creds(p.hubHost, p.hubUser, p.hubPass, p.hubKey),
+    impairmentDriver: p.impairmentDriver,
     netemSsh: creds(p.netemHost, p.netemUser, p.netemPass, p.netemKey),
     netemCandidates: String(p.netemCandidates || "").split(",").map((s) => s.trim()).filter(Boolean),
     netemExclude: String(p.netemExclude || "").split(",").map((s) => s.trim()).filter(Boolean),
@@ -360,7 +362,11 @@ function paramsFromEnv() {
     packetSize: envOr("PACKET_SIZE", ""),
     serverCmd: "",   // advanced override — empty = auto-generate
     clientCmd: "",   // advanced override — empty = auto-generate
-    // netem VM SSH (dynamic packet-loss impairment via tc + active-link detection)
+    // how netem impairment is applied: "ssh-tc" = tc on the netem VM against
+    // the auto-detected active link (no UI selectors needed); "netem-ui" =
+    // drive the netem web panel with Playwright
+    impairmentDriver: envOr("IMPAIRMENT_DRIVER", "ssh-tc"),
+    // netem VM SSH (impairment via tc + active-link detection)
     netemHost: envOr("NETEM_HOST", "172.16.226.199"),
     netemUser: envOr("NETEM_USER", "espace"),
     netemPass: envOr("NETEM_PASS", ""),
@@ -1081,6 +1087,49 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
   return events;
 }
 
+/**
+ * Apply a static latency test case via tc on the netem VM: the HIGHER delay
+ * of the pair goes on the auto-detected active link (giving DMTS a reason to
+ * switch), the lower delay on the standby link when it can be identified
+ * (second candidate iface, or second-highest pps). Returns impairment events.
+ */
+async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
+  const events = [];
+  const hi = Math.max(tc.link1.delayMs, tc.link2.delayMs);
+  const lo = Math.min(tc.link1.delayMs, tc.link2.delayMs);
+  const note = (iface, event) => {
+    const ev = { t: new Date().toISOString(), iface, event };
+    events.push(ev);
+    setStatus({ netem: `${event} on ${iface}` });
+    log(`impairment: ${event} on ${iface}`);
+  };
+  if (hi === 0) {
+    log(`${tc.name}: both links clean — no impairment to apply`);
+    return events;
+  }
+  const det = await detectActiveLink(cfg);
+  await applyNetemImpairment(cfg, det.iface, { delayMs: hi });
+  impairedIfaces.add(det.iface);
+  note(det.iface, `delay ${hi}ms (active link)`);
+  if (lo > 0) {
+    let other = null;
+    if (cfg.netemCandidates.length === 2) {
+      other = cfg.netemCandidates.find((i) => i !== det.iface) || null;
+    } else if (det.table.length >= 2) {
+      other = det.table[1].iface;
+    }
+    if (other) {
+      await applyNetemImpairment(cfg, other, { delayMs: lo });
+      impairedIfaces.add(other);
+      note(other, `delay ${lo}ms (standby link)`);
+    } else {
+      log(`WARN: standby link interface unknown — set NETEM_CANDIDATE_IFACES ` +
+          `(csv of the two link NICs); skipping the ${lo}ms side`);
+    }
+  }
+  return events;
+}
+
 /* ========================================================================= *
  * Playwright — drive the netem UI
  * TODO(1): every selector below is a PLACEHOLDER.
@@ -1142,6 +1191,7 @@ async function stopTrafficViaUi(page) {
 }
 
 async function snap(page, tcDir, name) {
+  if (!page) return null; // running without a browser (all-SSH drivers)
   try {
     const dir = path.join(tcDir, "screenshots");
     fs.mkdirSync(dir, { recursive: true });
@@ -1206,7 +1256,7 @@ async function generateDiagPackViaSsh(creds, destDir, label, tag) {
 async function collectDiagPack(cfg, browser, label, destDir, tag) {
   const gridUiUrl = label === "spoke" ? cfg.gridUiSpoke : cfg.gridUiHub;
   const creds = label === "spoke" ? cfg.spoke : cfg.hub;
-  if (gridUiUrl) return generateDiagPackViaUi(browser, gridUiUrl, destDir, label, tag);
+  if (gridUiUrl && browser) return generateDiagPackViaUi(browser, gridUiUrl, destDir, label, tag);
   return generateDiagPackViaSsh(creds, destDir, label, tag);
 }
 
@@ -1384,13 +1434,16 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   };
 
   const isDynamicPL = !!tc.plType;
+  const sshTc = cfg.impairmentDriver === "ssh-tc";
   await shot("01_before_netem");
-  if (!isDynamicPL) {
-    // static latency case: configure both links up front via the netem UI
+  if (isDynamicPL) {
+    log(`${tc.name}: ${tc.describe} — impairment is applied at runtime to the auto-detected active link`);
+  } else if (sshTc) {
+    log(`${tc.name}: latency will be applied via tc on the netem VM once traffic is flowing`);
+  } else {
+    // static latency case via the netem UI: configure both links up front
     await configureNetemViaUi(page, tc);
     await shot("02_after_netem");
-  } else {
-    log(`${tc.name}: ${tc.describe} — impairment is applied at runtime to the auto-detected active link`);
   }
 
   let sshHandles = null;
@@ -1418,6 +1471,17 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   }
 
   const impairedIfaces = new Set();
+  // static latency case driven via tc: traffic is flowing, apply the delays now
+  if (!isDynamicPL && sshTc) {
+    try {
+      result.impairments = await applyLatencyViaTc(cfg, tc, impairedIfaces);
+      await shot("02_after_netem");
+    } catch (e) {
+      result.errors.push(`apply latency via tc: ${e.message}`);
+      log(`ERROR: ${e.message}`);
+    }
+  }
+
   const spokeMonitor = await sshConnect(cfg.spoke);
   try {
     const monitorP = monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
@@ -1432,7 +1496,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       : Promise.resolve([]);
     const [switches, impairments] = await Promise.all([monitorP, scheduleP]);
     result.switches = switches;
-    result.impairments = impairments;
+    result.impairments = [...result.impairments, ...impairments];
   } finally {
     spokeMonitor.end();
     for (const iface of impairedIfaces) {
@@ -1993,7 +2057,18 @@ async function runSuite(cfg, params) {
   log(`run start: modes=[${modes.join(",")}] traffic=${traffic.type} ToS=${traffic.tos} ` +
       `tc=${tcFilter} duration=${durationMs / 1000}s/case, GRID=${meta.gridVersion}`);
 
-  const { browser, page } = await openNetemUi(cfg);
+  // The browser is only REQUIRED when a driver actually clicks the netem UI;
+  // with all-SSH drivers it is still opened for evidence screenshots, but a
+  // launch failure then degrades gracefully instead of killing the run.
+  const uiRequired = cfg.trafficDriver === "netem-ui" || cfg.impairmentDriver === "netem-ui";
+  let browser = null;
+  let page = null;
+  try {
+    ({ browser, page } = await openNetemUi(cfg));
+  } catch (e) {
+    if (uiRequired) throw e;
+    log(`WARN: netem UI page unavailable for screenshots (${e.message.split("\n")[0]}) — continuing without browser`);
+  }
   const allResults = [];
   const reportFiles = [];
   try {
@@ -2031,7 +2106,7 @@ async function runSuite(cfg, params) {
       allResults.push(...results);
     }
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
   }
 
   let pageId = null;
@@ -2101,6 +2176,8 @@ async function interactiveSetup(p) {
 
   p.trafficDriver = await askValidated("Traffic driver (ssh/netem-ui)", p.trafficDriver,
     (s) => (["ssh", "netem-ui"].includes(s.toLowerCase()) ? s.toLowerCase() : null));
+  p.impairmentDriver = await askValidated("Netem impairment via (ssh-tc/netem-ui)", p.impairmentDriver,
+    (s) => (["ssh-tc", "netem-ui"].includes(s.toLowerCase()) ? s.toLowerCase() : null));
   const sshDriver = p.trafficDriver === "ssh";
 
   const ipRequired = (s) => (isValidIp(s) ? s : null);
@@ -2168,7 +2245,7 @@ async function interactiveSetup(p) {
     (s) => (parseTcChoice(s) !== null ? s : null));
   p.mode = await askValidated("Mode (latency/packet-loss/all)", p.mode,
     (s) => (["latency", "packet-loss", "all"].includes(s.toLowerCase()) ? s.toLowerCase() : null));
-  if (["packet-loss", "all"].includes(p.mode)) {
+  if (["packet-loss", "all"].includes(p.mode) || p.impairmentDriver === "ssh-tc") {
     p.netemHost = await askValidated("Netem VM SSH IP", p.netemHost, ipRequired);
     p.netemUser = await askValidated("Netem VM SSH username", p.netemUser, (s) => (s ? s : null));
     p.netemPass = await askValidated("Netem VM SSH password", p.netemPass ? "(from env)" : "",
@@ -2287,7 +2364,7 @@ module.exports = {
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  runPacketLossSchedule, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
+  runPacketLossSchedule, applyLatencyViaTc, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // parsing / cases / reports (tests)
   lastCompleteRecord, findBalancedEnd, activeTc, linkStats,
   buildTestCases, describeLink, buildStorageBody, escapeXml, escapeHtml,
