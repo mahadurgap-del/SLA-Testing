@@ -1172,20 +1172,18 @@ async function netemCandidatePps(cfg, sampleSeconds = 5) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
     const a = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    const masters = parseIfaceMasters((await sshExec(conn, "ip -o link show")).stdout);
     await sleep(sampleSeconds * 1000);
     const b = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
-    const ifaces = cfg.netemCandidates.length
-      ? cfg.netemCandidates
-      : Object.keys(b).filter((i) =>
-          i !== "lo" && !i.startsWith("br") && !cfg.netemExclude.includes(i));
-    let best = { iface: null, pps: 0 };
-    for (const iface of ifaces) {
-      if (!a[iface] || !b[iface]) continue;
-      const pps = Math.round(
-        (b[iface].rxPkts - a[iface].rxPkts + b[iface].txPkts - a[iface].txPkts) / sampleSeconds);
-      if (pps > best.pps) best = { iface, pps };
+    const delta = {};
+    for (const [iface, cb] of Object.entries(b)) {
+      const ca = a[iface] ?? { rxPkts: 0, txPkts: 0 };
+      delta[iface] = Math.round((cb.rxPkts - ca.rxPkts + cb.txPkts - ca.txPkts) / sampleSeconds);
     }
-    return best;
+    // measure the busiest LINK (bridge) — same model as detection
+    const groups = rankLinkGroups(delta, masters, cfg.netemCandidates, cfg.netemExclude);
+    const top = groups[0];
+    return top ? { iface: top.bridge, pps: top.pps } : { iface: null, pps: 0 };
   } finally {
     conn.end();
   }
@@ -1259,38 +1257,76 @@ function parseIfaceMasters(text) {
   return masters;
 }
 
+/**
+ * Group interfaces into LINKS by their bridge and rank by total pps.
+ * A netem link (as the netem UI models it) is a bridge with its member ports
+ * — e.g. br1 = {ens192, ens193}. Impairment must go on ALL ports of the link,
+ * because bridged traffic enters one port and leaves the other and DMTS scores
+ * the round trip. Pure function so it can be unit-tested.
+ *   deltaPps: {iface: pps}   masters: {iface: bridge}
+ * Returns [{ bridge, ports:[...], pps }] sorted by pps desc.
+ */
+function rankLinkGroups(deltaPps, masters, candidates = [], exclude = []) {
+  const groups = new Map();
+  for (const [iface, pps] of Object.entries(deltaPps)) {
+    if (iface === "lo" || iface.startsWith("br")) continue;
+    if (candidates.length) {
+      if (!candidates.includes(iface)) continue;
+    } else {
+      // netem links are bridges (as the netem UI models them); by default
+      // ignore lone non-bridge NICs (mgmt/noise like ens160). Name them in
+      // NETEM_CANDIDATE_IFACES to include a non-bridged link.
+      if (!masters[iface] || exclude.includes(iface)) continue;
+    }
+    const bridge = masters[iface] || iface; // named lone iface = its own link
+    if (!groups.has(bridge)) groups.set(bridge, { bridge, ports: [], pps: 0 });
+    const g = groups.get(bridge);
+    g.ports.push(iface);
+    g.pps += pps;
+  }
+  for (const g of groups.values()) g.ports.sort();
+  return [...groups.values()].sort((x, y) => y.pps - x.pps);
+}
+
+/**
+ * Detect the active LINK (bridge + all its ports) on the netem VM by pps.
+ * Returns { bridge, ports:[...], pps, groups, iface (first port, legacy) }.
+ */
 async function detectActiveLink(cfg, sampleSeconds = 3) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
     const a = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
-    // bridge membership: two legs of the same bridge are the SAME link
     const masters = parseIfaceMasters((await sshExec(conn, "ip -o link show")).stdout);
     await sleep(sampleSeconds * 1000);
     const b = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
-    const table = [];
+    const delta = {};
     for (const [iface, cb] of Object.entries(b)) {
-      if (iface === "lo") continue;
-      if (cfg.netemCandidates.length) {
-        if (!cfg.netemCandidates.includes(iface)) continue;
-      } else {
-        if (iface.startsWith("br") || cfg.netemExclude.includes(iface)) continue;
-      }
       const ca = a[iface] ?? { rxPkts: 0, txPkts: 0 };
-      const pps = Math.round((cb.rxPkts - ca.rxPkts + cb.txPkts - ca.txPkts) / sampleSeconds);
-      table.push({ iface, pps, master: masters[iface] ?? null });
+      delta[iface] = Math.round((cb.rxPkts - ca.rxPkts + cb.txPkts - ca.txPkts) / sampleSeconds);
     }
-    table.sort((x, y) => y.pps - x.pps);
-    if (!table.length) throw new Error("no candidate interfaces found on the netem VM");
-    for (const row of table.slice(0, 6)) {
-      log(`  ${row.iface.padEnd(12)} ${String(row.pps).padStart(6)} pps${row.master ? `  (bridge ${row.master})` : ""}`);
+    const groups = rankLinkGroups(delta, masters, cfg.netemCandidates, cfg.netemExclude);
+    if (!groups.length) throw new Error("no candidate interfaces found on the netem VM");
+    for (const g of groups.slice(0, 6)) {
+      log(`  link ${g.bridge.padEnd(8)} ${String(g.pps).padStart(6)} pps  ports=${g.ports.join(",")}`);
     }
-    const active = table[0];
+    const active = groups[0];
     checkpoint(true, "Active link detected",
-      `${active.iface} (${active.pps} pps${active.master ? `, bridge ${active.master}` : ""})`);
-    return { ...active, table };
+      `${active.bridge} (${active.pps} pps, ports ${active.ports.join("+")})`);
+    return { bridge: active.bridge, ports: active.ports, pps: active.pps, iface: active.ports[0], groups };
   } finally {
     conn.end();
   }
+}
+
+/** Apply a netem spec to every port of a link, tracking each in impairedIfaces. */
+async function applyToLink(cfg, ports, spec, impairedIfaces) {
+  for (const iface of ports) {
+    await applyNetemImpairment(cfg, iface, spec);
+    if (impairedIfaces) impairedIfaces.add(iface);
+  }
+}
+async function clearLink(cfg, ports) {
+  for (const iface of ports) await clearNetemImpairment(cfg, iface);
 }
 
 /* module-level registry of interfaces we impaired — the safety net that
@@ -1422,25 +1458,25 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
   const s = cfg.plSchedule;
   const deadline = Date.now() + durationMs;
   const events = [];
-  const note = (iface, event) => {
-    const ev = { t: new Date().toISOString(), iface, event };
+  const note = (link, event) => {
+    const ev = { t: new Date().toISOString(), iface: link, event };
     events.push(ev);
-    setStatus({ netem: `${event} on ${iface}` });
-    log(`impairment: ${event} on ${iface}`);
+    setStatus({ netem: `${event} on ${link}` });
+    log(`impairment: ${event} on ${link}`);
     if (onEvent) onEvent(ev);
   };
+  const label = (d) => `${d.bridge} (${d.ports.join("+")})`;
 
   if (plType === "constant") {
     // The ramp stays on the initially-active link: traffic leaving it under
     // increasing loss (and possibly returning) is exactly what we measure.
-    const { iface } = await detectActiveLink(cfg);
+    const det = await detectActiveLink(cfg);
     let pct = 0;
     while (Date.now() < deadline && !isAborted()) {
       pct += s.rampStepPct;
       try {
-        await applyNetemImpairment(cfg, iface, { lossPct: pct });
-        impairedIfaces.add(iface);
-        note(iface, `loss ${pct}%`);
+        await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
+        note(label(det), `loss ${pct}%`);
       } catch (e) {
         log(`WARN: ramp step failed (${e.message}) — retrying next interval`);
         pct -= s.rampStepPct; // retry the same level next tick
@@ -1450,13 +1486,12 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
   } else if (plType === "burst") {
     while (Date.now() < deadline && !isAborted()) {
       try {
-        const { iface } = await detectActiveLink(cfg);
-        await applyNetemImpairment(cfg, iface, { lossPct: s.burstLossPct });
-        impairedIfaces.add(iface);
-        note(iface, `burst loss ${s.burstLossPct}%`);
+        const det = await detectActiveLink(cfg);
+        await applyToLink(cfg, det.ports, { lossPct: s.burstLossPct }, impairedIfaces);
+        note(label(det), `burst loss ${s.burstLossPct}%`);
         await sleepWithin(deadline, s.burstDurationSec * 1000);
-        await clearNetemImpairment(cfg, iface);
-        note(iface, "clear");
+        await clearLink(cfg, det.ports);
+        note(label(det), "clear");
       } catch (e) {
         log(`WARN: burst cycle failed (${e.message}) — retrying next interval`);
       }
@@ -1468,13 +1503,12 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
       try {
-        const { iface } = await detectActiveLink(cfg);
-        await applyNetemImpairment(cfg, iface, { lossPct: s.randomLossPct });
-        impairedIfaces.add(iface);
-        note(iface, `random loss ${s.randomLossPct}%`);
+        const det = await detectActiveLink(cfg);
+        await applyToLink(cfg, det.ports, { lossPct: s.randomLossPct }, impairedIfaces);
+        note(label(det), `random loss ${s.randomLossPct}%`);
         await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000);
-        await clearNetemImpairment(cfg, iface);
-        note(iface, "clear");
+        await clearLink(cfg, det.ports);
+        note(label(det), "clear");
       } catch (e) {
         log(`WARN: random-loss event failed (${e.message}) — retrying after next gap`);
       }
@@ -1495,42 +1529,28 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
   const events = [];
   const hi = Math.max(tc.link1.delayMs, tc.link2.delayMs);
   const lo = Math.min(tc.link1.delayMs, tc.link2.delayMs);
-  const note = (iface, event) => {
-    const ev = { t: new Date().toISOString(), iface, event };
+  const note = (link, event) => {
+    const ev = { t: new Date().toISOString(), iface: link, event };
     events.push(ev);
-    setStatus({ netem: `${event} on ${iface}` });
-    log(`impairment: ${event} on ${iface}`);
+    setStatus({ netem: `${event} on ${link}` });
+    log(`impairment: ${event} on ${link}`);
   };
+  const label = (g) => `${g.bridge} (${g.ports.join("+")})`;
   if (hi === 0) {
     log(`${tc.name}: both links clean — no impairment to apply`);
     return events;
   }
   const det = await detectActiveLink(cfg);
-  await applyNetemImpairment(cfg, det.iface, { delayMs: hi });
-  impairedIfaces.add(det.iface);
-  note(det.iface, `delay ${hi}ms (active link)`);
+  await applyToLink(cfg, det.ports, { delayMs: hi }, impairedIfaces);
+  note(label(det), `delay ${hi}ms (active link)`);
   if (lo > 0) {
-    let other = null;
-    if (cfg.netemCandidates.length === 2) {
-      other = cfg.netemCandidates.find((i) => i !== det.iface) || null;
-    } else if (det.table.length >= 2) {
-      // the standby link must be on a DIFFERENT bridge — the second-busiest
-      // NIC is usually just the other leg of the active bridge
-      const differentBridge = det.table.find(
-        (r) => r.iface !== det.iface && (r.master ?? r.iface) !== (det.master ?? det.iface));
-      other = differentBridge ? differentBridge.iface : det.table[1].iface;
-      if (!differentBridge) {
-        log("WARN: no NIC on a different bridge found — standby pick may be the " +
-            "active link's other leg; set NETEM_CANDIDATE_IFACES to be safe");
-      }
-    }
-    if (other) {
-      await applyNetemImpairment(cfg, other, { delayMs: lo });
-      impairedIfaces.add(other);
-      note(other, `delay ${lo}ms (standby link)`);
+    // standby = the next link group on a DIFFERENT bridge
+    const standby = det.groups.find((g) => g.bridge !== det.bridge);
+    if (standby) {
+      await applyToLink(cfg, standby.ports, { delayMs: lo }, impairedIfaces);
+      note(label(standby), `delay ${lo}ms (standby link)`);
     } else {
-      log(`WARN: standby link interface unknown — set NETEM_CANDIDATE_IFACES ` +
-          `(csv of the two link NICs); skipping the ${lo}ms side`);
+      log(`WARN: no second link found — set NETEM_CANDIDATE_IFACES; skipping the ${lo}ms side`);
     }
   }
   return events;
@@ -1554,12 +1574,13 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
   const events = [];
   const r = cfg.latencyRamp;
   const deadline = Date.now() + durationMs;
-  const note = (iface, event) => {
-    const ev = { t: new Date().toISOString(), iface, event };
+  const note = (link, event) => {
+    const ev = { t: new Date().toISOString(), iface: link, event };
     events.push(ev);
-    setStatus({ netem: `${event} on ${iface}` });
-    log(`impairment: ${event} on ${iface}`);
+    setStatus({ netem: `${event} on ${link}` });
+    log(`impairment: ${event} on ${link}`);
   };
+  const label = (g) => `${g.bridge} (${g.ports.join("+")})`;
 
   const hi = Math.max(tc.link1.delayMs, tc.link2.delayMs);
   const lo = Math.min(tc.link1.delayMs, tc.link2.delayMs);
@@ -1569,34 +1590,22 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     return events;
   }
 
-  // 1. detect active link + apply the initial delays
+  // 1. detect active link (bridge + all ports) + apply the initial delays to
+  //    EVERY port of the link (bridged traffic uses both ports)
   const det = await detectActiveLink(cfg);
-  const activeIface = det.iface;
-  sync.activeIface = activeIface;
-  let other = null;
-  if (cfg.netemCandidates.length === 2) {
-    other = cfg.netemCandidates.find((i) => i !== activeIface) || null;
-  } else if (det.table.length >= 2) {
-    const diff = det.table.find(
-      (x) => x.iface !== activeIface && (x.master ?? x.iface) !== (det.master ?? activeIface));
-    other = diff ? diff.iface : det.table[1].iface;
-    if (!diff) {
-      log("WARN: no NIC on a different bridge found — standby pick may be the " +
-          "active link's other leg; set NETEM_CANDIDATE_IFACES to be safe");
-    }
-  }
+  const activePorts = det.ports;
+  sync.activeIface = label(det);
+  const standby = det.groups.find((g) => g.bridge !== det.bridge);
 
   let current = hi;
-  await applyNetemImpairment(cfg, activeIface, { delayMs: current });
-  impairedIfaces.add(activeIface);
+  await applyToLink(cfg, activePorts, { delayMs: current }, impairedIfaces);
   sync.currentMs = current;
-  note(activeIface, `initial delay ${current}ms${band ? ` (${band})` : ""} on active link`);
-  if (lo > 0 && other) {
-    await applyNetemImpairment(cfg, other, { delayMs: lo });
-    impairedIfaces.add(other);
-    note(other, `delay ${lo}ms (standby link)`);
+  note(label(det), `initial delay ${current}ms${band ? ` (${band})` : ""} on active link`);
+  if (lo > 0 && standby) {
+    await applyToLink(cfg, standby.ports, { delayMs: lo }, impairedIfaces);
+    note(label(standby), `delay ${lo}ms (standby link)`);
   } else if (lo > 0) {
-    log(`WARN: standby link interface unknown — set NETEM_CANDIDATE_IFACES; skipping the ${lo}ms side`);
+    log(`WARN: no second link found — set NETEM_CANDIDATE_IFACES; skipping the ${lo}ms side`);
   }
 
   // 2. stabilize window — observe whether DMTS switches naturally
@@ -1607,25 +1616,25 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     await sleep(2000);
   }
   if (sync.switched) {
-    note(activeIface, `switch observed during stabilize at ${current}ms — ramp not started`);
+    note(label(det), `switch observed during stabilize at ${current}ms — ramp not started`);
     return events;
   }
   if (isAborted() || Date.now() >= deadline) return events;
 
-  // 3. ramp +stepMs every intervalSec until switch / max / deadline
+  // 3. ramp +stepMs every intervalSec on ALL active-link ports until switch / max / deadline
   log(`${tc.name}: no switch after stabilize — ramping +${r.stepMs}ms every ${r.intervalSec}s (max ${r.maxMs}ms)`);
   while (Date.now() < deadline && !isAborted() && !sync.switched) {
     if (current >= r.maxMs) {
       sync.maxReached = true;
-      note(activeIface, `reached max ${r.maxMs}ms without a switch — holding until test ends`);
+      note(label(det), `reached max ${r.maxMs}ms without a switch — holding until test ends`);
       break;
     }
     const next = Math.min(current + r.stepMs, r.maxMs);
     try {
-      await applyNetemImpairment(cfg, activeIface, { delayMs: next });
+      await applyToLink(cfg, activePorts, { delayMs: next }, impairedIfaces);
       current = next;
       sync.currentMs = current;
-      note(activeIface, `ramp delay ${current}ms`);
+      note(label(det), `ramp delay ${current}ms`);
     } catch (e) {
       log(`WARN: ramp step to ${next}ms failed (${e.message}) — retrying next interval`);
     }
@@ -3009,7 +3018,7 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  parseNetemIfaces, sanitizeNetem,
+  parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // parsing / cases / reports (tests)

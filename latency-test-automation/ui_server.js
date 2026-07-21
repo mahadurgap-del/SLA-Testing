@@ -412,7 +412,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <div><label>TC2 burst duration (s)</label><input name="burstDurationSec" value="${esc(d.burstDurationSec)}"><div class="errmsg"></div></div>
     <div><label>TC2 burst loss (%)</label><input name="burstLossPct" value="${esc(d.burstLossPct)}"><div class="errmsg"></div></div>
     <div><label>TC3 random loss (%)</label><input name="randomLossPct" value="${esc(d.randomLossPct)}"><div class="errmsg"></div></div>
-    <div style="grid-column: 1 / -1;"><label>Overlay link interfaces on netem VM (csv, e.g. ens192,ens193 — empty = auto-detect among non-bridge NICs)</label>
+    <div style="grid-column: 1 / -1;"><label>Overlay link ports on netem VM (csv, e.g. ens192,ens193,ens224,ens225 — empty = auto-detect bridge links; impairment is applied to ALL ports of the active bridge)</label>
       <input name="netemCandidates" value="${esc(d.netemCandidates)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
