@@ -41,22 +41,43 @@ let running = false;
 
 const SECRET_FIELDS = ["clientPass", "serverPass", "spokePass", "hubPass", "netemPass", "confToken"];
 
+// the form state is auto-saved under this profile on every Start and
+// prefilled on page load — no retyping after a refresh
+const DEFAULT_PROFILE = "__default__";
+
+function savedDefaults() {
+  return loadProfiles()[DEFAULT_PROFILE] || {};
+}
+
+function rememberDefaults(params) {
+  try {
+    const profiles = loadProfiles();
+    profiles[DEFAULT_PROFILE] = { ...params };
+    saveProfiles(profiles);
+  } catch (e) {
+    console.error("could not persist defaults:", e.message);
+  }
+}
+
 function formDefaults() {
-  const p = engine.paramsFromEnv();
+  // saved form state wins over env defaults
+  const p = { ...engine.paramsFromEnv(), ...savedDefaults() };
   const d = { ...p };
   for (const f of SECRET_FIELDS) {
     d[f + "Set"] = !!p[f];
-    d[f] = "";
+    d[f] = ""; // secrets are never rendered into the page
   }
   return d;
 }
 
 function mergeSecrets(body) {
   const envp = engine.paramsFromEnv();
-  const p = { ...envp, ...body };
-  for (const f of SECRET_FIELDS) if (!body[f]) p[f] = envp[f];
-  p.durationSec = body.durationSec || envp.durationSec;
-  p.baselineDurationSec = body.baselineDurationSec || envp.baselineDurationSec;
+  const saved = savedDefaults();
+  const base = { ...envp, ...saved };
+  const p = { ...base, ...body };
+  for (const f of SECRET_FIELDS) if (!body[f]) p[f] = saved[f] || envp[f];
+  p.durationSec = body.durationSec || base.durationSec;
+  p.baselineDurationSec = body.baselineDurationSec || base.baselineDurationSec;
   p.headless = body.headless !== false;
   p.confluence = !!body.confluence;
   p.debugMode = !!body.debugMode;
@@ -98,7 +119,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(PAGE(formDefaults(), Object.keys(loadProfiles())));
+      res.end(PAGE(formDefaults(), Object.keys(loadProfiles()).filter((n) => n !== DEFAULT_PROFILE)));
       return;
     }
 
@@ -174,7 +195,7 @@ const server = http.createServer(async (req, res) => {
           if (!profiles[name]) return json(res, 404, { ok: false, error: "no such profile" });
           return json(res, 200, { ok: true, profile: profiles[name] });
         }
-        return json(res, 200, { ok: true, names: Object.keys(profiles) });
+        return json(res, 200, { ok: true, names: Object.keys(profiles).filter((n) => n !== DEFAULT_PROFILE) });
       }
       if (req.method === "POST") {
         const b = await readBody(req);
@@ -183,14 +204,14 @@ const server = http.createServer(async (req, res) => {
         const profiles = loadProfiles();
         profiles[b.name] = b.params || {};
         saveProfiles(profiles);
-        return json(res, 200, { ok: true, names: Object.keys(profiles) });
+        return json(res, 200, { ok: true, names: Object.keys(profiles).filter((n) => n !== DEFAULT_PROFILE) });
       }
       if (req.method === "DELETE") {
         const name = url.searchParams.get("name");
         const profiles = loadProfiles();
         delete profiles[name];
         saveProfiles(profiles);
-        return json(res, 200, { ok: true, names: Object.keys(profiles) });
+        return json(res, 200, { ok: true, names: Object.keys(profiles).filter((n) => n !== DEFAULT_PROFILE) });
       }
     }
 
@@ -212,6 +233,9 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readBody(req);
       const p = mergeSecrets(body);
+      // remember the form (with resolved secrets) even if validation fails,
+      // so a refresh never loses what was typed
+      rememberDefaults(p);
       const check = engine.validateParams(p);
       if (p.confluence) {
         if (!p.confEmail) { check.ok = false; check.errors.confEmail = "required for Confluence upload"; }
@@ -325,7 +349,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       ${["spoke", "hub", "netem"].includes(side)
         ? `<label>IP</label><input name="${side}Host" value="${esc(d[side + "Host"])}"><div class="errmsg"></div>` : ""}
       <label>Username</label><input name="${side}User" value="${esc(d[side + "User"])}"><div class="errmsg"></div>
-      <label>Password ${d[side + "PassSet"] ? "(blank = env)" : ""}</label><input name="${side}Pass" type="password"><div class="errmsg"></div>
+      <label>Password ${d[side + "PassSet"] ? "(saved — blank keeps it)" : ""}</label><input name="${side}Pass" type="password"><div class="errmsg"></div>
       <label>or key path</label><input name="${side}Key" value="${esc(d[side + "Key"])}"><div class="errmsg"></div>
     </div>`).join("")}
   </div></fieldset>
@@ -411,7 +435,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <fieldset><legend>Confluence</legend><div class="grid">
     <div class="full"><label><input type="checkbox" name="confluence" style="width:auto" ${d.confluence ? "checked" : ""}> Upload results to Confluence</label></div>
     <div><label>Email</label><input name="confEmail" value="${esc(d.confEmail)}"><div class="errmsg"></div></div>
-    <div><label>API token ${d.confTokenSet ? "(blank = env)" : ""}</label><input name="confToken" type="password"><div class="errmsg"></div></div>
+    <div><label>API token ${d.confTokenSet ? "(saved — blank keeps it)" : ""}</label><input name="confToken" type="password"><div class="errmsg"></div></div>
     <div class="full"><label>Base URL</label><input name="confBase" value="${esc(d.confBase)}"><div class="errmsg"></div></div>
     <div><label>Page URL or ID (update)</label><input name="confPageId" value="${esc(d.confPageId)}" placeholder="paste the page link"><div class="errmsg"></div></div>
     <div><label>Space key (create)</label><input name="confSpace" value="${esc(d.confSpace)}"><div class="errmsg"></div></div>
