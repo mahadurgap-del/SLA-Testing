@@ -56,6 +56,7 @@ function mergeSecrets(body) {
   const p = { ...envp, ...body };
   for (const f of SECRET_FIELDS) if (!body[f]) p[f] = envp[f];
   p.durationSec = body.durationSec || envp.durationSec;
+  p.baselineDurationSec = body.baselineDurationSec || envp.baselineDurationSec;
   p.headless = body.headless !== false;
   p.confluence = !!body.confluence;
   p.debugMode = !!body.debugMode;
@@ -354,6 +355,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       </select><div class="errmsg"></div></div>
     <div><label>Bandwidth</label><input name="bandwidth" value="${esc(d.bandwidth)}" placeholder="e.g. 1000M"><div class="errmsg"></div></div>
     <div><label>Duration (s)</label><input name="durationSec" value="${esc(d.durationSec)}"><div class="errmsg"></div></div>
+    <div><label>TC1 baseline duration (s)</label><input name="baselineDurationSec" value="${esc(d.baselineDurationSec)}"><div class="errmsg"></div></div>
     <div><label>Parallel streams</label><input name="parallelStreams" value="${esc(d.parallelStreams)}"><div class="errmsg"></div></div>
     <div><label>ToS / DSCP</label><input name="tos" value="${esc(d.tos)}"><div class="errmsg"></div></div>
     <div><label>Packet size (bytes)</label><input name="packetSize" value="${esc(d.packetSize)}" placeholder="tool default"><div class="errmsg"></div></div>

@@ -350,6 +350,7 @@ function validateParams(p) {
   }
   if (!parseTos(p.tos)) errors.tos = "must be 0xNN hex or decimal 0-255";
   if (!parseDuration(p.durationSec)) errors.durationSec = "must be a positive integer (seconds)";
+  if (!parseDuration(p.baselineDurationSec)) errors.baselineDurationSec = "must be a positive integer (seconds)";
   if (!parseBandwidth(p.bandwidth).ok) errors.bandwidth = "e.g. 10M, 500K, 1G, or empty";
   if (parseTcChoice(p.tcChoice) === null) errors.tcChoice = "must be TC1-TC4 or all";
   if (parseConfPageId(p.confPageId) === null)
@@ -444,6 +445,8 @@ function paramsFromEnv() {
     trafficDirection: envOr("TRAFFIC_DIRECTION", "upstream"), // upstream | downstream (-R)
     tos: "0xB8",
     durationSec: 600,
+    // the clean 0ms/0ms baseline case needs less time than impairment cases
+    baselineDurationSec: envOr("BASELINE_DURATION_SEC", "300"),
     bandwidth: envOr("TRAFFIC_BANDWIDTH", ""),
     parallelStreams: envOr("PARALLEL_STREAMS", "1"),
     packetSize: envOr("PACKET_SIZE", ""),
@@ -518,7 +521,7 @@ function buildTestCases(cfg, mode = "latency") {
   const P = (lossPct) => ({ delayMs: 0, lossPct });
   if (mode === "latency") {
     return [
-      { n: 1, name: "TC1_0ms_0ms", mode, link1: L(0),         link2: L(0),          expectSwitch: false },
+      { n: 1, name: "TC1_0ms_0ms", mode, link1: L(0),         link2: L(0),          expectSwitch: false, baseline: true },
       { n: 2, name: "TC2_0ms_LEO", mode, link1: L(0),         link2: L(LEO_MS),     expectSwitch: true },
       { n: 3, name: "TC3_LEO_MEO", mode, link1: L(LEO_MS),    link2: L(cfg.meoMs),  expectSwitch: true },
       { n: 4, name: "TC4_MEO_GEO", mode, link1: L(cfg.meoMs), link2: L(cfg.geoMs),  expectSwitch: true },
@@ -2384,8 +2387,15 @@ async function runSuite(cfg, params) {
           continue;
         }
         setStatus({ caseIndex: i + 1 });
+        // clean baseline case (TC1 0ms/0ms) runs shorter than impairment cases
+        const caseDurationMs = tc.baseline
+          ? parseDuration(params.baselineDurationSec) * 1000
+          : durationMs;
+        if (tc.baseline && caseDurationMs !== durationMs) {
+          log(`${tc.name}: baseline case — running ${caseDurationMs / 1000}s instead of ${durationMs / 1000}s`);
+        }
         try {
-          const r = await runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs);
+          const r = await runTestCase(cfg, browser, page, tc, traffic, baseDir, caseDurationMs);
           results.push(r);
         } catch (e) {
           log(`ERROR: ${tc.name} aborted: ${e.message}`);
@@ -2531,6 +2541,8 @@ async function interactiveSetup(p) {
     (s) => (["upstream", "downstream"].includes(s.toLowerCase()) ? s.toLowerCase() : null));
   p.tos = await askValidated("ToS/DSCP value (hex 0xNN or decimal)", p.tos, (s) => parseTos(s));
   p.durationSec = await askValidated("Traffic duration seconds", p.durationSec, (s) => parseDuration(s));
+  p.baselineDurationSec = await askValidated("Baseline TC1 (0ms/0ms) duration seconds",
+    p.baselineDurationSec, (s) => parseDuration(s));
   p.bandwidth = await askValidated("Bandwidth (e.g. 10M, empty = tool default)", p.bandwidth,
     (s) => (parseBandwidth(s).ok ? (s || "") : null));
   p.parallelStreams = await askValidated("Parallel streams", p.parallelStreams,
