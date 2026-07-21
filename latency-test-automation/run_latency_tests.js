@@ -426,6 +426,7 @@ function buildConfig(p) {
       geo: [parseInt(p.geoMinMs, 10) || 600, parseInt(p.geoMaxMs, 10) || 1000],
     },
     latencyRamp: {
+      enabled: p.latencyRampEnabled === true || p.latencyRampEnabled === "true",
       stabilizeSec: parseInt(p.latencyStabilizeSec, 10) || 180,
       stepMs: parseInt(p.latencyRampStepMs, 10) || 50,
       intervalSec: parseInt(p.latencyRampIntervalSec, 10) || 60,
@@ -469,9 +470,11 @@ function paramsFromEnv() {
     trafficType: "UDP",
     trafficDirection: envOr("TRAFFIC_DIRECTION", "upstream"), // upstream | downstream (-R)
     tos: "0xB8",
-    durationSec: 600,
-    // the clean 0ms/0ms baseline case needs less time than impairment cases
+    durationSec: envOr("DURATION_SEC", "300"),        // 5 min observation per case
     baselineDurationSec: envOr("BASELINE_DURATION_SEC", "300"),
+    // latency test method: default = hold the configured LEO/MEO/GEO values and
+    // observe for a switch. Ramp mode (escalate the active link) is opt-in.
+    latencyRampEnabled: envOr("LATENCY_RAMP_ENABLED", "false") === "true",
     // RTT ranges (ms) — a value is drawn at random per run for each test case
     leoMinMs: envOr("LEO_MIN_MS", "30"),
     leoMaxMs: envOr("LEO_MAX_MS", "50"),
@@ -858,7 +861,9 @@ function activeTcs(record) {
     const qoe = tc.qoe;
     if (qoe === null || qoe === undefined) continue;
     if (["IDLE", "NOREF"].includes(String(qoe).toUpperCase())) continue;
-    if (tc.dom_link === null || tc.dom_link === undefined) continue;
+    // dom_link < 0 (e.g. -1) = no dominant link / traffic gap — not a real
+    // link, so ignore it (prevents phantom X -> -1 -> X "switches")
+    if (tc.dom_link === null || tc.dom_link === undefined || tc.dom_link < 0) continue;
     out.push({ name, domLink: tc.dom_link, tc });
   }
   return out;
@@ -1635,6 +1640,15 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     log(`WARN: no second link found — set NETEM_CANDIDATE_IFACES; skipping the ${lo}ms side`);
   }
 
+  // DEFAULT (ramp disabled): hold the configured values for the whole window
+  // and let the concurrent monitor observe whether DMTS switches. No escalation.
+  if (!r.enabled) {
+    log(`${tc.name}: holding ${current}ms${band ? ` (${band})` : ""} on the active link ` +
+        `for ${Math.round(durationMs / 1000)}s — observing for a switch (no ramp)`);
+    setStatus({ netem: `holding ${current}ms${band ? ` (${band})` : ""}` });
+    return events;
+  }
+
   // 2. stabilize window — observe whether DMTS switches naturally
   log(`${tc.name}: stabilize ${r.stabilizeSec}s at ${current}ms before ramping — watching for a natural switch`);
   setStatus({ netem: `${current}ms — stabilizing (${r.stabilizeSec}s)` });
@@ -2112,19 +2126,29 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   }
   result.switchObserved = result.switches.length > 0;
   if (isLatencyRamp) {
+    const held = Math.max(tc.link1.delayMs, tc.link2.delayMs);
+    const ramped = cfg.latencyRamp.enabled;
     result.latencyRamp = {
-      initialMs: Math.max(tc.link1.delayMs, tc.link2.delayMs),
+      mode: ramped ? "ramp" : "hold",
+      initialMs: held,
+      windowSec: Math.round(durationMs / 1000),
       maxMs: cfg.latencyRamp.maxMs,
       stepMs: cfg.latencyRamp.stepMs,
       stabilizeSec: cfg.latencyRamp.stabilizeSec,
       switchLatencyMs: result.switchLatencyMs ?? null,
       maxReached: !!sync.maxReached,
     };
-    result.rampNote = result.switchObserved
-      ? `Switched at ${result.switchLatencyMs}ms latency`
-      : sync.maxReached
-        ? "No switch observed within configured latency range"
-        : "No switch observed before test duration ended";
+    if (ramped) {
+      result.rampNote = result.switchObserved
+        ? `Switched at ${result.switchLatencyMs}ms latency`
+        : sync.maxReached
+          ? "No switch observed within configured latency range"
+          : "No switch observed before test duration ended";
+    } else {
+      result.rampNote = result.switchObserved
+        ? `Switched while holding ${held}ms for ${result.latencyRamp.windowSec}s`
+        : `No switch observed while holding ${held}ms for ${result.latencyRamp.windowSec}s`;
+    }
     log(`${tc.name}: ${result.rampNote}`);
   }
   checkpoint(true, `${tc.name} monitoring complete`,
