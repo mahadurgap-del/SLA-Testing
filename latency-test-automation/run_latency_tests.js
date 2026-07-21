@@ -134,8 +134,13 @@ function clearAbort() {
 const AUTOMATION_LOG = path.join(process.cwd(), "automation.log");
 
 function resetRunLogs() {
-  status.checkpoints = [];
-  status.paused = null;
+  // clear transient per-run status so the panel never shows stale fields from
+  // a previous (e.g. aborted) run — confluence "skipped", old netem/results...
+  Object.assign(status, {
+    checkpoints: [], paused: null, currentCase: null, caseIndex: 0, caseCount: 0,
+    caseStartedAt: null, netem: null, trafficVerified: null, switchObserved: null,
+    lastSwitch: null, collection: {}, confluence: "pending", results: [], error: null,
+  });
   try {
     fs.writeFileSync(AUTOMATION_LOG, `# automation.log — run started ${new Date().toISOString()}\n`);
   } catch { /* read-only cwd */ }
