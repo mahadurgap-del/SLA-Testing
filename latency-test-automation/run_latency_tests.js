@@ -570,32 +570,25 @@ async function preflight(cfg) {
 
   if (cfg.confluence) {
     log("pre-flight: Confluence auth check");
-    const auth = { Authorization: confAuthHeader(cfg.confluence) };
-    // 1. does the email/token pair authenticate at all?
-    const who = await fetch(`${cfg.confluence.base}/wiki/rest/api/user/current`, { headers: auth });
-    const whoBody = (await who.text()).slice(0, 300);
-    if (!who.ok) {
-      throw new Error(
-        `Confluence auth failed (HTTP ${who.status}). Check that CONF email is the ` +
-        `Atlassian account that created the token, and that the API token has ` +
-        `Confluence access — scoped tokens without Confluence scopes return 403; ` +
-        `create a classic token at id.atlassian.com > Security > API tokens. ` +
-        `Server said: ${whoBody}`);
-    }
-    let whoName = "user";
-    try { whoName = JSON.parse(whoBody).displayName || whoName; } catch { /* not json */ }
+    // 1. resolve which endpoint the token works against (classic token ->
+    //    site URL, scoped token -> api.atlassian.com gateway)
+    const whoName = await resolveConfApiBase(cfg.confluence);
     log(`pre-flight: Confluence auth OK (${whoName})`);
     // 2. can this token see the target page/space?
+    const apiBase = confApiBase(cfg.confluence);
     const target = cfg.confluence.pageId
-      ? { url: `${cfg.confluence.base}/wiki/rest/api/content/${cfg.confluence.pageId}`,
+      ? { url: `${apiBase}/rest/api/content/${cfg.confluence.pageId}`,
           desc: `page ${cfg.confluence.pageId}` }
-      : { url: `${cfg.confluence.base}/wiki/rest/api/space/${cfg.confluence.space}`,
+      : { url: `${apiBase}/rest/api/space/${cfg.confluence.space}`,
           desc: `space ${cfg.confluence.space}` };
-    const resp = await fetch(target.url, { headers: auth });
+    const resp = await fetch(target.url, {
+      headers: { Authorization: confAuthHeader(cfg.confluence) },
+    });
     if (!resp.ok) {
       throw new Error(
         `Confluence auth works (${whoName}) but access to ${target.desc} failed ` +
-        `(HTTP ${resp.status}): ${(await resp.text()).slice(0, 300)}`);
+        `(HTTP ${resp.status}): ${(await resp.text()).slice(0, 300)} — for scoped ` +
+        `tokens verify the content read/write scopes were granted`);
     }
     log(`pre-flight: Confluence OK (${target.desc} reachable)`);
   }
@@ -1698,6 +1691,62 @@ function confAuthHeader(conf) {
   return "Basic " + Buffer.from(`${conf.email}:${conf.token}`).toString("base64");
 }
 
+/** Effective REST base: site URL for classic tokens, api.atlassian.com
+ *  gateway for scoped tokens (set by resolveConfApiBase). */
+function confApiBase(conf) {
+  return conf.apiBase || `${conf.base}/wiki`;
+}
+
+/**
+ * Figure out which endpoint this email/token pair works against:
+ *   1. the site itself      {base}/wiki/rest/api/...          (classic token)
+ *   2. the API gateway      api.atlassian.com/ex/confluence/{cloudId}/wiki/...
+ *   3. gateway without /wiki                                  (scoped token)
+ * Stores the winner on conf.apiBase and returns the display name. Throws with
+ * the per-endpoint status list if none authenticate.
+ */
+async function resolveConfApiBase(conf) {
+  if (conf.apiBase) return conf.resolvedUser || "user";
+  const auth = { Authorization: confAuthHeader(conf) };
+  const candidates = [`${conf.base}/wiki`];
+  try {
+    const ti = await fetch(`${conf.base}/_edge/tenant_info`);
+    if (ti.ok) {
+      const { cloudId } = await ti.json();
+      if (cloudId) {
+        candidates.push(`https://api.atlassian.com/ex/confluence/${cloudId}/wiki`);
+        candidates.push(`https://api.atlassian.com/ex/confluence/${cloudId}`);
+      }
+    }
+  } catch { /* gateway lookup unavailable — site URL only */ }
+
+  const attempts = [];
+  for (const apiBase of candidates) {
+    try {
+      const resp = await fetch(`${apiBase}/rest/api/user/current`, { headers: auth });
+      const body = (await resp.text()).slice(0, 300);
+      if (resp.ok) {
+        conf.apiBase = apiBase;
+        try { conf.resolvedUser = JSON.parse(body).displayName || "user"; }
+        catch { conf.resolvedUser = "user"; }
+        if (apiBase !== `${conf.base}/wiki`) {
+          log(`Confluence: scoped token detected — using API gateway ${apiBase}`);
+        }
+        return conf.resolvedUser;
+      }
+      attempts.push(`${apiBase} -> HTTP ${resp.status} ${body.slice(0, 120)}`);
+    } catch (e) {
+      attempts.push(`${apiBase} -> ${e.message}`);
+    }
+  }
+  throw new Error(
+    "Confluence auth failed on every endpoint. For a classic token check the " +
+    "email/token pair; for a scoped token make sure these Confluence scopes are " +
+    "granted: read:confluence-user, read:confluence-content.all, " +
+    "read:confluence-space.summary, write:confluence-content, write:confluence-file. " +
+    "Attempts: " + attempts.join(" | "));
+}
+
 async function confFetch(conf, url, options = {}, label = "Confluence API") {
   return withRetry(async () => {
     const resp = await fetch(url, {
@@ -1832,7 +1881,7 @@ function buildCaseSection(r) {
 }
 
 async function confUploadAttachment(conf, pageId, filepath, asName = null) {
-  const url = `${conf.base}/wiki/rest/api/content/${pageId}/child/attachment?allowDuplicated=true`;
+  const url = `${confApiBase(conf)}/rest/api/content/${pageId}/child/attachment?allowDuplicated=true`;
   const form = new FormData();
   const buf = fs.readFileSync(filepath);
   form.append("file", new Blob([buf]), asName || path.basename(filepath));
@@ -1849,12 +1898,13 @@ async function confUploadAttachment(conf, pageId, filepath, asName = null) {
 }
 
 async function publishToConfluence(conf, results, meta, extraFiles = []) {
+  await resolveConfApiBase(conf); // no-op if pre-flight already resolved it
   const body = buildStorageBody(results, meta);
   let pageId = conf.pageId;
 
   if (pageId) {
     const getResp = await confFetch(conf,
-      `${conf.base}/wiki/rest/api/content/${pageId}?expand=body.storage,version`, {}, "get page");
+      `${confApiBase(conf)}/rest/api/content/${pageId}?expand=body.storage,version`, {}, "get page");
     if (!getResp.ok) throw new Error(`get page ${pageId}: HTTP ${getResp.status}`);
     const page = await getResp.json();
     if (String(page.id) !== String(pageId)) {
@@ -1867,7 +1917,7 @@ async function publishToConfluence(conf, results, meta, extraFiles = []) {
       version: { number: page.version.number + 1, message: "impairment test automation run" },
       body: { storage: { value: page.body.storage.value + body, representation: "storage" } },
     };
-    const putResp = await confFetch(conf, `${conf.base}/wiki/rest/api/content/${pageId}`, {
+    const putResp = await confFetch(conf, `${confApiBase(conf)}/rest/api/content/${pageId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1882,7 +1932,7 @@ async function publishToConfluence(conf, results, meta, extraFiles = []) {
       ...(conf.parentId ? { ancestors: [{ id: conf.parentId }] } : {}),
       body: { storage: { value: body, representation: "storage" } },
     };
-    const resp = await confFetch(conf, `${conf.base}/wiki/rest/api/content`, {
+    const resp = await confFetch(conf, `${confApiBase(conf)}/rest/api/content`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -2232,7 +2282,7 @@ module.exports = {
   bus, getStatus, setStatus,
   // validators
   isValidIp, parseTos, parseBandwidth, parseDuration, parseTcChoice, validateParams,
-  parsePort, parsePosInt, parseConfPageId,
+  parsePort, parsePosInt, parseConfPageId, confApiBase, resolveConfApiBase,
   // traffic generation + interface discovery
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
   // netem impairment + dynamic packet loss
