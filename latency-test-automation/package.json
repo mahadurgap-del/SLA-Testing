@@ -1,0 +1,18 @@
+{
+  "name": "latency-test-automation",
+  "version": "1.0.0",
+  "description": "Automated 4-scenario netem latency validation: drives the netem UI with Playwright, monitors DMTS link switches over SSH, collects logs/diag packs from Hub and Spoke, and publishes results to Confluence.",
+  "main": "run_latency_tests.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node run_latency_tests.js",
+    "postinstall-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.45.0",
+    "ssh2": "^1.15.0"
+  }
+}
