@@ -84,7 +84,9 @@ const bus = new EventEmitter();
 bus.setMaxListeners(50);
 
 const status = {
-  phase: "idle",          // idle | preflight | running | publishing | done | error
+  phase: "idle",          // idle | preflight | running | paused | publishing | done | error | aborted
+  paused: null,           // stage name while waiting for Continue (debug mode)
+  checkpoints: [],        // [{ok, name, detail, t}] — mirrors automation.log
   mode: null,
   currentCase: null,
   caseIndex: 0,
@@ -127,6 +129,68 @@ function isAborted() {
 function clearAbort() {
   abortState.requested = false;
   abortState.reason = null;
+}
+
+/* --- checkpoint log (automation.log) + debug-mode stage gate --- */
+const AUTOMATION_LOG = path.join(process.cwd(), "automation.log");
+
+function resetRunLogs() {
+  status.checkpoints = [];
+  status.paused = null;
+  try {
+    fs.writeFileSync(AUTOMATION_LOG, `# automation.log — run started ${new Date().toISOString()}\n`);
+  } catch { /* read-only cwd */ }
+}
+
+/** Record a named checkpoint: [PASS]/[FAIL] into automation.log, the normal
+ *  log stream, and the live status (panel checklist). */
+function checkpoint(ok, name, detail = "") {
+  const line = `[${ok ? "PASS" : "FAIL"}] ${name}${detail ? ` — ${detail}` : ""}`;
+  try { fs.appendFileSync(AUTOMATION_LOG, line + "\n"); } catch { /* read-only cwd */ }
+  log(line);
+  status.checkpoints.push({ ok, name, detail, t: new Date().toISOString() });
+  bus.emit("status", getStatus());
+  return ok;
+}
+
+let continueResolver = null;
+
+/** Release a debug-mode pause. Returns false if nothing was waiting. */
+function continueRun() {
+  if (!continueResolver) return false;
+  const r = continueResolver;
+  continueResolver = null;
+  r();
+  return true;
+}
+
+/** In debug mode, pause after a stage until Continue (or abort). */
+async function stageGate(cfg, stage) {
+  if (!cfg.debugMode || isAborted()) return;
+  log(`DEBUG MODE: stage "${stage}" complete — waiting for Continue`);
+  const prevPhase = status.phase;
+  setStatus({ phase: "paused", paused: stage });
+  if (process.stdin.isTTY && require.main === module) {
+    ask("Continue? (Enter) ").then(() => continueRun()).catch(() => {});
+  }
+  await new Promise((resolve) => {
+    let done = false;
+    let timer = null;
+    const release = () => {
+      if (done) return;
+      done = true;
+      if (continueResolver === release) continueResolver = null;
+      clearInterval(timer);
+      resolve();
+    };
+    continueResolver = release;
+    timer = setInterval(() => {
+      if (done) { clearInterval(timer); return; }
+      if (isAborted()) release();
+    }, 1000);
+  });
+  setStatus({ phase: prevPhase, paused: null });
+  log(`DEBUG MODE: continuing after "${stage}"`);
 }
 
 /* ========================================================================= *
@@ -323,6 +387,7 @@ function buildConfig(p) {
     spoke: creds(p.spokeHost, p.spokeUser, p.spokePass, p.spokeKey),
     hub: creds(p.hubHost, p.hubUser, p.hubPass, p.hubKey),
     impairmentDriver: p.impairmentDriver,
+    debugMode: !!p.debugMode,
     netemSsh: creds(p.netemHost, p.netemUser, p.netemPass, p.netemKey),
     netemCandidates: String(p.netemCandidates || "").split(",").map((s) => s.trim()).filter(Boolean),
     netemExclude: String(p.netemExclude || "").split(",").map((s) => s.trim()).filter(Boolean),
@@ -433,6 +498,7 @@ function paramsFromEnv() {
     // test selection
     tcChoice: "all",
     mode: "latency",
+    debugMode: envOr("DEBUG_MODE", "false") === "true",
     headless: (envOr("HEADLESS", "true")) !== "false",
     confluence: true,
     confEmail: envOr("CONF_EMAIL", ""),
@@ -571,31 +637,45 @@ function sftpGet(conn, remotePath, localPath) {
 
 async function preflight(cfg) {
   setStatus({ phase: "preflight" });
-  log("pre-flight: checking netem UI reachability");
-  try {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 10000);
-    const resp = await fetch(cfg.netemUiUrl, { signal: ctrl.signal });
-    clearTimeout(t);
-    log(`pre-flight: netem UI responded HTTP ${resp.status}`);
-  } catch (e) {
-    throw new Error(`netem UI unreachable at ${cfg.netemUiUrl}: ${e.message}`);
-  }
 
-  const sshChecks = [["spoke", cfg.spoke], ["hub", cfg.hub]];
+  const httpCheck = async (name, url) => {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10000);
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(t);
+      checkpoint(true, `${name} reachable`, `HTTP ${resp.status}`);
+    } catch (e) {
+      checkpoint(false, `${name} reachable`, e.message);
+      throw new Error(`${name} unreachable at ${url}: ${e.message}`);
+    }
+  };
+  await httpCheck("Netem UI", cfg.netemUiUrl);
+  if (cfg.gridUiSpoke) await httpCheck("Grid UI (spoke)", cfg.gridUiSpoke);
+  if (cfg.gridUiHub) await httpCheck("Grid UI (hub)", cfg.gridUiHub);
+
+  const sshChecks = [["Spoke", cfg.spoke], ["Hub", cfg.hub]];
   if (cfg.trafficDriver === "ssh") {
-    if (cfg.clientSsh) sshChecks.push(["client", cfg.clientSsh]);
-    if (cfg.serverSsh) sshChecks.push(["server", cfg.serverSsh]);
+    if (cfg.serverSsh) sshChecks.unshift(["Server", cfg.serverSsh]);
+    if (cfg.clientSsh) sshChecks.unshift(["Client", cfg.clientSsh]);
+  }
+  if (cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath)) {
+    sshChecks.push(["Netem VM", cfg.netemSsh]);
   }
   for (const [label, creds] of sshChecks) {
     log(`pre-flight: SSH check ${label} (${creds.user}@${creds.host})`);
-    const conn = await sshConnect(creds);
     try {
-      const { code } = await sshExec(conn, "echo ok", { timeoutMs: 15000 });
-      if (code !== 0) throw new Error(`echo returned rc=${code}`);
-      log(`pre-flight: ${label} SSH OK`);
-    } finally {
-      conn.end();
+      const conn = await sshConnect(creds);
+      try {
+        const { code } = await sshExec(conn, "echo ok", { timeoutMs: 15000 });
+        if (code !== 0) throw new Error(`echo returned rc=${code}`);
+        checkpoint(true, `SSH ${label}`, `${creds.user}@${creds.host}`);
+      } finally {
+        conn.end();
+      }
+    } catch (e) {
+      checkpoint(false, `SSH ${label}`, e.message);
+      throw e;
     }
   }
 
@@ -603,8 +683,14 @@ async function preflight(cfg) {
     log("pre-flight: Confluence auth check");
     // 1. resolve which endpoint the token works against (classic token ->
     //    site URL, scoped token -> api.atlassian.com gateway)
-    const whoName = await resolveConfApiBase(cfg.confluence);
-    log(`pre-flight: Confluence auth OK (${whoName})`);
+    let whoName;
+    try {
+      whoName = await resolveConfApiBase(cfg.confluence);
+    } catch (e) {
+      checkpoint(false, "Confluence auth", e.message.slice(0, 160));
+      throw e;
+    }
+    checkpoint(true, "Confluence auth", whoName);
     // 2. can this token see the target page/space?
     const apiBase = confApiBase(cfg.confluence);
     const target = cfg.confluence.pageId
@@ -621,7 +707,7 @@ async function preflight(cfg) {
         `(HTTP ${resp.status}): ${(await resp.text()).slice(0, 300)} — for scoped ` +
         `tokens verify the content read/write scopes were granted`);
     }
-    log(`pre-flight: Confluence OK (${target.desc} reachable)`);
+    checkpoint(true, "Confluence target", `${target.desc} reachable`);
   }
   log("pre-flight: all checks passed");
 }
@@ -742,6 +828,8 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch) {
           fromLinkPacketLoss95P: stats.packetLoss95P,
         };
         switches.push(sw);
+        checkpoint(true, "Link switch detected",
+          `${sw.fromLink} -> ${sw.toLink} at ${sw.time} (TC ${sw.tc})`);
         log(`LINK SWITCH: TC ${sw.tc} ${sw.fromLink} -> ${sw.toLink} at ${sw.time} ` +
             `(from-link latency95P=${sw.fromLinkLatency95P} ms, packetLoss95P=${sw.fromLinkPacketLoss95P} %)`);
         setStatus({ switchObserved: true, lastSwitch: sw });
@@ -804,12 +892,14 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
       log(`traffic check ${i}/${attempts}: ${best.pps} pps on netem link ` +
           `${best.iface ?? "(none)"} (threshold ${cfg.trafficMinPps} pps, scope: ${scope})`);
       if (best.pps >= cfg.trafficMinPps) {
-        log(`traffic confirmed flowing over ${best.iface}`);
+        checkpoint(true, "Traffic verified", `${best.pps} pps over ${best.iface}`);
         setStatus({ trafficVerified: best.pps });
         return best.pps;
       }
     }
     const c2 = sshHandles ? await checkTrafficClient(cfg, sshHandles) : null;
+    checkpoint(false, "Traffic verified",
+      `below ${cfg.trafficMinPps} pps on ${scope} after ${attempts} checks`);
     throw new Error(
       `traffic is NOT crossing the netem links (below ${cfg.trafficMinPps} pps on ` +
       `${scope} after ${attempts} checks). Check the traffic ` +
@@ -831,7 +921,7 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
       log(`traffic check ${i}/${attempts}: ${Math.round(bps)} B/s aggregate on spoke ` +
           `(threshold ${cfg.trafficMinBps})`);
       if (bps >= cfg.trafficMinBps) {
-        log("traffic confirmed flowing (spoke aggregate)");
+        checkpoint(true, "Traffic verified", `${Math.round(bps)} B/s spoke aggregate (weak signal)`);
         setStatus({ trafficVerified: Math.round(bps) });
         return bps;
       }
@@ -839,6 +929,7 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
   } finally {
     conn.end();
   }
+  checkpoint(false, "Traffic verified", `below ${cfg.trafficMinBps} B/s after ${attempts} checks`);
   throw new Error(
     `traffic is NOT flowing (below ${cfg.trafficMinBps} B/s after ${attempts} checks) — failing early`);
 }
@@ -952,6 +1043,7 @@ async function startTrafficViaSsh(cfg, traffic) {
       if (bin && !/[/\\]/.test(bin)) {
         const which = await sshExec(conn, `command -v ${bin} || echo MISSING`);
         if (which.stdout.includes("MISSING")) {
+          checkpoint(false, `${bin} ${side} started`, `${bin} not installed on ${creds.host}`);
           throw new Error(`${bin} is not installed on the ${side} (${creds.host}) — install it first`);
         }
       }
@@ -965,8 +1057,10 @@ async function startTrafficViaSsh(cfg, traffic) {
         conn, `kill -0 ${pid} 2>/dev/null && echo alive || echo dead`)).stdout.includes("alive");
       if (!alive) {
         const tail = (await sshExec(conn, `tail -5 /tmp/${logName} 2>/dev/null`)).stdout.trim();
+        checkpoint(false, `${bin ?? "traffic"} ${side} started`, tail.slice(0, 160) || "exited with no output");
         throw new Error(`traffic ${side} exited immediately on ${creds.host}: ${tail || "(no output)"}`);
       }
+      checkpoint(true, `${bin ?? "traffic"} ${side} started`, `pid ${pid} on ${creds.host}`);
       return pid;
     } finally {
       conn.end();
@@ -1113,15 +1207,16 @@ async function detectActiveLink(cfg, sampleSeconds = 3) {
       log(`  ${row.iface.padEnd(12)} ${String(row.pps).padStart(6)} pps${row.master ? `  (bridge ${row.master})` : ""}`);
     }
     const active = table[0];
-    log(`active link on netem VM: ${active.iface} (${active.pps} pps` +
-        `${active.master ? `, bridge ${active.master}` : ""})`);
+    checkpoint(true, "Active link detected",
+      `${active.iface} (${active.pps} pps${active.master ? `, bridge ${active.master}` : ""})`);
     return { ...active, table };
   } finally {
     conn.end();
   }
 }
 
-/** Apply a netem impairment ({lossPct} and/or {delayMs}) to one interface. */
+/** Apply a netem impairment ({lossPct} and/or {delayMs}) to one interface,
+ *  then VERIFY it via `tc qdisc show dev <iface>`. */
 async function applyNetemImpairment(cfg, iface, spec) {
   const parts = [];
   if (spec.delayMs) parts.push(`delay ${spec.delayMs}ms`);
@@ -1133,9 +1228,25 @@ async function applyNetemImpairment(cfg, iface, spec) {
       : `tc qdisc del dev ${iface} root`;
     const r = await sudoExec(conn, cfg.netemSsh, cmd);
     if (r.code !== 0 && parts.length) {
+      checkpoint(false, `Netem applied on ${iface}`, `tc rc=${r.code}`);
       throw new Error(`tc failed on ${iface} (rc=${r.code}): ${(r.stderr || r.stdout).slice(0, 200)}`);
     }
-    log(`netem ${iface}: ${parts.join(" ") || "cleared"}`);
+    if (parts.length) {
+      // read back what the kernel actually installed
+      const show = (await sshExec(conn, `tc qdisc show dev ${iface}`)).stdout;
+      const okDelay = !spec.delayMs ||
+        new RegExp(`delay\\s+${spec.delayMs}(\\.0+)?ms`).test(show);
+      const okLoss = !spec.lossPct ||
+        new RegExp(`loss\\s+${spec.lossPct}(\\.0+)?%`).test(show);
+      if (!show.includes("netem") || !okDelay || !okLoss) {
+        checkpoint(false, `Netem applied on ${iface}`,
+          `tc qdisc show mismatch: ${show.trim().split("\n")[0]?.slice(0, 120)}`);
+        throw new Error(`netem verification failed on ${iface}: tc qdisc show says "${show.trim().slice(0, 160)}"`);
+      }
+      checkpoint(true, `Netem applied on ${iface}`, `${parts.join(" ")} (verified by tc qdisc show)`);
+    } else {
+      log(`netem ${iface}: cleared`);
+    }
   } finally {
     conn.end();
   }
@@ -1509,9 +1620,12 @@ async function collectEndOfTest(cfg, browser, tcName, result, spokeDir, hubDir) 
       const logs = await withRetry(() => collectDmtsLogs(creds, dir, label, tcName),
         { label: `${label} DMTS log collection`, attempts: 2 });
       result.artifacts[label].push(...logs);
+      checkpoint(true, `${label} DMTS logs collected`,
+        logs.map((p) => path.basename(p)).join(", ").slice(0, 160));
       setStatus({ collection: { ...status.collection, [label]: "logs done" } });
     } catch (e) {
       result.errors.push(`${label} DMTS logs: ${e.message}`);
+      checkpoint(false, `${label} DMTS logs collected`, e.message.slice(0, 160));
       setStatus({ collection: { ...status.collection, [label]: "logs FAILED" } });
       log(`ERROR: ${e.message}`);
     }
@@ -1519,10 +1633,12 @@ async function collectEndOfTest(cfg, browser, tcName, result, spokeDir, hubDir) 
       const pack = await collectDiagPack(cfg, browser, label, dir, tcName);
       if (pack) {
         result.artifacts[label].push(pack);
+        checkpoint(true, `${label} Diag Pack collected`, path.basename(pack));
         setStatus({ collection: { ...status.collection, [label]: "done" } });
       }
     } catch (e) {
       result.errors.push(`${label} diag pack: ${e.message}`);
+      checkpoint(false, `${label} Diag Pack collected`, e.message.slice(0, 160));
       setStatus({ collection: { ...status.collection, [label]: "diag FAILED" } });
       log(`ERROR: ${e.message}`);
     }
@@ -1655,6 +1771,8 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     return result;
   }
 
+  await stageGate(cfg, `${tc.name}: traffic validated`);
+
   const impairedIfaces = new Set();
   // static latency case driven via tc: traffic is flowing, apply the delays now
   if (!isDynamicPL && sshTc) {
@@ -1665,6 +1783,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       result.errors.push(`apply latency via tc: ${e.message}`);
       log(`ERROR: ${e.message}`);
     }
+    await stageGate(cfg, `${tc.name}: netem applied`);
   }
 
   const spokeMonitor = await sshConnect(cfg.spoke);
@@ -1690,6 +1809,9 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     }
   }
   result.switchObserved = result.switches.length > 0;
+  checkpoint(true, `${tc.name} monitoring complete`,
+    `${result.switches.length} switch(es), ${result.impairments.length} impairment event(s)`);
+  await stageGate(cfg, `${tc.name}: monitoring complete`);
 
   try {
     await stopTraffic();
@@ -1711,6 +1833,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   }
 
   await collectEndOfTest(cfg, browser, tc.name, result, spokeDir, hubDir);
+  await stageGate(cfg, `${tc.name}: logs collected`);
 
   result.endTime = new Date().toISOString();
   result.result =
@@ -2223,7 +2346,9 @@ async function runSuite(cfg, params) {
   const durationMs = parseDuration(params.durationSec) * 1000;
 
   clearAbort();
+  resetRunLogs();
   await preflight(cfg);
+  await stageGate(cfg, "Phase 1: infrastructure validation");
 
   const meta = await collectRunMetadata(cfg, traffic.type, traffic.tos);
   log(`run start: modes=[${modes.join(",")}] traffic=${traffic.type} ToS=${traffic.tos} ` +
@@ -2286,13 +2411,16 @@ async function runSuite(cfg, params) {
   }
 
   let pageId = null;
-  if (params.confluence && cfg.confluence) {
+  if (params.confluence && cfg.confluence && !isAborted()) {
+    await stageGate(cfg, "all test cases complete — next: Confluence upload");
     setStatus({ phase: "publishing", confluence: "uploading" });
     try {
       pageId = await publishToConfluence(cfg.confluence, allResults, meta, reportFiles);
+      checkpoint(true, "Confluence uploaded", `page ${pageId}`);
       setStatus({ confluence: `done (page ${pageId})` });
       log(`results published to Confluence page ${pageId}`);
     } catch (e) {
+      checkpoint(false, "Confluence uploaded", e.message.slice(0, 160));
       setStatus({ confluence: `FAILED: ${e.message}` });
       log(`ERROR: Confluence publish failed: ${e.message}`);
     }
@@ -2540,6 +2668,7 @@ module.exports = {
   runSuite, buildConfig, paramsFromEnv, preflight,
   // events / status (web UI)
   bus, getStatus, setStatus, requestAbort, isAborted, clearAbort,
+  checkpoint, continueRun, stageGate, resetRunLogs,
   // validators
   isValidIp, parseTos, parseBandwidth, parseDuration, parseTcChoice, validateParams,
   parsePort, parsePosInt, parseConfPageId, confApiBase, resolveConfApiBase,

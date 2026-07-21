@@ -58,6 +58,7 @@ function mergeSecrets(body) {
   p.durationSec = body.durationSec || envp.durationSec;
   p.headless = body.headless !== false;
   p.confluence = !!body.confluence;
+  p.debugMode = !!body.debugMode;
   return p;
 }
 
@@ -190,6 +191,12 @@ const server = http.createServer(async (req, res) => {
         saveProfiles(profiles);
         return json(res, 200, { ok: true, names: Object.keys(profiles) });
       }
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/continue") {
+      const released = engine.continueRun();
+      return json(res, released ? 200 : 409,
+        released ? { ok: true } : { ok: false, error: "nothing is paused" });
     }
 
     if (req.method === "POST" && url.pathname === "/api/stop") {
@@ -384,7 +391,8 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <option${d.mode === "latency" ? " selected" : ""}>latency</option>
       <option${d.mode === "packet-loss" ? " selected" : ""}>packet-loss</option>
       <option${d.mode === "all" ? " selected" : ""}>all</option></select><div class="errmsg"></div></div>
-    <div style="grid-column: 3 / -1;"><label><input type="checkbox" name="headed" style="width:auto"> Headed browser (watch Playwright)</label></div>
+    <div><label><input type="checkbox" name="headed" style="width:auto"> Headed browser</label></div>
+    <div><label><input type="checkbox" name="debugMode" style="width:auto" ${d.debugMode ? "checked" : ""}> Debug mode — pause after each stage</label></div>
   </div></fieldset>
 
   <fieldset><legend>Confluence</legend><div class="grid">
@@ -409,6 +417,10 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <button type="button" id="confirmGo">Confirm &amp; Start</button>
     <button type="button" class="grey" id="confirmCancel">Cancel</button>
   </div>
+  <div class="panel" id="pausebox" style="display:none; border-color:#f59e0b; background:#fffbeb;">
+    <b>Debug mode:</b> paused after <span id="pausestage"></span>
+    <button type="button" id="continueBtn" style="margin-left:14px;">Continue</button>
+  </div>
   <div class="panel">
     <h2>Live progress</h2>
     <div class="stat">
@@ -423,6 +435,10 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <b>Confluence upload</b><span id="s-conf">pending</span>
       <b>Results</b><span id="s-results" class="chips">—</span>
     </div>
+  </div>
+  <div class="panel">
+    <h2>Checkpoints <span style="font-weight:400;font-size:12px;color:var(--mut)">(automation.log)</span></h2>
+    <div id="checkpoints" style="font:12px/1.6 ui-monospace,monospace; max-height:220px; overflow-y:auto;">—</div>
   </div>
   <div id="log"></div>
 </div>
@@ -487,7 +503,22 @@ function render(running, s) {
   if (s.error) $("globalerr").textContent = s.error;
   startBtn.disabled = running;
   $("stop").disabled = !running;
+  $("pausebox").style.display = s.paused ? "block" : "none";
+  if (s.paused) $("pausestage").textContent = s.paused;
+  const cps = s.checkpoints || [];
+  $("checkpoints").innerHTML = cps.length
+    ? cps.slice(-60).map((c) =>
+        '<div style="color:' + (c.ok ? "#166534" : "#991b1b") + '">[' + (c.ok ? "PASS" : "FAIL") + "] " +
+        c.name.replace(/</g, "&lt;") + (c.detail ? " — " + String(c.detail).replace(/</g, "&lt;") : "") + "</div>"
+      ).join("")
+    : "—";
+  const cpEl = $("checkpoints");
+  cpEl.scrollTop = cpEl.scrollHeight;
 }
+$("continueBtn").addEventListener("click", async () => {
+  const out = await (await fetch("/api/continue", { method: "POST" })).json();
+  if (!out.ok) $("globalerr").textContent = out.error;
+});
 $("stop").addEventListener("click", async () => {
   if (!confirm("Stop the current test run? Traffic is stopped and netem impairments " +
                "are cleared; remaining test cases are skipped.")) return;
