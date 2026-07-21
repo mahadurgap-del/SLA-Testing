@@ -359,6 +359,9 @@ function validateParams(p) {
       errors[band + "MaxMs"] = "max must be >= min";
     }
   }
+  for (const f of ["latencyStabilizeSec", "latencyRampStepMs", "latencyRampIntervalSec", "latencyRampMaxMs"]) {
+    if (!parsePosInt(p[f]).ok) errors[f] = "positive integer required";
+  }
   if (!parseBandwidth(p.bandwidth).ok) errors.bandwidth = "e.g. 10M, 500K, 1G, or empty";
   if (parseTcChoice(p.tcChoice) === null) errors.tcChoice = "must be TC1-TC4 or all";
   if (parseConfPageId(p.confPageId) === null)
@@ -417,6 +420,12 @@ function buildConfig(p) {
       meo: [parseInt(p.meoMinMs, 10) || 150, parseInt(p.meoMaxMs, 10) || 180],
       geo: [parseInt(p.geoMinMs, 10) || 600, parseInt(p.geoMaxMs, 10) || 1000],
     },
+    latencyRamp: {
+      stabilizeSec: parseInt(p.latencyStabilizeSec, 10) || 180,
+      stepMs: parseInt(p.latencyRampStepMs, 10) || 50,
+      intervalSec: parseInt(p.latencyRampIntervalSec, 10) || 60,
+      maxMs: parseInt(p.latencyRampMaxMs, 10) || 1000,
+    },
     lossLow: parseFloat(envOr("LOSS_LOW_PCT", "1")),
     lossMed: parseFloat(envOr("LOSS_MED_PCT", "3")),
     lossHigh: parseFloat(envOr("LOSS_HIGH_PCT", "5")),
@@ -465,6 +474,12 @@ function paramsFromEnv() {
     meoMaxMs: envOr("MEO_MAX_MS", "180"),
     geoMinMs: envOr("GEO_MIN_MS", "600"),
     geoMaxMs: envOr("GEO_MAX_MS", "1000"),
+    // latency ramp (TC2-4): apply initial delay, wait to observe a natural
+    // switch, then raise delay on the active link until a switch or the max
+    latencyStabilizeSec: envOr("LATENCY_STABILIZE_SEC", "180"),
+    latencyRampStepMs: envOr("LATENCY_RAMP_STEP_MS", "50"),
+    latencyRampIntervalSec: envOr("LATENCY_RAMP_INTERVAL_SEC", "60"),
+    latencyRampMaxMs: envOr("LATENCY_RAMP_MAX_MS", "1000"),
     bandwidth: envOr("TRAFFIC_BANDWIDTH", ""),
     parallelStreams: envOr("PARALLEL_STREAMS", "1"),
     packetSize: envOr("PACKET_SIZE", ""),
@@ -1466,6 +1481,104 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
   return events;
 }
 
+/**
+ * Latency test case (TC2-4) impairment schedule, run CONCURRENTLY with the
+ * hourLog monitor so a detected switch stops the ramp:
+ *   1. detect the active link, apply the case's initial delay on it (and the
+ *      lower delay of the pair on the standby link's bridge);
+ *   2. STABILIZE — hold for latencyRamp.stabilizeSec (default 180s) watching
+ *      for a natural switch (sync.switched, set by the monitor callback);
+ *   3. if no switch, RAMP — +stepMs (default 50) every intervalSec (default
+ *      60) on the same active link;
+ *   4. stop raising the moment a switch is flagged, or when maxMs is reached
+ *      (sync.maxReached), then hold until the case duration ends.
+ * `sync` is shared with the monitor: it reads sync.switched to stop, and the
+ * monitor reads sync.currentMs to record the latency at the switch.
+ */
+async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync) {
+  const events = [];
+  const r = cfg.latencyRamp;
+  const deadline = Date.now() + durationMs;
+  const note = (iface, event) => {
+    const ev = { t: new Date().toISOString(), iface, event };
+    events.push(ev);
+    setStatus({ netem: `${event} on ${iface}` });
+    log(`impairment: ${event} on ${iface}`);
+  };
+
+  const hi = Math.max(tc.link1.delayMs, tc.link2.delayMs);
+  const lo = Math.min(tc.link1.delayMs, tc.link2.delayMs);
+  const band = (tc.link1.delayMs >= tc.link2.delayMs ? tc.link1.band : tc.link2.band) || "";
+  if (hi === 0) {
+    log(`${tc.name}: both links clean — no impairment to apply`);
+    return events;
+  }
+
+  // 1. detect active link + apply the initial delays
+  const det = await detectActiveLink(cfg);
+  const activeIface = det.iface;
+  sync.activeIface = activeIface;
+  let other = null;
+  if (cfg.netemCandidates.length === 2) {
+    other = cfg.netemCandidates.find((i) => i !== activeIface) || null;
+  } else if (det.table.length >= 2) {
+    const diff = det.table.find(
+      (x) => x.iface !== activeIface && (x.master ?? x.iface) !== (det.master ?? activeIface));
+    other = diff ? diff.iface : det.table[1].iface;
+    if (!diff) {
+      log("WARN: no NIC on a different bridge found — standby pick may be the " +
+          "active link's other leg; set NETEM_CANDIDATE_IFACES to be safe");
+    }
+  }
+
+  let current = hi;
+  await applyNetemImpairment(cfg, activeIface, { delayMs: current });
+  impairedIfaces.add(activeIface);
+  sync.currentMs = current;
+  note(activeIface, `initial delay ${current}ms${band ? ` (${band})` : ""} on active link`);
+  if (lo > 0 && other) {
+    await applyNetemImpairment(cfg, other, { delayMs: lo });
+    impairedIfaces.add(other);
+    note(other, `delay ${lo}ms (standby link)`);
+  } else if (lo > 0) {
+    log(`WARN: standby link interface unknown — set NETEM_CANDIDATE_IFACES; skipping the ${lo}ms side`);
+  }
+
+  // 2. stabilize window — observe whether DMTS switches naturally
+  log(`${tc.name}: stabilize ${r.stabilizeSec}s at ${current}ms before ramping — watching for a natural switch`);
+  setStatus({ netem: `${current}ms — stabilizing (${r.stabilizeSec}s)` });
+  const stabilizeEnd = Math.min(deadline, Date.now() + r.stabilizeSec * 1000);
+  while (Date.now() < stabilizeEnd && !isAborted() && !sync.switched) {
+    await sleep(2000);
+  }
+  if (sync.switched) {
+    note(activeIface, `switch observed during stabilize at ${current}ms — ramp not started`);
+    return events;
+  }
+  if (isAborted() || Date.now() >= deadline) return events;
+
+  // 3. ramp +stepMs every intervalSec until switch / max / deadline
+  log(`${tc.name}: no switch after stabilize — ramping +${r.stepMs}ms every ${r.intervalSec}s (max ${r.maxMs}ms)`);
+  while (Date.now() < deadline && !isAborted() && !sync.switched) {
+    if (current >= r.maxMs) {
+      sync.maxReached = true;
+      note(activeIface, `reached max ${r.maxMs}ms without a switch — holding until test ends`);
+      break;
+    }
+    const next = Math.min(current + r.stepMs, r.maxMs);
+    try {
+      await applyNetemImpairment(cfg, activeIface, { delayMs: next });
+      current = next;
+      sync.currentMs = current;
+      note(activeIface, `ramp delay ${current}ms`);
+    } catch (e) {
+      log(`WARN: ramp step to ${next}ms failed (${e.message}) — retrying next interval`);
+    }
+    if (!(await sleepWithin(deadline, r.intervalSec * 1000))) break;
+  }
+  return events;
+}
+
 /* ========================================================================= *
  * Playwright — drive the netem UI
  * TODO(1): every selector below is a PLACEHOLDER.
@@ -1859,17 +1972,11 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   await stageGate(cfg, `${tc.name}: traffic validated`);
 
   const impairedIfaces = new Set();
-  // static latency case driven via tc: traffic is flowing, apply the delays now
-  if (!isDynamicPL && sshTc) {
-    try {
-      result.impairments = await applyLatencyViaTc(cfg, tc, impairedIfaces);
-      await shot("02_after_netem");
-    } catch (e) {
-      result.errors.push(`apply latency via tc: ${e.message}`);
-      log(`ERROR: ${e.message}`);
-    }
-    await stageGate(cfg, `${tc.name}: netem applied`);
-  }
+  // latency ramp (TC2-4 via tc) runs CONCURRENTLY with the monitor so a
+  // detected switch stops the ramp; shared via `sync`
+  const isLatencyRamp = !isDynamicPL && sshTc && !tc.baseline &&
+    Math.max(tc.link1.delayMs, tc.link2.delayMs) > 0;
+  const sync = { switched: false, currentMs: null, activeIface: null, maxReached: false };
 
   // a monitoring failure must not skip traffic stop / netem cleanup /
   // log collection — catch it, record it, and continue the teardown path
@@ -1879,13 +1986,24 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       const monitorP = monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
         await shot(`03_switch_${result.switches.length}`);
         if (isFirst) {
+          // stop the ramp and record the latency that triggered the switch
+          if (!sync.switched) {
+            sync.switched = true;
+            result.switchLatencyMs = sync.currentMs;
+            result.switchAt = sw.wallClock ?? sw.time;
+            if (sync.currentMs != null) {
+              log(`${tc.name}: switch at ${sync.currentMs}ms on ${sync.activeIface} — stopping ramp`);
+            }
+          }
           const snapTar = await collectHourlogSnapshot(cfg.spoke, spokeDir, `${tc.name}_switch`);
           if (snapTar) result.artifacts.spoke.push(snapTar);
         }
       });
       const scheduleP = isDynamicPL
         ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null)
-        : Promise.resolve([]);
+        : isLatencyRamp
+          ? runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
+          : Promise.resolve([]);
       const [switches, impairments] = await Promise.all([monitorP, scheduleP]);
       result.switches = switches;
       result.impairments = [...result.impairments, ...impairments];
@@ -1902,7 +2020,24 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     }
   }
   result.switchObserved = result.switches.length > 0;
+  if (isLatencyRamp) {
+    result.latencyRamp = {
+      initialMs: Math.max(tc.link1.delayMs, tc.link2.delayMs),
+      maxMs: cfg.latencyRamp.maxMs,
+      stepMs: cfg.latencyRamp.stepMs,
+      stabilizeSec: cfg.latencyRamp.stabilizeSec,
+      switchLatencyMs: result.switchLatencyMs ?? null,
+      maxReached: !!sync.maxReached,
+    };
+    result.rampNote = result.switchObserved
+      ? `Switched at ${result.switchLatencyMs}ms latency`
+      : sync.maxReached
+        ? "No switch observed within configured latency range"
+        : "No switch observed before test duration ended";
+    log(`${tc.name}: ${result.rampNote}`);
+  }
   checkpoint(true, `${tc.name} monitoring complete`,
+    (result.rampNote ? result.rampNote + "; " : "") +
     `${result.switches.length} switch(es), ${result.impairments.length} impairment event(s)`);
   await stageGate(cfg, `${tc.name}: monitoring complete`);
 
@@ -1977,6 +2112,12 @@ function observationsText(r) {
     `Window:           ${r.startTime} .. ${r.endTime}`,
     `Switch expected:  ${r.expectSwitch ? "Yes" : "No"}`,
     `Switch observed:  ${r.switchObserved ? "Yes" : "No"}`,
+    ...(r.latencyRamp
+      ? [`Latency ramp:      initial ${r.latencyRamp.initialMs}ms, stabilize ${r.latencyRamp.stabilizeSec}s, ` +
+         `+${r.latencyRamp.stepMs}ms step, max ${r.latencyRamp.maxMs}ms`,
+         `Ramp outcome:      ${r.rampNote}` +
+         (r.switchLatencyMs != null ? ` (switch at ${r.switchLatencyMs}ms, ${r.switchAt})` : "")]
+      : []),
     ...r.switches.map(
       (s, i) =>
         `  switch ${i + 1}: TC=${s.tc} ${s.fromLink} -> ${s.toLink} at ${s.time} ` +
@@ -2084,6 +2225,8 @@ function writeHtmlReport(baseDir, results, meta) {
           : escapeHtml(describeLink(r.link1)) + " / " + escapeHtml(describeLink(r.link2))}
          — Traffic ${escapeHtml(r.trafficType)} ${escapeHtml(r.direction ?? "")} ToS ${escapeHtml(r.tos)}
          ${r.trafficVerifiedBps != null ? `(verified ${Math.round(r.trafficVerifiedBps)} B/s)` : "(traffic NOT verified)"}</p>
+      ${r.rampNote ? `<p><b>Latency ramp:</b> ${escapeHtml(r.rampNote)}` +
+        (r.latencyRamp ? ` <span style="color:#64748b">(initial ${r.latencyRamp.initialMs}ms, stabilize ${r.latencyRamp.stabilizeSec}s, +${r.latencyRamp.stepMs}ms/step, max ${r.latencyRamp.maxMs}ms)</span>` : "") + `</p>` : ""}
       ${cmds}
       ${schedule}
       <h3>Switch timeline</h3>${timeline}
@@ -2285,6 +2428,11 @@ function buildCaseSection(r) {
     row("ToS", r.tos) +
     row("Impairment", r.plType ? `dynamic packet loss (${r.plType}) — ${r.plDescribe}` :
       `${describeLink(r.link1)} / ${describeLink(r.link2)}`) +
+    (r.latencyRamp ? row("Latency ramp",
+      `initial ${r.latencyRamp.initialMs}ms · stabilize ${r.latencyRamp.stabilizeSec}s · ` +
+      `+${r.latencyRamp.stepMs}ms/step · max ${r.latencyRamp.maxMs}ms`) : "") +
+    (r.rampNote ? row("Ramp outcome",
+      r.rampNote + (r.switchLatencyMs != null ? ` (switch at ${r.switchLatencyMs}ms)` : "")) : "") +
     (r.clientCmd ? row("Client command", r.clientCmd) : "") +
     row("Window", `${r.startTime ?? "-"} .. ${r.endTime ?? "-"}`) +
     `</tbody></table>`;
@@ -2650,6 +2798,16 @@ async function interactiveSetup(p) {
   p.durationSec = await askValidated("Traffic duration seconds", p.durationSec, (s) => parseDuration(s));
   p.baselineDurationSec = await askValidated("Baseline TC1 (0ms/0ms) duration seconds",
     p.baselineDurationSec, (s) => parseDuration(s));
+  if (["latency", "all"].includes(p.mode)) {
+    p.latencyStabilizeSec = await askValidated("Latency stabilize window before ramp (seconds)",
+      p.latencyStabilizeSec, (s) => (parsePosInt(s).ok ? s : null));
+    p.latencyRampStepMs = await askValidated("Latency ramp step (ms)",
+      p.latencyRampStepMs, (s) => (parsePosInt(s).ok ? s : null));
+    p.latencyRampIntervalSec = await askValidated("Latency ramp interval (seconds)",
+      p.latencyRampIntervalSec, (s) => (parsePosInt(s).ok ? s : null));
+    p.latencyRampMaxMs = await askValidated("Latency ramp ceiling (ms)",
+      p.latencyRampMaxMs, (s) => (parsePosInt(s).ok ? s : null));
+  }
   p.bandwidth = await askValidated("Bandwidth (e.g. 10M, empty = tool default)", p.bandwidth,
     (s) => (parseBandwidth(s).ok ? (s || "") : null));
   p.parallelStreams = await askValidated("Parallel streams", p.parallelStreams,
@@ -2797,7 +2955,8 @@ module.exports = {
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
   parseNetemIfaces, sanitizeNetem,
-  runPacketLossSchedule, applyLatencyViaTc, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
+  runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
+  offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // parsing / cases / reports (tests)
   lastCompleteRecord, findBalancedEnd, activeTc, linkStats,
   buildTestCases, describeLink, buildStorageBody, escapeXml, escapeHtml,

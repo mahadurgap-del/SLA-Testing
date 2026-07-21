@@ -398,6 +398,11 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <div></div>
     <div><label>GEO min</label><input name="geoMinMs" value="${esc(d.geoMinMs)}"><div class="errmsg"></div></div>
     <div><label>GEO max</label><input name="geoMaxMs" value="${esc(d.geoMaxMs)}"><div class="errmsg"></div></div>
+    <div style="grid-column: 1 / -1; color:var(--mut); font-size:11px;">TC2–TC4: apply initial delay on the active link, hold to observe a natural switch, then ramp up until a switch or the ceiling.</div>
+    <div><label>Stabilize before ramp (s)</label><input name="latencyStabilizeSec" value="${esc(d.latencyStabilizeSec)}"><div class="errmsg"></div></div>
+    <div><label>Ramp step (ms)</label><input name="latencyRampStepMs" value="${esc(d.latencyRampStepMs)}"><div class="errmsg"></div></div>
+    <div><label>Ramp interval (s)</label><input name="latencyRampIntervalSec" value="${esc(d.latencyRampIntervalSec)}"><div class="errmsg"></div></div>
+    <div><label>Ramp ceiling (ms)</label><input name="latencyRampMaxMs" value="${esc(d.latencyRampMaxMs)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
   <fieldset><legend>4b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid3">
