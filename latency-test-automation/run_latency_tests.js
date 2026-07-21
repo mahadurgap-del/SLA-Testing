@@ -634,10 +634,20 @@ function sshExec(conn, command, { sudoPass = null, timeoutMs = 120000 } = {}) {
       let stdout = "";
       let stderr = "";
       let fedPassword = false;
+      const feed = () => {
+        if (!sudoPass || fedPassword) return;
+        fedPassword = true;
+        try { stream.write(sudoPass + "\n"); } catch { /* stream gone */ }
+      };
+      const promptRe = /\[sudo\] password|password for|:\s*$/i;
       const timer = setTimeout(() => {
         stream.close();
         reject(new Error(`ssh command timed out after ${timeoutMs} ms: ${command}`));
       }, timeoutMs);
+      // `sudo -S` reads the password from stdin; the prompt may appear on
+      // stderr (or nowhere with a pty). Feed on prompt from EITHER stream and,
+      // as a fallback, proactively shortly after the command starts.
+      if (sudoPass) setTimeout(feed, 800);
       stream
         .on("close", (code) => {
           clearTimeout(timer);
@@ -645,12 +655,12 @@ function sshExec(conn, command, { sudoPass = null, timeoutMs = 120000 } = {}) {
         })
         .on("data", (data) => {
           stdout += data.toString();
-          if (sudoPass && !fedPassword && /\[sudo\] password|password for/i.test(stdout)) {
-            stream.write(sudoPass + "\n");
-            fedPassword = true;
-          }
+          if (sudoPass && !fedPassword && promptRe.test(stdout)) feed();
         })
-        .stderr.on("data", (data) => (stderr += data.toString()));
+        .stderr.on("data", (data) => {
+          stderr += data.toString();
+          if (sudoPass && !fedPassword && promptRe.test(stderr)) feed();
+        });
     });
   });
 }
@@ -722,6 +732,28 @@ async function preflight(cfg) {
     } catch (e) {
       checkpoint(false, `SSH ${label}`, e.message);
       throw e;
+    }
+  }
+
+  // netem impairment via tc needs sudo on the netem VM — verify it early so a
+  // sudo/password problem fails here (fast) rather than hanging mid-ramp
+  const needsNetemTc = cfg.impairmentDriver === "ssh-tc" &&
+    cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath);
+  if (needsNetemTc) {
+    log("pre-flight: netem VM sudo/tc check");
+    try {
+      const conn = await sshConnect(cfg.netemSsh);
+      try {
+        const r = await sudoExec(conn, cfg.netemSsh, "tc -Version", { timeoutMs: 20000 });
+        if (r.code !== 0) throw new Error(`sudo tc returned rc=${r.code}: ${(r.stderr || r.stdout).slice(0, 120)}`);
+        checkpoint(true, "Netem VM sudo tc", (r.stdout.trim().split("\n")[0] || "ok").slice(0, 80));
+      } finally {
+        conn.end();
+      }
+    } catch (e) {
+      checkpoint(false, "Netem VM sudo tc", e.message.slice(0, 160));
+      throw new Error(`netem VM sudo/tc not usable: ${e.message} — passwordless sudo or the ` +
+        `correct netem password is required for the SSH-tc impairment driver`);
     }
   }
 
@@ -1275,20 +1307,42 @@ function parseNetemIfaces(tcShow) {
   return out;
 }
 
-/** Remove any leftover netem qdiscs on the netem VM (e.g. from a crashed
- *  earlier run) so every run starts from a known-clean state. */
+/**
+ * Report the netem qdiscs already present on the netem VM at run start.
+ *
+ * IMPORTANT: the netem VM runs its own impairment app that owns tc qdiscs on
+ * the overlay interfaces, so we do NOT blanket-delete them (that would wipe
+ * the app's config and, if sudo prompts, hang). We only clear leftovers on
+ * interfaces WE impaired in a previous run of THIS process (activeImpairments)
+ * or, when NETEM_SANITIZE=all is set, on the configured candidate interfaces.
+ * Our own apply path uses `tc qdisc replace`, which overrides cleanly anyway.
+ */
 async function sanitizeNetem(cfg) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
-    const show = (await sshExec(conn, "tc qdisc show")).stdout;
-    const dirty = parseNetemIfaces(show);
-    for (const iface of dirty) {
-      await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root 2>/dev/null; true`);
-      log(`sanitize: removed leftover netem on ${iface}`);
+    const show = (await sshExec(conn, "tc qdisc show", { timeoutMs: 15000 })).stdout;
+    const present = parseNetemIfaces(show);
+    // only touch interfaces that are safe to clear
+    const aggressive = envOr("NETEM_SANITIZE", "") === "all" && cfg.netemCandidates.length;
+    const toClear = [...activeImpairments].filter((i) => present.includes(i));
+    if (aggressive) {
+      for (const i of cfg.netemCandidates) if (present.includes(i) && !toClear.includes(i)) toClear.push(i);
+    }
+    for (const iface of toClear) {
+      try {
+        await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root`, { timeoutMs: 20000 });
+        activeImpairments.delete(iface);
+        log(`sanitize: cleared netem on ${iface}`);
+      } catch (e) {
+        log(`WARN: sanitize could not clear ${iface}: ${e.message}`);
+      }
     }
     checkpoint(true, "Netem VM clean state",
-      dirty.length ? `removed leftover netem on ${dirty.join(", ")}` : "no leftover netem rules");
-    return dirty;
+      present.length
+        ? `netem present on ${present.join(", ")}` +
+          (toClear.length ? `; cleared ${toClear.join(", ")}` : "; left app-managed qdiscs untouched")
+        : "no netem qdiscs present");
+    return present;
   } finally {
     conn.end();
   }
@@ -1305,14 +1359,14 @@ async function applyNetemImpairment(cfg, iface, spec) {
     const cmd = parts.length
       ? `tc qdisc replace dev ${iface} root netem ${parts.join(" ")}`
       : `tc qdisc del dev ${iface} root`;
-    const r = await sudoExec(conn, cfg.netemSsh, cmd);
+    const r = await sudoExec(conn, cfg.netemSsh, cmd, { timeoutMs: 20000 });
     if (r.code !== 0 && parts.length) {
-      checkpoint(false, `Netem applied on ${iface}`, `tc rc=${r.code}`);
+      checkpoint(false, `Netem applied on ${iface}`, `tc rc=${r.code}: ${(r.stderr || r.stdout).slice(0, 120)}`);
       throw new Error(`tc failed on ${iface} (rc=${r.code}): ${(r.stderr || r.stdout).slice(0, 200)}`);
     }
     if (parts.length) {
       // read back what the kernel actually installed
-      const show = (await sshExec(conn, `tc qdisc show dev ${iface}`)).stdout;
+      const show = (await sshExec(conn, `tc qdisc show dev ${iface}`, { timeoutMs: 15000 })).stdout;
       const okDelay = !spec.delayMs ||
         new RegExp(`delay\\s+${spec.delayMs}(\\.0+)?ms`).test(show);
       const okLoss = !spec.lossPct ||
@@ -1336,7 +1390,8 @@ async function applyNetemImpairment(cfg, iface, spec) {
 async function clearNetemImpairment(cfg, iface) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
-    await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root 2>/dev/null; true`);
+    await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root 2>/dev/null; true`,
+      { timeoutMs: 20000 });
     activeImpairments.delete(iface);
     log(`netem ${iface}: cleared`);
   } finally {
