@@ -182,6 +182,19 @@ function parseTcChoice(s) {
   return m ? parseInt(m[1], 10) : null;
 }
 
+/**
+ * Accept a bare Confluence page ID or ANY page URL and return the numeric id.
+ * Handles .../pages/4965335046/Title, .../pages/edit-v2/4965335046?draft...,
+ * and ...?pageId=4965335046. Returns "" for empty input, null if unparseable.
+ */
+function parseConfPageId(s) {
+  const t = String(s ?? "").trim();
+  if (!t) return "";
+  if (/^\d+$/.test(t)) return t;
+  const m = t.match(/pages\/(?:edit(?:-v2)?\/)?(\d+)/) || t.match(/[?&]pageId=(\d+)/);
+  return m ? m[1] : null;
+}
+
 function parsePort(s) {
   const t = String(s ?? "").trim();
   if (!t) return { ok: true, value: null };
@@ -253,6 +266,10 @@ function validateParams(p) {
   if (!parseDuration(p.durationSec)) errors.durationSec = "must be a positive integer (seconds)";
   if (!parseBandwidth(p.bandwidth).ok) errors.bandwidth = "e.g. 10M, 500K, 1G, or empty";
   if (parseTcChoice(p.tcChoice) === null) errors.tcChoice = "must be TC1-TC4 or all";
+  if (parseConfPageId(p.confPageId) === null)
+    errors.confPageId = "paste the page URL or its numeric ID";
+  if (parseConfPageId(p.confParentId) === null)
+    errors.confParentId = "paste the page URL or its numeric ID";
   if (!["latency", "packet-loss", "all"].includes(p.mode)) errors.mode = "latency | packet-loss | all";
   return { ok: Object.keys(errors).length === 0, errors };
 }
@@ -314,9 +331,9 @@ function buildConfig(p) {
           email: p.confEmail,
           token: p.confToken,
           base: (p.confBase || "https://espacenetworks.atlassian.net").replace(/\/+$/, ""),
-          pageId: p.confPageId || null,
+          pageId: parseConfPageId(p.confPageId) || null,
           space: p.confSpace || null,
-          parentId: p.confParentId || null,
+          parentId: parseConfPageId(p.confParentId) || null,
         }
       : null,
   };
@@ -2105,8 +2122,8 @@ async function interactiveSetup(p) {
       { hidden: true });
     p.confBase = await askValidated("Confluence base URL", p.confBase,
       (s) => (/^https?:\/\//.test(s) ? s.replace(/\/+$/, "") : null));
-    p.confPageId = await askValidated("Confluence page ID to update (empty = create new)",
-      p.confPageId, (s) => (s === "" || /^\d+$/.test(s) ? s : null));
+    p.confPageId = await askValidated("Confluence page URL or ID to update (empty = create new)",
+      p.confPageId, (s) => parseConfPageId(s));
     if (!p.confPageId) {
       p.confSpace = await askValidated("Confluence space key", p.confSpace, (s) => (s ? s : null));
       p.confParentId = await askValidated("Parent page ID (optional)", p.confParentId,
@@ -2197,7 +2214,7 @@ module.exports = {
   bus, getStatus, setStatus,
   // validators
   isValidIp, parseTos, parseBandwidth, parseDuration, parseTcChoice, validateParams,
-  parsePort, parsePosInt,
+  parsePort, parsePosInt, parseConfPageId,
   // traffic generation + interface discovery
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
   // netem impairment + dynamic packet loss

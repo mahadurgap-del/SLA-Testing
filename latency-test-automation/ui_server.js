@@ -381,7 +381,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <div><label>Email</label><input name="confEmail" value="${esc(d.confEmail)}"><div class="errmsg"></div></div>
     <div><label>API token ${d.confTokenSet ? "(blank = env)" : ""}</label><input name="confToken" type="password"><div class="errmsg"></div></div>
     <div class="full"><label>Base URL</label><input name="confBase" value="${esc(d.confBase)}"><div class="errmsg"></div></div>
-    <div><label>Page ID (update)</label><input name="confPageId" value="${esc(d.confPageId)}"><div class="errmsg"></div></div>
+    <div><label>Page URL or ID (update)</label><input name="confPageId" value="${esc(d.confPageId)}" placeholder="paste the page link"><div class="errmsg"></div></div>
     <div><label>Space key (create)</label><input name="confSpace" value="${esc(d.confSpace)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
