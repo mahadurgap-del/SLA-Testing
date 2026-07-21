@@ -1131,7 +1131,7 @@ async function snap(page, tcDir, name) {
  * Grid Diag Pack — via the Grid UI button (preferred) or SSH (fallback)
  * ========================================================================= */
 
-async function generateDiagPackViaUi(browser, gridUiUrl, destDir, label) {
+async function generateDiagPackViaUi(browser, gridUiUrl, destDir, label, tag) {
   log(`[${label}] generating diag pack via Grid UI ${gridUiUrl}`);
   const page = await browser.newPage();
   try {
@@ -1142,7 +1142,7 @@ async function generateDiagPackViaUi(browser, gridUiUrl, destDir, label) {
       await page.click('button:has-text("Generate Diag Pack")');
       // ----------------------------------------------------------
       const download = await downloadPromise;
-      const localPath = path.join(destDir, `diagpack_${label}_${download.suggestedFilename()}`);
+      const localPath = path.join(destDir, `${tag}_diagpack_${label}_${download.suggestedFilename()}`);
       await download.saveAs(localPath);
       log(`[${label}] diag pack downloaded via UI: ${localPath}`);
       return localPath;
@@ -1152,7 +1152,7 @@ async function generateDiagPackViaUi(browser, gridUiUrl, destDir, label) {
   }
 }
 
-async function generateDiagPackViaSsh(creds, destDir, label) {
+async function generateDiagPackViaSsh(creds, destDir, label, tag) {
   if (DIAG_PACK_CMD.startsWith("TODO")) {
     log(`[${label}] WARN: no GRID_UI_URL_* set and DIAG_PACK_CMD not filled in — skipping diag pack`);
     return null;
@@ -1166,7 +1166,7 @@ async function generateDiagPackViaSsh(creds, destDir, label) {
     const remotePath = stdout.trim();
     if (!remotePath) throw new Error(`no diag pack matching ${DIAG_PACK_GLOB} on ${label}`);
     await sudoExec(conn, creds, `chown ${creds.user}:${creds.user} '${remotePath}'`);
-    const localPath = path.join(destDir, `diagpack_${label}_${path.basename(remotePath)}`);
+    const localPath = path.join(destDir, `${tag}_diagpack_${label}_${path.basename(remotePath)}`);
     await sftpGet(conn, remotePath, localPath);
     log(`[${label}] diag pack saved: ${localPath}`);
     return localPath;
@@ -1175,19 +1175,37 @@ async function generateDiagPackViaSsh(creds, destDir, label) {
   }
 }
 
-async function collectDiagPack(cfg, browser, label, destDir) {
+async function collectDiagPack(cfg, browser, label, destDir, tag) {
   const gridUiUrl = label === "spoke" ? cfg.gridUiSpoke : cfg.gridUiHub;
   const creds = label === "spoke" ? cfg.spoke : cfg.hub;
-  if (gridUiUrl) return generateDiagPackViaUi(browser, gridUiUrl, destDir, label);
-  return generateDiagPackViaSsh(creds, destDir, label);
+  if (gridUiUrl) return generateDiagPackViaUi(browser, gridUiUrl, destDir, label, tag);
+  return generateDiagPackViaSsh(creds, destDir, label, tag);
 }
 
 /* ========================================================================= *
  * DMTS log collection (Hub + Spoke)
  * ========================================================================= */
 
-async function collectDmtsLogs(creds, destDir, label) {
+const DMTS_COMPONENTS = ["hourLog", "curLog", "ubd"];
+
+/**
+ * Collect the COMPLETE DMTS archive plus the INDIVIDUAL components
+ * (hourLog, curLog, ubd as per-directory tarballs, and ubdLatest.tar as-is)
+ * from one host. Files are named `<tag>_<label>_...` so attachments stay
+ * unique per test case on the Confluence page. Returns the list of local
+ * paths that were actually collected.
+ */
+async function collectDmtsLogs(creds, destDir, label, tag) {
   const conn = await sshConnect(creds);
+  const collected = [];
+  const grab = async (remotePath, localName) => {
+    await sudoExec(conn, creds, `chown ${creds.user}:${creds.user} '${remotePath}'`);
+    const localPath = path.join(destDir, localName);
+    await sftpGet(conn, remotePath, localPath);
+    await sshExec(conn, `rm -f '${remotePath}'`);
+    log(`[${label}] saved ${localName} (${fs.statSync(localPath).size} bytes)`);
+    collected.push(localPath);
+  };
   try {
     log(`[${label}] listing ${DMTS_LOG_DIR}`);
     const listing = await sudoExec(conn, creds, `ls -laht ${DMTS_LOG_DIR}/ | head -50`);
@@ -1195,27 +1213,41 @@ async function collectDmtsLogs(creds, destDir, label) {
     fs.writeFileSync(path.join(destDir, `dmts_dir_listing_${label}.txt`),
       listing.stdout + "\n" + size.stdout);
 
-    const remoteTar = `/tmp/dmts_today_$(hostname)_$(date +%F).tar.gz`;
-    log(`[${label}] archiving DMTS logs`);
+    // 1. complete archive (hourLog + curLog + ubd + ubdLatest.tar)
+    log(`[${label}] archiving complete DMTS logs`);
+    const fullRemote = `/tmp/dmts_full_${label}.tar.gz`;
     const tar = await sudoExec(
       conn, creds,
-      `tar czf ${remoteTar} -C ${DMTS_LOG_DIR} hourLog curLog ubd ubdLatest.tar`,
+      `tar czf ${fullRemote} -C ${DMTS_LOG_DIR} hourLog curLog ubd ubdLatest.tar`,
       { timeoutMs: 300000 }
     );
-    if (tar.code !== 0) {
-      throw new Error(`tar failed on ${label} (rc=${tar.code}): ${tar.stderr.slice(0, 500) || tar.stdout.slice(0, 500)}`);
+    if (tar.code === 0) {
+      await grab(fullRemote, `${tag}_${label}_dmts_full.tar.gz`);
+    } else {
+      log(`WARN: [${label}] complete archive failed (rc=${tar.code}): ` +
+          `${(tar.stderr || tar.stdout).slice(0, 300)} — collecting components individually`);
     }
-    await sudoExec(conn, creds, `chown ${creds.user}:${creds.user} /tmp/dmts_today_*.tar.gz`);
 
-    const { stdout } = await sshExec(conn, `ls -t /tmp/dmts_today_*.tar.gz | head -1`);
-    const remotePath = stdout.trim();
-    if (!remotePath) throw new Error(`no DMTS archive found on ${label} after tar`);
-    const localPath = path.join(destDir, path.basename(remotePath));
-    log(`[${label}] downloading ${remotePath}`);
-    await sftpGet(conn, remotePath, localPath);
-    await sshExec(conn, `rm -f ${remotePath}`);
-    log(`[${label}] DMTS logs saved: ${localPath} (${fs.statSync(localPath).size} bytes)`);
-    return localPath;
+    // 2. individual components as separate tarballs
+    for (const comp of DMTS_COMPONENTS) {
+      const remote = `/tmp/dmts_${comp}_${label}.tar.gz`;
+      const r = await sudoExec(conn, creds,
+        `tar czf ${remote} -C ${DMTS_LOG_DIR} ${comp}`, { timeoutMs: 180000 });
+      if (r.code !== 0) {
+        log(`WARN: [${label}] ${comp} archive failed (rc=${r.code}) — skipping`);
+        continue;
+      }
+      await grab(remote, `${tag}_${label}_${comp}.tar.gz`);
+    }
+
+    // 3. ubdLatest.tar as-is
+    const ubdRemote = `/tmp/ubdLatest_${label}.tar`;
+    const cp = await sudoExec(conn, creds, `cp ${DMTS_LOG_DIR}/ubdLatest.tar ${ubdRemote}`);
+    if (cp.code === 0) await grab(ubdRemote, `${tag}_${label}_ubdLatest.tar`);
+    else log(`WARN: [${label}] ubdLatest.tar not found — skipping`);
+
+    if (!collected.length) throw new Error(`no DMTS logs could be collected from ${label}`);
+    return collected;
   } finally {
     conn.end();
   }
@@ -1396,9 +1428,9 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   ]) {
     setStatus({ collection: { ...status.collection, [label]: "collecting" } });
     try {
-      const logs = await withRetry(() => collectDmtsLogs(creds, dir, label),
+      const logs = await withRetry(() => collectDmtsLogs(creds, dir, label, tc.name),
         { label: `${label} DMTS log collection`, attempts: 2 });
-      result.artifacts[label].push(logs);
+      result.artifacts[label].push(...logs);
       setStatus({ collection: { ...status.collection, [label]: "logs done" } });
     } catch (e) {
       result.errors.push(`${label} DMTS logs: ${e.message}`);
@@ -1406,7 +1438,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       log(`ERROR: ${e.message}`);
     }
     try {
-      const pack = await collectDiagPack(cfg, browser, label, dir);
+      const pack = await collectDiagPack(cfg, browser, label, dir, tc.name);
       if (pack) {
         result.artifacts[label].push(pack);
         setStatus({ collection: { ...status.collection, [label]: "done" } });
@@ -1689,17 +1721,23 @@ function buildStorageBody(results, meta) {
   );
 }
 
-/** Which of the standard artifacts were actually collected for this case. */
+/** Which of the standard artifacts were actually collected for this case:
+ *  complete DMTS archive + individual hourLog/curLog/ubd/ubdLatest.tar and
+ *  the Diag Pack, from both Spoke and Hub. */
 function artifactChecklist(r) {
-  const spoke = r.artifacts.spoke.map((p) => path.basename(p).toLowerCase());
-  const hub = r.artifacts.hub.map((p) => path.basename(p).toLowerCase());
-  return [
-    ["Spoke hourLog", spoke.some((f) => f.includes("hourlog"))],
-    ["Spoke DMTS archive", spoke.some((f) => f.includes("dmts_today"))],
-    ["Hub DMTS archive", hub.some((f) => f.includes("dmts_today"))],
-    ["Spoke Diag Pack", spoke.some((f) => f.startsWith("diagpack_spoke"))],
-    ["Hub Diag Pack", hub.some((f) => f.startsWith("diagpack_hub"))],
-  ];
+  const rows = [];
+  for (const side of ["spoke", "hub"]) {
+    const files = (r.artifacts[side] ?? []).map((p) => path.basename(p).toLowerCase());
+    const has = (s) => files.some((f) => f.includes(s));
+    const S = side[0].toUpperCase() + side.slice(1);
+    rows.push([`${S} DMTS archive (complete)`, has("dmts_full")]);
+    rows.push([`${S} hourLog`, has("hourlog")]);
+    rows.push([`${S} curLog`, has("curlog")]);
+    rows.push([`${S} ubd`, has("_ubd.tar")]);
+    rows.push([`${S} ubdLatest.tar`, has("ubdlatest")]);
+    rows.push([`${S} Diag Pack`, has(`diagpack_${side}`)]);
+  }
+  return rows;
 }
 
 /** One Confluence section per test case: Configuration / Schedule /
