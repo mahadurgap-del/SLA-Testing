@@ -834,22 +834,53 @@ function findBalancedEnd(text, start) {
   return -1;
 }
 
-function activeTc(record) {
+/**
+ * Active traffic classes in a DMTS hourLog record. Real structure:
+ *   scores.per_tc = { "<id>": {name, qoe, dom_link, ...}, ... }
+ * qoe is a string ("OK" | "IDLE" | "NOREF" | ...). A TC is "active" (carrying
+ * traffic) when qoe is present and not IDLE/NOREF and it has a dom_link.
+ * `dom_link` is the 0-based INDEX into record.channels of the link the TC is
+ * currently on (this is what changes on a link switch — there is no link_map).
+ * Returns [{ name, domLink, tc }].
+ */
+function activeTcs(record) {
   const perTc = record?.scores?.per_tc ?? {};
-  for (const [name, tc] of Object.entries(perTc)) {
-    if (name === "__internal_hp__" || !tc || typeof tc !== "object") continue;
+  const out = [];
+  for (const [key, tc] of Object.entries(perTc)) {
+    if (!tc || typeof tc !== "object") continue;
+    const name = tc.name || key;
+    if (name === "__internal_hp__") continue;
     const qoe = tc.qoe;
     if (qoe === null || qoe === undefined) continue;
     if (["IDLE", "NOREF"].includes(String(qoe).toUpperCase())) continue;
-    return { name, tc };
+    if (tc.dom_link === null || tc.dom_link === undefined) continue;
+    out.push({ name, domLink: tc.dom_link, tc });
   }
-  return null;
+  return out;
 }
 
-function linkStats(record, linkId) {
+/** Backward-compatible single-TC accessor. */
+function activeTc(record) {
+  const a = activeTcs(record);
+  return a.length ? { name: a[0].name, tc: a[0].tc } : null;
+}
+
+/** channels[] as an array regardless of source shape. */
+function channelsOf(record) {
   let channels = record?.channels ?? [];
   if (!Array.isArray(channels)) channels = Object.values(channels);
-  for (const ch of channels) {
+  return channels;
+}
+
+/** Real link_id for a 0-based dom_link index (falls back to the index). */
+function linkIdForDom(record, domLink) {
+  const ch = channelsOf(record)[domLink];
+  return ch && ch.link_id !== undefined ? ch.link_id : domLink;
+}
+
+/** Per-link 95P stats by link_id. */
+function linkStats(record, linkId) {
+  for (const ch of channelsOf(record)) {
     if (ch && typeof ch === "object" && ch.link_id === linkId) {
       return { latency95P: ch.latency95P ?? null, packetLoss95P: ch.packetLoss95P ?? null };
     }
@@ -865,10 +896,9 @@ async function newestHourlogFile(conn) {
 async function monitorLinkSwitches(conn, durationMs, onSwitch) {
   const deadline = Date.now() + durationMs;
   const switches = [];
-  let prevLink = null;
-  let prevRecord = null;
+  const prevDom = {};   // tcName -> last dom_link index seen
   let file = await newestHourlogFile(conn);
-  log(`monitoring hourlog ${file ?? "(none yet)"} for ${Math.round(durationMs / 1000)}s`);
+  log(`monitoring hourlog ${file ?? "(none yet)"} for ${Math.round(durationMs / 1000)}s (watching dom_link per TC)`);
 
   while (Date.now() < deadline && !isAborted()) {
     try {
@@ -877,50 +907,42 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch) {
         log(`hourlog rolled over: ${file} -> ${current}`);
         file = current;
       }
-      if (!file) {
-        await sleep(2000);
-        continue;
-      }
+      if (!file) { await sleep(2000); continue; }
       const { stdout: tail } = await sshExec(conn, `tail -c 262144 '${file}'`);
       const record = lastCompleteRecord(tail);
-      const active = record ? activeTc(record) : null;
-      const linkMap = active?.tc?.link_map ?? [];
-      if (!record || !active || !linkMap.length) {
-        await sleep(2000);
-        continue;
-      }
-      const link = linkMap[0];
-      if (prevLink === null) {
-        prevLink = link;
-        log(`active TC ${active.name} starts on link ${link}`);
-      } else if (link !== prevLink) {
-        let stats = linkStats(record, prevLink);
-        if (stats.latency95P === null && prevRecord) stats = linkStats(prevRecord, prevLink);
+      const active = record ? activeTcs(record) : [];
+      for (const a of active) {
+        const prev = prevDom[a.name];
+        if (prev === undefined) {
+          prevDom[a.name] = a.domLink;
+          log(`active TC ${a.name} starts on dom_link ${a.domLink} (link ${linkIdForDom(record, a.domLink)})`);
+          continue;
+        }
+        if (a.domLink === prev) continue;
+        // dom_link changed for this TC -> link switch
+        const fromLink = linkIdForDom(record, prev);
+        const toLink = linkIdForDom(record, a.domLink);
+        const stats = linkStats(record, fromLink);
         const sw = {
-          tc: active.name,
-          fromLink: prevLink,
-          toLink: link,
-          time: record.timestamp ?? record.time ?? record.ts ?? new Date().toISOString(),
+          tc: a.name,
+          fromLink, toLink, fromDom: prev, toDom: a.domLink,
+          time: record.time ?? record.timestamp ?? record.ts ?? new Date().toISOString(),
           wallClock: new Date().toISOString(),
           fromLinkLatency95P: stats.latency95P,
           fromLinkPacketLoss95P: stats.packetLoss95P,
         };
         switches.push(sw);
+        prevDom[a.name] = a.domLink;
         checkpoint(true, "Link switch detected",
-          `${sw.fromLink} -> ${sw.toLink} at ${sw.time} (TC ${sw.tc})`);
-        log(`LINK SWITCH: TC ${sw.tc} ${sw.fromLink} -> ${sw.toLink} at ${sw.time} ` +
+          `TC ${sw.tc}: link ${sw.fromLink} -> ${sw.toLink} at ${sw.time}`);
+        log(`LINK SWITCH: TC ${sw.tc} link ${sw.fromLink} -> ${sw.toLink} at ${sw.time} ` +
             `(from-link latency95P=${sw.fromLinkLatency95P} ms, packetLoss95P=${sw.fromLinkPacketLoss95P} %)`);
         setStatus({ switchObserved: true, lastSwitch: sw });
-        prevLink = link;
         if (onSwitch) {
-          try {
-            await onSwitch(sw, switches.length === 1);
-          } catch (e) {
-            log(`WARN: on-switch handler failed: ${e.message}`);
-          }
+          try { await onSwitch(sw, switches.length === 1); }
+          catch (e) { log(`WARN: on-switch handler failed: ${e.message}`); }
         }
       }
-      prevRecord = record;
     } catch (e) {
       log(`WARN: hourlog poll error: ${e.message}`);
     }
@@ -3022,7 +3044,8 @@ module.exports = {
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // parsing / cases / reports (tests)
-  lastCompleteRecord, findBalancedEnd, activeTc, linkStats,
+  lastCompleteRecord, findBalancedEnd, activeTc, activeTcs, linkStats,
+  channelsOf, linkIdForDom, monitorLinkSwitches,
   buildTestCases, describeLink, buildStorageBody, escapeXml, escapeHtml,
   writeSummary, writeHtmlReport, withRetry, observationsText,
 };
