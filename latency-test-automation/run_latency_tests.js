@@ -74,7 +74,6 @@ const DIAG_PACK_GLOB = "/tmp/grid_diag_*.tar.gz"; // TODO: confirm output path
 
 const DMTS_LOG_DIR = "/var/log/dmts";
 const HOURLOG_DIR = `${DMTS_LOG_DIR}/hourLog`;
-const LEO_MS = 130;
 
 /* ========================================================================= *
  * Event bus + live status (consumed by the web UI's SSE stream)
@@ -351,6 +350,15 @@ function validateParams(p) {
   if (!parseTos(p.tos)) errors.tos = "must be 0xNN hex or decimal 0-255";
   if (!parseDuration(p.durationSec)) errors.durationSec = "must be a positive integer (seconds)";
   if (!parseDuration(p.baselineDurationSec)) errors.baselineDurationSec = "must be a positive integer (seconds)";
+  for (const band of ["leo", "meo", "geo"]) {
+    const lo = parsePosInt(p[band + "MinMs"]);
+    const hi = parsePosInt(p[band + "MaxMs"]);
+    if (!lo.ok || lo.value === null) errors[band + "MinMs"] = "positive integer (ms)";
+    if (!hi.ok || hi.value === null) errors[band + "MaxMs"] = "positive integer (ms)";
+    if (lo.value !== null && hi.value !== null && lo.value > hi.value) {
+      errors[band + "MaxMs"] = "max must be >= min";
+    }
+  }
   if (!parseBandwidth(p.bandwidth).ok) errors.bandwidth = "e.g. 10M, 500K, 1G, or empty";
   if (parseTcChoice(p.tcChoice) === null) errors.tcChoice = "must be TC1-TC4 or all";
   if (parseConfPageId(p.confPageId) === null)
@@ -404,8 +412,11 @@ function buildConfig(p) {
       randomMinDurSec: parseInt(p.randomMinDurSec, 10) || 5,
       randomMaxDurSec: parseInt(p.randomMaxDurSec, 10) || 15,
     },
-    meoMs: parseInt(envOr("MEO_LATENCY_MS", "325"), 10),
-    geoMs: parseInt(envOr("GEO_LATENCY_MS", "560"), 10),
+    latencyRanges: {
+      leo: [parseInt(p.leoMinMs, 10) || 30, parseInt(p.leoMaxMs, 10) || 50],
+      meo: [parseInt(p.meoMinMs, 10) || 150, parseInt(p.meoMaxMs, 10) || 180],
+      geo: [parseInt(p.geoMinMs, 10) || 600, parseInt(p.geoMaxMs, 10) || 1000],
+    },
     lossLow: parseFloat(envOr("LOSS_LOW_PCT", "1")),
     lossMed: parseFloat(envOr("LOSS_MED_PCT", "3")),
     lossHigh: parseFloat(envOr("LOSS_HIGH_PCT", "5")),
@@ -447,6 +458,13 @@ function paramsFromEnv() {
     durationSec: 600,
     // the clean 0ms/0ms baseline case needs less time than impairment cases
     baselineDurationSec: envOr("BASELINE_DURATION_SEC", "300"),
+    // RTT ranges (ms) — a value is drawn at random per run for each test case
+    leoMinMs: envOr("LEO_MIN_MS", "30"),
+    leoMaxMs: envOr("LEO_MAX_MS", "50"),
+    meoMinMs: envOr("MEO_MIN_MS", "150"),
+    meoMaxMs: envOr("MEO_MAX_MS", "180"),
+    geoMinMs: envOr("GEO_MIN_MS", "600"),
+    geoMaxMs: envOr("GEO_MAX_MS", "1000"),
     bandwidth: envOr("TRAFFIC_BANDWIDTH", ""),
     parallelStreams: envOr("PARALLEL_STREAMS", "1"),
     packetSize: envOr("PACKET_SIZE", ""),
@@ -520,14 +538,24 @@ function buildTestCases(cfg, mode = "latency") {
   const L = (delayMs) => ({ delayMs, lossPct: 0 });
   const P = (lossPct) => ({ delayMs: 0, lossPct });
   if (mode === "latency") {
-    return [
-      { n: 1, name: "TC1_0ms_0ms", mode, link1: L(0),         link2: L(0),          expectSwitch: false, baseline: true },
-      { n: 2, name: "TC2_0ms_LEO", mode, link1: L(0),         link2: L(LEO_MS),     expectSwitch: true },
-      { n: 3, name: "TC3_LEO_MEO", mode, link1: L(LEO_MS),    link2: L(cfg.meoMs),  expectSwitch: true },
-      { n: 4, name: "TC4_MEO_GEO", mode, link1: L(cfg.meoMs), link2: L(cfg.geoMs),  expectSwitch: true },
+    // draw a random RTT within each configured band per run — the exact
+    // values are carried on the link objects and land in every report
+    const R = cfg.latencyRanges ?? { leo: [30, 50], meo: [150, 180], geo: [600, 1000] };
+    const draw = (band) => {
+      const [lo, hi] = R[band.toLowerCase()];
+      return { delayMs: randInt(lo, hi), lossPct: 0, band };
+    };
+    const cases = [
+      { n: 1, name: "TC1_0ms_0ms", mode, link1: L(0),          link2: L(0),           expectSwitch: false, baseline: true },
+      { n: 2, name: "TC2_0ms_LEO", mode, link1: L(0),          link2: draw("LEO"),    expectSwitch: true },
+      { n: 3, name: "TC3_LEO_MEO", mode, link1: draw("LEO"),   link2: draw("MEO"),    expectSwitch: true },
+      { n: 4, name: "TC4_MEO_GEO", mode, link1: draw("MEO"),   link2: draw("GEO"),    expectSwitch: true },
       // TODO: confirm expectSwitch flags — whether a switch is expected
       // depends on which link traffic starts on.
     ];
+    log("latency draws this run: " + cases.slice(1)
+      .map((c) => `${c.name}: ${describeLink(c.link1)} / ${describeLink(c.link2)}`).join(" | "));
+    return cases;
   }
   if (mode === "packet-loss") {
     // Dynamic cases: traffic starts FIRST, the active link is auto-detected
@@ -552,7 +580,7 @@ function buildTestCases(cfg, mode = "latency") {
 
 function describeLink(l) {
   const parts = [];
-  if (l.delayMs) parts.push(`${l.delayMs} ms`);
+  if (l.delayMs) parts.push(`${l.delayMs} ms${l.band ? ` (${l.band})` : ""}`);
   if (l.lossPct) parts.push(`${l.lossPct}% loss`);
   return parts.join(" + ") || "clean";
 }

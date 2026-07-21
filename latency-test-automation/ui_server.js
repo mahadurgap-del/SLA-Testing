@@ -365,6 +365,17 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <div class="errmsg"></div></div>
   </div></fieldset>
 
+  <fieldset><legend>4a — Latency ranges, RTT ms (mode: latency — a value is drawn at random per run and recorded in all reports)</legend><div class="grid3">
+    <div><label>LEO min</label><input name="leoMinMs" value="${esc(d.leoMinMs)}"><div class="errmsg"></div></div>
+    <div><label>LEO max</label><input name="leoMaxMs" value="${esc(d.leoMaxMs)}"><div class="errmsg"></div></div>
+    <div></div>
+    <div><label>MEO min</label><input name="meoMinMs" value="${esc(d.meoMinMs)}"><div class="errmsg"></div></div>
+    <div><label>MEO max</label><input name="meoMaxMs" value="${esc(d.meoMaxMs)}"><div class="errmsg"></div></div>
+    <div></div>
+    <div><label>GEO min</label><input name="geoMinMs" value="${esc(d.geoMinMs)}"><div class="errmsg"></div></div>
+    <div><label>GEO max</label><input name="geoMaxMs" value="${esc(d.geoMaxMs)}"><div class="errmsg"></div></div>
+  </div></fieldset>
+
   <fieldset><legend>4b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid3">
     <div><label>TC1 ramp step (%)</label><input name="rampStepPct" value="${esc(d.rampStepPct)}"><div class="errmsg"></div></div>
     <div><label>TC1 ramp interval (s)</label><input name="rampIntervalSec" value="${esc(d.rampIntervalSec)}"><div class="errmsg"></div></div>
