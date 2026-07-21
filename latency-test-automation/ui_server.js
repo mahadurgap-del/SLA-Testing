@@ -135,7 +135,12 @@ const server = http.createServer(async (req, res) => {
       const envp = engine.paramsFromEnv();
       const pass = b.pass || envp[(b.side || "") + "Pass"] || "";
       const keyPath = b.key || "";
-      if (!pass && !keyPath) return json(res, 400, { ok: false, error: "password or key required" });
+      if (!pass && !keyPath) {
+        return json(res, 400, {
+          ok: false,
+          error: `enter the ${b.side} SSH password or key in section 2 first`,
+        });
+      }
       try {
         const ifaces = await engine.listRemoteInterfaces(
           { host: b.host, user: b.user, pass: pass || null, keyPath: keyPath || null });
@@ -238,13 +243,17 @@ const PAGE = (d, profileNames) => `<!doctype html>
   :root { --line:#cbd5e1; --mut:#64748b; --bad:#991b1b; --ok:#166534; }
   body { font-family: system-ui, sans-serif; margin: 1.5rem auto; max-width: 1320px; padding: 0 1rem; color:#1a1a2e; }
   h1 { font-size: 22px; } h2 { font-size: 16px; margin: 0 0 10px; }
-  .cols { display:grid; grid-template-columns: 540px 1fr; gap: 20px; align-items:start; }
-  fieldset { border:1px solid var(--line); border-radius:8px; margin-bottom:12px; }
+  .cols { display:grid; grid-template-columns: minmax(560px, 660px) 1fr; gap: 24px; align-items:start; }
+  @media (max-width: 1100px) { .cols { grid-template-columns: 1fr; } }
+  fieldset { border:1px solid var(--line); border-radius:8px; margin-bottom:14px; padding: 10px 12px 12px; }
   legend { font-weight:600; font-size:13px; padding:0 6px; }
-  .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
-  .grid4 { display:grid; grid-template-columns: repeat(4, 1fr); gap: 8px 10px; }
-  label { font-size:12px; color:var(--mut); display:block; }
-  input, select, textarea { width:100%; box-sizing:border-box; padding:5px 7px; border:1px solid var(--line); border-radius:5px; font-size:13px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+  .grid3 { display:grid; grid-template-columns: repeat(3, 1fr); gap: 10px 14px; }
+  .grid4 { display:grid; grid-template-columns: repeat(4, 1fr); gap: 10px 14px; }
+  label { font-size:12px; color:var(--mut); display:block; margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  input, select, textarea { width:100%; box-sizing:border-box; padding:6px 8px; border:1px solid var(--line); border-radius:5px; font-size:13px; }
+  .sshbox label { margin-top:6px; }
+  .sshbox label:first-of-type { margin-top:0; }
   textarea { font-family: ui-monospace, monospace; font-size:12px; }
   input.err, textarea.err { border-color:var(--bad); background:#fef2f2; }
   .errmsg { color:var(--bad); font-size:11px; min-height:13px; }
@@ -295,7 +304,18 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <div style="grid-column: 2 / -1;"><label>netem UI URL</label><input name="netemUiUrl" value="${esc(d.netemUiUrl)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>2 — Interface selection</legend><div class="grid">
+  <fieldset><legend>2 — SSH details</legend><div class="sshgrid">
+    ${["client", "server", "spoke", "hub", "netem"].map((side) => `
+    <div class="sshbox"><h4>${side === "netem" ? "Netem VM" : side[0].toUpperCase() + side.slice(1)}${["spoke", "hub", "netem"].includes(side) ? "" : " (uses IP above)"}</h4>
+      ${["spoke", "hub", "netem"].includes(side)
+        ? `<label>IP</label><input name="${side}Host" value="${esc(d[side + "Host"])}"><div class="errmsg"></div>` : ""}
+      <label>Username</label><input name="${side}User" value="${esc(d[side + "User"])}"><div class="errmsg"></div>
+      <label>Password ${d[side + "PassSet"] ? "(blank = env)" : ""}</label><input name="${side}Pass" type="password"><div class="errmsg"></div>
+      <label>or key path</label><input name="${side}Key" value="${esc(d[side + "Key"])}"><div class="errmsg"></div>
+    </div>`).join("")}
+  </div></fieldset>
+
+  <fieldset><legend>3 — Interface selection</legend><div class="grid">
     <div><label>Client interface <button type="button" class="small grey" data-discover="client">Discover</button></label>
       <select name="clientIface" id="clientIfaceSel"><option value="">— (default route) —</option>
       ${d.clientIface ? `<option selected>${esc(d.clientIface)}</option>` : ""}</select>
@@ -306,7 +326,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <div class="errmsg" id="serverIfaceErr"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>3 — Traffic generation</legend><div class="grid4">
+  <fieldset><legend>4 — Traffic generation</legend><div class="grid3">
     <div><label>Driver</label><select name="trafficDriver">
       <option value="ssh"${d.trafficDriver === "ssh" ? " selected" : ""}>SSH (this tool)</option>
       <option value="netem-ui"${d.trafficDriver === "netem-ui" ? " selected" : ""}>netem UI page</option></select><div class="errmsg"></div></div>
@@ -314,7 +334,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       ${["iperf3", "scapy", "tcpreplay", "custom"].map((t) =>
         `<option${d.trafficTool === t ? " selected" : ""}>${t}</option>`).join("")}
       </select><div class="errmsg"></div></div>
-    <div><label>Bandwidth (e.g. 1000M)</label><input name="bandwidth" value="${esc(d.bandwidth)}"><div class="errmsg"></div></div>
+    <div><label>Bandwidth</label><input name="bandwidth" value="${esc(d.bandwidth)}" placeholder="e.g. 1000M"><div class="errmsg"></div></div>
     <div><label>Duration (s)</label><input name="durationSec" value="${esc(d.durationSec)}"><div class="errmsg"></div></div>
     <div><label>Parallel streams</label><input name="parallelStreams" value="${esc(d.parallelStreams)}"><div class="errmsg"></div></div>
     <div><label>ToS / DSCP</label><input name="tos" value="${esc(d.tos)}"><div class="errmsg"></div></div>
@@ -325,7 +345,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <div class="errmsg"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>3b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid4">
+  <fieldset><legend>4b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid3">
     <div><label>TC1 ramp step (%)</label><input name="rampStepPct" value="${esc(d.rampStepPct)}"><div class="errmsg"></div></div>
     <div><label>TC1 ramp interval (s)</label><input name="rampIntervalSec" value="${esc(d.rampIntervalSec)}"><div class="errmsg"></div></div>
     <div><label>TC2 burst interval (s)</label><input name="burstIntervalSec" value="${esc(d.burstIntervalSec)}"><div class="errmsg"></div></div>
@@ -336,24 +356,13 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <input name="netemCandidates" value="${esc(d.netemCandidates)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>4 — Traffic command</legend>
+  <fieldset><legend>5 — Traffic command</legend>
     <div style="padding: 0 8px;">
     <label><input type="checkbox" id="advanced" style="width:auto"> Advanced — edit commands before execution</label>
     <label>Server command</label><textarea name="serverCmd" rows="2" readonly>${esc(d.serverCmd)}</textarea><div class="errmsg"></div>
     <label>Client command</label><textarea name="clientCmd" rows="2" readonly>${esc(d.clientCmd)}</textarea><div class="errmsg"></div>
     </div>
   </fieldset>
-
-  <fieldset><legend>5 — SSH details</legend><div class="sshgrid">
-    ${["client", "server", "spoke", "hub", "netem"].map((side) => `
-    <div class="sshbox"><h4>${side === "netem" ? "Netem VM" : side[0].toUpperCase() + side.slice(1)}${["spoke", "hub", "netem"].includes(side) ? "" : " (uses IP above)"}</h4>
-      ${["spoke", "hub", "netem"].includes(side)
-        ? `<label>IP</label><input name="${side}Host" value="${esc(d[side + "Host"])}"><div class="errmsg"></div>` : ""}
-      <label>Username</label><input name="${side}User" value="${esc(d[side + "User"])}"><div class="errmsg"></div>
-      <label>Password ${d[side + "PassSet"] ? "(blank = env)" : ""}</label><input name="${side}Pass" type="password"><div class="errmsg"></div>
-      <label>or key path</label><input name="${side}Key" value="${esc(d[side + "Key"])}"><div class="errmsg"></div>
-    </div>`).join("")}
-  </div></fieldset>
 
   <fieldset><legend>6 — Test selection</legend><div class="grid4">
     <div><label>Test case</label><select name="tcChoice">
