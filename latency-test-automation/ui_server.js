@@ -320,9 +320,10 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <select name="clientIface" id="clientIfaceSel"><option value="">— (default route) —</option>
       ${d.clientIface ? `<option selected>${esc(d.clientIface)}</option>` : ""}</select>
       <input type="hidden" name="clientBindIp" value="${esc(d.clientBindIp)}"><div class="errmsg" id="clientIfaceErr"></div></div>
-    <div><label>Server interface <button type="button" class="small grey" data-discover="server">Discover</button></label>
+    <div><label>Server interface — its IP becomes the traffic destination <button type="button" class="small grey" data-discover="server">Discover</button></label>
       <select name="serverIface" id="serverIfaceSel"><option value="">— (default route) —</option>
       ${d.serverIface ? `<option selected>${esc(d.serverIface)}</option>` : ""}</select>
+      <input type="hidden" name="serverTrafficIp" value="${esc(d.serverTrafficIp)}">
       <div class="errmsg" id="serverIfaceErr"></div></div>
   </div></fieldset>
 
@@ -542,6 +543,11 @@ $("clientIfaceSel").addEventListener("change", () => {
   form.querySelector('[name="clientBindIp"]').value = (opt && opt.dataset.ip) || "";
   refreshCommands();
 });
+$("serverIfaceSel").addEventListener("change", () => {
+  const opt = $("serverIfaceSel").selectedOptions[0];
+  form.querySelector('[name="serverTrafficIp"]').value = (opt && opt.dataset.ip) || "";
+  refreshCommands();
+});
 
 /* ---------- connection profiles ---------- */
 async function refreshProfiles(names) {
@@ -604,10 +610,11 @@ form.addEventListener("submit", async (ev) => {
   const node = (title, ip, iface) =>
     '<div class="node"><b>' + title + "</b><br>" + (ip || "?") + (iface ? "<br>Interface: " + iface : "") + "</div>";
   $("pathview").innerHTML =
-    node("Client", body.clientIp, body.clientIface) + '<div class="arrow">↓</div>' +
+    node("Client", body.clientIp + (body.clientBindIp ? " → src " + body.clientBindIp : ""), body.clientIface) +
+    '<div class="arrow">↓</div>' +
     node("Spoke", body.spokeHost, "") + '<div class="arrow">↓</div>' +
     node("Hub", body.hubHost, "") + '<div class="arrow">↓</div>' +
-    node("Server", body.serverIp, body.serverIface);
+    node("Server", body.serverIp + (body.serverTrafficIp ? " → dst " + body.serverTrafficIp : ""), body.serverIface);
   $("cmdview").textContent = body.trafficDriver === "netem-ui"
     ? "(traffic driven by the netem UI page)"
     : (cmds.serverCmd ? "server: " + cmds.serverCmd + "\\n" : "") +

@@ -235,6 +235,7 @@ function validateParams(p) {
   if (p.clientKey && !fs.existsSync(p.clientKey)) errors.clientKey = `key file not found: ${p.clientKey}`;
   if (p.serverKey && !fs.existsSync(p.serverKey)) errors.serverKey = `key file not found: ${p.serverKey}`;
   if (p.clientBindIp && !isValidIp(p.clientBindIp)) errors.clientBindIp = "invalid IPv4 address";
+  if (p.serverTrafficIp && !isValidIp(p.serverTrafficIp)) errors.serverTrafficIp = "invalid IPv4 address";
 
   if (!parsePort(p.clientPort).ok) errors.clientPort = "port 1-65535 or empty";
   if (!parsePort(p.serverPort).ok) errors.serverPort = "port 1-65535 or empty";
@@ -323,6 +324,7 @@ function buildConfig(p) {
     lossMed: parseFloat(envOr("LOSS_MED_PCT", "3")),
     lossHigh: parseFloat(envOr("LOSS_HIGH_PCT", "5")),
     trafficMinBps: parseInt(envOr("TRAFFIC_MIN_BPS", "10000"), 10),
+    trafficMinPps: parseInt(envOr("TRAFFIC_MIN_PPS", "50"), 10),
     gridUiSpoke: envOr("GRID_UI_URL_SPOKE", null),
     gridUiHub: envOr("GRID_UI_URL_HUB", null),
     gridVersionCmd: envOr("GRID_VERSION_CMD", null),
@@ -390,6 +392,9 @@ function paramsFromEnv() {
     clientIface: envOr("CLIENT_IFACE", ""),
     clientBindIp: envOr("CLIENT_BIND_IP", ""),
     serverIface: envOr("SERVER_IFACE", ""),
+    // traffic DESTINATION address (the server's data-plane IP on the selected
+    // interface, e.g. 10.40.2.2) — the plain server IP is the SSH/mgmt address
+    serverTrafficIp: envOr("SERVER_TRAFFIC_IP", ""),
     // SSH details
     clientUser: envOr("CLIENT_USER", "espace"),
     clientPass: envOr("CLIENT_PASS", ""),
@@ -755,13 +760,45 @@ async function ifaceByteTotals(conn) {
   return total;
 }
 
-async function verifyTrafficFlowing(cfg, { attempts = 4, sampleSeconds = 5 } = {}) {
+async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, sampleSeconds = 5 } = {}) {
+  // 1. is the generator process even alive? (catches bad binds, bad options)
+  if (sshHandles) {
+    const c = await checkTrafficClient(cfg, sshHandles);
+    if (c) {
+      if (c.tail) log(`traffic client output:\n${c.tail}`);
+      if (!c.alive) {
+        throw new Error(`traffic client exited: ${c.tail || "(no output)"} — failing early`);
+      }
+    }
+  }
+
+  // 2. is the TEST traffic actually crossing the overlay links? Measuring on
+  // the netem VM's candidate link NICs is the authoritative signal — the
+  // spoke's aggregate counters also count mgmt/SSH noise and false-positive.
+  if (cfg.netemCandidates.length) {
+    for (let i = 1; i <= attempts; i++) {
+      const best = await netemCandidatePps(cfg, sampleSeconds);
+      log(`traffic check ${i}/${attempts}: ${best.pps} pps on netem link ` +
+          `${best.iface ?? "(none)"} (threshold ${cfg.trafficMinPps} pps)`);
+      if (best.pps >= cfg.trafficMinPps) {
+        log(`traffic confirmed flowing over ${best.iface}`);
+        setStatus({ trafficVerified: best.pps });
+        return best.pps;
+      }
+    }
+    const c2 = sshHandles ? await checkTrafficClient(cfg, sshHandles) : null;
+    throw new Error(
+      `traffic is NOT crossing the overlay links (below ${cfg.trafficMinPps} pps on ` +
+      `${cfg.netemCandidates.join("/")} after ${attempts} checks). Check the traffic ` +
+      `destination is the server's DATA-plane IP, not its mgmt IP.` +
+      (c2?.tail ? ` Client output: ${c2.tail}` : ""));
+  }
+
+  // fallback (no candidate list): aggregate byte rate on the spoke
+  log("WARN: NETEM_CANDIDATE_IFACES not set — falling back to spoke byte counters " +
+      "(weak signal, can false-positive on mgmt traffic)");
   const conn = await sshConnect(cfg.spoke);
   try {
-    const { stdout: procs } = await sshExec(
-      conn, "pgrep -a 'iperf3|iperf|tcpkali|scapy|python' 2>/dev/null | head -10");
-    if (procs.trim()) log(`traffic processes on spoke:\n${procs.trim()}`);
-
     for (let i = 1; i <= attempts; i++) {
       const before = await ifaceByteTotals(conn);
       await sleep(sampleSeconds * 1000);
@@ -770,7 +807,7 @@ async function verifyTrafficFlowing(cfg, { attempts = 4, sampleSeconds = 5 } = {
       log(`traffic check ${i}/${attempts}: ${Math.round(bps)} B/s aggregate on spoke ` +
           `(threshold ${cfg.trafficMinBps})`);
       if (bps >= cfg.trafficMinBps) {
-        log("traffic confirmed flowing");
+        log("traffic confirmed flowing (spoke aggregate)");
         setStatus({ trafficVerified: Math.round(bps) });
         return bps;
       }
@@ -828,8 +865,11 @@ function buildTrafficCommands(p) {
 
   switch (p.trafficTool) {
     case "iperf3": {
+      // target the server's DATA-PLANE address (selected interface IP); the
+      // plain server IP is the SSH/mgmt address and would bypass the overlay
+      const target = p.serverTrafficIp || p.serverIp;
       const serverCmd = `iperf3 -s${sPort ? ` -p ${sPort}` : ""}`;
-      let c = `iperf3 -c ${p.serverIp}`;
+      let c = `iperf3 -c ${target}`;
       if (sPort) c += ` -p ${sPort}`;
       if (udp) c += " -u";
       if (String(p.trafficDirection).toLowerCase() === "downstream") c += " -R";
@@ -847,7 +887,7 @@ function buildTrafficCommands(p) {
       return {
         serverCmd: "# scapy needs no server process",
         clientCmd: `sudo python3 /path/to/scapy_traffic.py --iface ${p.clientIface || "IFACE"} ` +
-          `--dst ${p.serverIp || "SERVER_IP"} --tos ${tos} --duration ${dur}` +
+          `--dst ${p.serverTrafficIp || p.serverIp || "SERVER_IP"} --tos ${tos} --duration ${dur}` +
           (pktSize ? ` --size ${pktSize}` : ""),
       };
     case "tcpreplay":
@@ -877,31 +917,77 @@ function toolBinary(cmd) {
  */
 async function startTrafficViaSsh(cfg, traffic) {
   const handles = { serverPid: null, clientPid: null };
-  if (traffic.serverCmd && !traffic.serverCmd.startsWith("#")) {
-    const conn = await sshConnect(cfg.serverSsh);
+
+  // launch + early-death detection: start detached, wait 3 s, then confirm
+  // the process is still alive — if it died, surface its log so the real
+  // error (bad bind, unreachable target, missing option) is visible.
+  const startSide = async (creds, cmd, logName, side) => {
+    const conn = await sshConnect(creds);
     try {
-      // clear any stale listener from a previous run
-      const bin = toolBinary(traffic.serverCmd);
+      const bin = toolBinary(cmd);
+      if (bin && !/[/\\]/.test(bin)) {
+        const which = await sshExec(conn, `command -v ${bin} || echo MISSING`);
+        if (which.stdout.includes("MISSING")) {
+          throw new Error(`${bin} is not installed on the ${side} (${creds.host}) — install it first`);
+        }
+      }
       if (bin) await sshExec(conn, `pkill -x ${bin} 2>/dev/null; true`);
       const { stdout } = await sshExec(
-        conn, `nohup ${traffic.serverCmd} >/tmp/sla_traffic_server.log 2>&1 & echo $!`);
-      handles.serverPid = parseInt(stdout.trim(), 10) || null;
-      log(`traffic server started on ${cfg.serverSsh.host} (pid ${handles.serverPid}): ${traffic.serverCmd}`);
+        conn, `nohup ${cmd} >/tmp/${logName} 2>&1 & echo $!`);
+      const pid = parseInt(stdout.trim(), 10) || null;
+      log(`traffic ${side} started on ${creds.host} (pid ${pid}): ${cmd}`);
+      await sleep(3000);
+      const alive = (await sshExec(
+        conn, `kill -0 ${pid} 2>/dev/null && echo alive || echo dead`)).stdout.includes("alive");
+      if (!alive) {
+        const tail = (await sshExec(conn, `tail -5 /tmp/${logName} 2>/dev/null`)).stdout.trim();
+        throw new Error(`traffic ${side} exited immediately on ${creds.host}: ${tail || "(no output)"}`);
+      }
+      return pid;
     } finally {
       conn.end();
     }
-    await sleep(1500);
+  };
+
+  if (traffic.serverCmd && !traffic.serverCmd.startsWith("#")) {
+    handles.serverPid = await startSide(cfg.serverSsh, traffic.serverCmd, "sla_traffic_server.log", "server");
   }
+  handles.clientPid = await startSide(cfg.clientSsh, traffic.clientCmd, "sla_traffic_client.log", "client");
+  return handles;
+}
+
+/** Is the traffic client still alive, and what has it printed? */
+async function checkTrafficClient(cfg, handles) {
+  if (!handles?.clientPid || !cfg.clientSsh) return null;
   const conn = await sshConnect(cfg.clientSsh);
   try {
-    const { stdout } = await sshExec(
-      conn, `nohup ${traffic.clientCmd} >/tmp/sla_traffic_client.log 2>&1 & echo $!`);
-    handles.clientPid = parseInt(stdout.trim(), 10) || null;
-    log(`traffic client started on ${cfg.clientSsh.host} (pid ${handles.clientPid}): ${traffic.clientCmd}`);
+    const alive = (await sshExec(
+      conn, `kill -0 ${handles.clientPid} 2>/dev/null && echo alive || echo dead`)).stdout.includes("alive");
+    const tail = (await sshExec(conn, "tail -5 /tmp/sla_traffic_client.log 2>/dev/null")).stdout.trim();
+    return { alive, tail };
   } finally {
     conn.end();
   }
-  return handles;
+}
+
+/** Peak pps across the netem VM's candidate link interfaces over one sample. */
+async function netemCandidatePps(cfg, sampleSeconds = 5) {
+  const conn = await sshConnect(cfg.netemSsh);
+  try {
+    const a = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    await sleep(sampleSeconds * 1000);
+    const b = parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+    let best = { iface: null, pps: 0 };
+    for (const iface of cfg.netemCandidates) {
+      if (!a[iface] || !b[iface]) continue;
+      const pps = Math.round(
+        (b[iface].rxPkts - a[iface].rxPkts + b[iface].txPkts - a[iface].txPkts) / sampleSeconds);
+      if (pps > best.pps) best = { iface, pps };
+    }
+    return best;
+  } finally {
+    conn.end();
+  }
 }
 
 /** Stop SSH-driven traffic on both ends; downloads the tool logs into destDir. */
@@ -1459,7 +1545,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   await startTraffic();
 
   try {
-    result.trafficVerifiedBps = await verifyTrafficFlowing(cfg);
+    result.trafficVerifiedBps = await verifyTrafficFlowing(cfg, sshHandles);
   } catch (e) {
     result.errors.push(e.message);
     await shot("99_traffic_not_flowing");
@@ -2362,6 +2448,7 @@ module.exports = {
   parsePort, parsePosInt, parseConfPageId, confApiBase, resolveConfApiBase,
   // traffic generation + interface discovery
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
+  checkTrafficClient, netemCandidatePps,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
   runPacketLossSchedule, applyLatencyViaTc, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
