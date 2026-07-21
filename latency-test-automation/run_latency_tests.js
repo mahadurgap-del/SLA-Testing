@@ -1246,6 +1246,39 @@ async function detectActiveLink(cfg, sampleSeconds = 3) {
   }
 }
 
+/* module-level registry of interfaces we impaired — the safety net that
+ * clears netem even when a case dies outside its own finally block */
+const activeImpairments = new Set();
+
+/** Parse `tc qdisc show` output into the list of ifaces with a netem qdisc. */
+function parseNetemIfaces(tcShow) {
+  const out = [];
+  for (const line of String(tcShow).split("\n")) {
+    const m = line.match(/^qdisc netem \S+ dev (\S+)/);
+    if (m && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/** Remove any leftover netem qdiscs on the netem VM (e.g. from a crashed
+ *  earlier run) so every run starts from a known-clean state. */
+async function sanitizeNetem(cfg) {
+  const conn = await sshConnect(cfg.netemSsh);
+  try {
+    const show = (await sshExec(conn, "tc qdisc show")).stdout;
+    const dirty = parseNetemIfaces(show);
+    for (const iface of dirty) {
+      await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root 2>/dev/null; true`);
+      log(`sanitize: removed leftover netem on ${iface}`);
+    }
+    checkpoint(true, "Netem VM clean state",
+      dirty.length ? `removed leftover netem on ${dirty.join(", ")}` : "no leftover netem rules");
+    return dirty;
+  } finally {
+    conn.end();
+  }
+}
+
 /** Apply a netem impairment ({lossPct} and/or {delayMs}) to one interface,
  *  then VERIFY it via `tc qdisc show dev <iface>`. */
 async function applyNetemImpairment(cfg, iface, spec) {
@@ -1275,7 +1308,9 @@ async function applyNetemImpairment(cfg, iface, spec) {
         throw new Error(`netem verification failed on ${iface}: tc qdisc show says "${show.trim().slice(0, 160)}"`);
       }
       checkpoint(true, `Netem applied on ${iface}`, `${parts.join(" ")} (verified by tc qdisc show)`);
+      activeImpairments.add(iface);
     } else {
+      activeImpairments.delete(iface);
       log(`netem ${iface}: cleared`);
     }
   } finally {
@@ -1287,6 +1322,7 @@ async function clearNetemImpairment(cfg, iface) {
   const conn = await sshConnect(cfg.netemSsh);
   try {
     await sudoExec(conn, cfg.netemSsh, `tc qdisc del dev ${iface} root 2>/dev/null; true`);
+    activeImpairments.delete(iface);
     log(`netem ${iface}: cleared`);
   } finally {
     conn.end();
@@ -1331,20 +1367,29 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     let pct = 0;
     while (Date.now() < deadline && !isAborted()) {
       pct += s.rampStepPct;
-      await applyNetemImpairment(cfg, iface, { lossPct: pct });
-      impairedIfaces.add(iface);
-      note(iface, `loss ${pct}%`);
+      try {
+        await applyNetemImpairment(cfg, iface, { lossPct: pct });
+        impairedIfaces.add(iface);
+        note(iface, `loss ${pct}%`);
+      } catch (e) {
+        log(`WARN: ramp step failed (${e.message}) — retrying next interval`);
+        pct -= s.rampStepPct; // retry the same level next tick
+      }
       if (!(await sleepWithin(deadline, s.rampIntervalSec * 1000))) break;
     }
   } else if (plType === "burst") {
     while (Date.now() < deadline && !isAborted()) {
-      const { iface } = await detectActiveLink(cfg);
-      await applyNetemImpairment(cfg, iface, { lossPct: s.burstLossPct });
-      impairedIfaces.add(iface);
-      note(iface, `burst loss ${s.burstLossPct}%`);
-      await sleepWithin(deadline, s.burstDurationSec * 1000);
-      await clearNetemImpairment(cfg, iface);
-      note(iface, "clear");
+      try {
+        const { iface } = await detectActiveLink(cfg);
+        await applyNetemImpairment(cfg, iface, { lossPct: s.burstLossPct });
+        impairedIfaces.add(iface);
+        note(iface, `burst loss ${s.burstLossPct}%`);
+        await sleepWithin(deadline, s.burstDurationSec * 1000);
+        await clearNetemImpairment(cfg, iface);
+        note(iface, "clear");
+      } catch (e) {
+        log(`WARN: burst cycle failed (${e.message}) — retrying next interval`);
+      }
       if (!(await sleepWithin(deadline,
         Math.max(1, s.burstIntervalSec - s.burstDurationSec) * 1000))) break;
     }
@@ -1352,13 +1397,17 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     while (Date.now() < deadline && !isAborted()) {
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
-      const { iface } = await detectActiveLink(cfg);
-      await applyNetemImpairment(cfg, iface, { lossPct: s.randomLossPct });
-      impairedIfaces.add(iface);
-      note(iface, `random loss ${s.randomLossPct}%`);
-      await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000);
-      await clearNetemImpairment(cfg, iface);
-      note(iface, "clear");
+      try {
+        const { iface } = await detectActiveLink(cfg);
+        await applyNetemImpairment(cfg, iface, { lossPct: s.randomLossPct });
+        impairedIfaces.add(iface);
+        note(iface, `random loss ${s.randomLossPct}%`);
+        await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000);
+        await clearNetemImpairment(cfg, iface);
+        note(iface, "clear");
+      } catch (e) {
+        log(`WARN: random-loss event failed (${e.message}) — retrying after next gap`);
+      }
     }
   } else {
     throw new Error(`unknown packet-loss type: ${plType}`);
@@ -1771,11 +1820,16 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   }
 
   let sshHandles = null;
+  let trafficStopped = false;
   const startTraffic = async () => {
+    trafficStopped = false;
     if (cfg.trafficDriver === "ssh") sshHandles = await startTrafficViaSsh(cfg, traffic);
     else await startTrafficViaUi(page, cfg, traffic);
   };
+  // idempotent: every exit path may call this; only the first call acts
   const stopTraffic = async () => {
+    if (trafficStopped) return;
+    trafficStopped = true;
     if (cfg.trafficDriver === "ssh") {
       const logs = await stopTrafficViaSsh(cfg, traffic, sshHandles, tcDir);
       if (logs?.length) result.artifacts.traffic.push(...logs);
@@ -1817,23 +1871,31 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     await stageGate(cfg, `${tc.name}: netem applied`);
   }
 
-  const spokeMonitor = await sshConnect(cfg.spoke);
+  // a monitoring failure must not skip traffic stop / netem cleanup /
+  // log collection — catch it, record it, and continue the teardown path
   try {
-    const monitorP = monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
-      await shot(`03_switch_${result.switches.length}`);
-      if (isFirst) {
-        const snapTar = await collectHourlogSnapshot(cfg.spoke, spokeDir, `${tc.name}_switch`);
-        if (snapTar) result.artifacts.spoke.push(snapTar);
-      }
-    });
-    const scheduleP = isDynamicPL
-      ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null)
-      : Promise.resolve([]);
-    const [switches, impairments] = await Promise.all([monitorP, scheduleP]);
-    result.switches = switches;
-    result.impairments = [...result.impairments, ...impairments];
+    const spokeMonitor = await sshConnect(cfg.spoke);
+    try {
+      const monitorP = monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
+        await shot(`03_switch_${result.switches.length}`);
+        if (isFirst) {
+          const snapTar = await collectHourlogSnapshot(cfg.spoke, spokeDir, `${tc.name}_switch`);
+          if (snapTar) result.artifacts.spoke.push(snapTar);
+        }
+      });
+      const scheduleP = isDynamicPL
+        ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null)
+        : Promise.resolve([]);
+      const [switches, impairments] = await Promise.all([monitorP, scheduleP]);
+      result.switches = switches;
+      result.impairments = [...result.impairments, ...impairments];
+    } finally {
+      spokeMonitor.end();
+    }
+  } catch (e) {
+    result.errors.push(`monitoring: ${e.message}`);
+    log(`ERROR: monitoring failed — ${e.message}`);
   } finally {
-    spokeMonitor.end();
     for (const iface of impairedIfaces) {
       try { await clearNetemImpairment(cfg, iface); }
       catch (e) { log(`WARN: clearing netem on ${iface} failed: ${e.message}`); }
@@ -2379,6 +2441,15 @@ async function runSuite(cfg, params) {
   clearAbort();
   resetRunLogs();
   await preflight(cfg);
+  // start from a known-clean netem VM (leftovers from a crashed run, etc.)
+  if (cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath)) {
+    try {
+      await sanitizeNetem(cfg);
+    } catch (e) {
+      checkpoint(false, "Netem VM clean state", e.message.slice(0, 160));
+      throw e;
+    }
+  }
   await stageGate(cfg, "Phase 1: infrastructure validation");
 
   const meta = await collectRunMetadata(cfg, traffic.type, traffic.tos);
@@ -2446,6 +2517,14 @@ async function runSuite(cfg, params) {
     }
   } finally {
     if (browser) await browser.close();
+    // safety net: clear any impairment a failed/crashed case left behind
+    if (activeImpairments.size && cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath)) {
+      log(`safety net: clearing leftover netem on ${[...activeImpairments].join(", ")}`);
+      for (const iface of [...activeImpairments]) {
+        try { await clearNetemImpairment(cfg, iface); }
+        catch (e) { log(`WARN: leftover netem on ${iface} NOT cleared: ${e.message}`); }
+      }
+    }
   }
 
   let pageId = null;
@@ -2717,6 +2796,7 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
+  parseNetemIfaces, sanitizeNetem,
   runPacketLossSchedule, applyLatencyViaTc, offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // parsing / cases / reports (tests)
   lastCompleteRecord, findBalancedEnd, activeTc, linkStats,
