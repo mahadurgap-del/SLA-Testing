@@ -570,16 +570,34 @@ async function preflight(cfg) {
 
   if (cfg.confluence) {
     log("pre-flight: Confluence auth check");
-    const url = cfg.confluence.pageId
-      ? `${cfg.confluence.base}/wiki/rest/api/content/${cfg.confluence.pageId}`
-      : `${cfg.confluence.base}/wiki/rest/api/space/${cfg.confluence.space}`;
-    const resp = await fetch(url, {
-      headers: { Authorization: confAuthHeader(cfg.confluence) },
-    });
-    if (!resp.ok) {
-      throw new Error(`Confluence check failed: HTTP ${resp.status} on ${url}`);
+    const auth = { Authorization: confAuthHeader(cfg.confluence) };
+    // 1. does the email/token pair authenticate at all?
+    const who = await fetch(`${cfg.confluence.base}/wiki/rest/api/user/current`, { headers: auth });
+    const whoBody = (await who.text()).slice(0, 300);
+    if (!who.ok) {
+      throw new Error(
+        `Confluence auth failed (HTTP ${who.status}). Check that CONF email is the ` +
+        `Atlassian account that created the token, and that the API token has ` +
+        `Confluence access — scoped tokens without Confluence scopes return 403; ` +
+        `create a classic token at id.atlassian.com > Security > API tokens. ` +
+        `Server said: ${whoBody}`);
     }
-    log("pre-flight: Confluence OK");
+    let whoName = "user";
+    try { whoName = JSON.parse(whoBody).displayName || whoName; } catch { /* not json */ }
+    log(`pre-flight: Confluence auth OK (${whoName})`);
+    // 2. can this token see the target page/space?
+    const target = cfg.confluence.pageId
+      ? { url: `${cfg.confluence.base}/wiki/rest/api/content/${cfg.confluence.pageId}`,
+          desc: `page ${cfg.confluence.pageId}` }
+      : { url: `${cfg.confluence.base}/wiki/rest/api/space/${cfg.confluence.space}`,
+          desc: `space ${cfg.confluence.space}` };
+    const resp = await fetch(target.url, { headers: auth });
+    if (!resp.ok) {
+      throw new Error(
+        `Confluence auth works (${whoName}) but access to ${target.desc} failed ` +
+        `(HTTP ${resp.status}): ${(await resp.text()).slice(0, 300)}`);
+    }
+    log(`pre-flight: Confluence OK (${target.desc} reachable)`);
   }
   log("pre-flight: all checks passed");
 }
