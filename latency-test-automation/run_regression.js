@@ -622,112 +622,103 @@ function resultTable(c, r) {
     `</tbody></table>`;
 }
 
-/* ---- matrix row (Test Execution Matrix) ---- */
-function matrixRow(c, r) {
+/* ========================================================================= *
+ * Confluence page — IPTV Testing page STYLE: one table with columns
+ * Testcase | Logs | Commands | Results, one row appended per testcase.
+ * ========================================================================= */
+
+const IPTV_HEADER =
+  "<tr>" + ["Testcase", "Logs", "Commands", "Results"].map((h) => `<th>${h}</th>`).join("") + "</tr>";
+
+/** Column 1 — Testcase: traffic type / direction / suite+TC / ToS / config. */
+function tcCell(c, r) {
+  const dir = c.direction === "downstream" ? "downstream" : "upstream";
+  return `<strong>Traffic type: IPTV ${dir}</strong><br/>` +
+    `${e(c.suiteLabel)} — ${e(c.testcase)} ${e(c.testLabel)}<br/>` +
+    `ToS ${e(c.tos)}<br/>` +
+    `${e(initialConfig(c))}<br/>` +
+    `Runtime: ${e(runtimeText(r))}`;
+}
+
+/** Column 2 — Logs: direction-scoped DMTS hourLog + screenshots + reports. */
+function logsCell(c, r) {
   const side = shownSide(c);
-  const hourlog = findFile(r.artifacts?.[side], (f) => f.includes("hourlog"));
-  const diag = findFile(r.artifacts?.[side], (f) => f.includes("diagpack"));
-  const logsCell = [hourlog, diag].filter(Boolean).map((f) => attRef(uploadName(f))).join(" ") ||
-    ((r.artifacts?.[side] || []).length ? "&#10003;" : "-");
+  const sideLabel = side === "spoke" ? "Spoke" : "Hub";
+  const parts = [];
+  const hourlog = findFile(r.artifacts && r.artifacts[side], (f) => f.includes("hourlog"));
+  parts.push(`DMTS hourLog (${sideLabel}): ${hourlog ? attRef(uploadName(hourlog)) : "&mdash;"}`);
+  const shots = r.screenshots || [];
+  if (shots.length) parts.push(`Screenshots: ` + shots.map((p) => attRef(uploadName(p))).join(" "));
   const report = findFile(r.reportFiles, (f) => f.endsWith("report.html"));
-  const mins = r.windowSec ? `${Math.round(r.windowSec / 60)} min` : runtimeText(r);
-  return (
-    "<tr>" +
-    `<td>${c.n}</td>` +
-    `<td>${e(c.dirLabel)}</td>` +
-    `<td>${e(c.tos)}</td>` +
-    `<td>${e(c.suiteLabel)}</td>` +
-    `<td>${e(c.testcase)} ${e(c.testLabel)}</td>` +
-    `<td>${e(mins)}</td>` +
-    `<td>${r.switchObserved ? "Yes" : "No"}</td>` +
-    `<td>${logsCell}</td>` +
-    `<td>${report ? attRef(uploadName(report)) : "-"}</td>` +
-    "</tr>"
-  );
+  if (report) parts.push(`HTML report: ${attRef(uploadName(report))}`);
+  const obs = findFile(r.reportFiles, (f) => f.endsWith("observations.txt")) || r.observationsFile;
+  if (obs) parts.push(`observations.txt: ${attRef(uploadName(obs))}`);
+  const sum = findFile(r.reportFiles, (f) => f.endsWith("summary.json"));
+  if (sum) parts.push(`summary.json: ${attRef(uploadName(sum))}`);
+  return parts.join("<br/>");
 }
 
-const MATRIX_HEADER =
-  "<tr>" + ["S.No", "Direction", "ToS", "Suite", "Test Case", "Runtime", "Switch Observed", "Logs", "Report"]
-    .map((h) => `<th>${h}</th>`).join("") + "</tr>";
-
-/* ---- top-level tables ---- */
-function executionSummary(state, baseMeta) {
-  const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
-  const total = state.total || TOTAL;
-  const done = (state.completed || []).length;
-  const cases = state.cases || [];
-  const lastEnd = cases.length ? cases[cases.length - 1].endTime : null;
-  const endTime = done >= total && lastEnd ? lastEnd : "(in progress)";
-  let runtime = "-";
-  if (state.startedAt && lastEnd) {
-    const sec = Math.max(0, Math.round((new Date(lastEnd) - new Date(state.startedAt)) / 1000));
-    runtime = `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+/** Column 3 — Commands: iperf3 server/client + the netem tc actions (per step). */
+function commandsCell(c, r) {
+  const lines = [];
+  if (r.serverCmd) lines.push(`<strong>iperf3 server:</strong><br/><code>${e(r.serverCmd)}</code>`);
+  if (r.clientCmd) lines.push(`<strong>iperf3 client:</strong><br/><code>${e(r.clientCmd)}</code>`);
+  const imp = r.impairments || [];
+  if (imp.length) {
+    const steps = imp.map((ev) => `${e(offset(r.startTime, ev.t))} ${e(ev.event)}`).join("<br/>");
+    lines.push(`<strong>Netem (tc):</strong><br/>${steps}`);
+  } else if (c.baseline) {
+    lines.push(`<strong>Netem (tc):</strong> none (baseline)`);
   }
-  return `<h2>Execution Summary</h2><table><tbody>` +
-    row("Execution ID", state.runId) +
-    row("Traffic profile", state.iptvMode ? "IPTV (iperf3 UDP, end-on-switch, hourLog only)" : "SLA regression") +
-    row("ToS", (state.tosList && state.tosList.join(", ")) || "0x04, 0x24, 0x38") +
-    row("Start Time", state.startedAt) +
-    row("End Time", endTime) +
-    row("Total Testcases", String(total)) +
-    row("Completed", String(done)) +
-    row("Remaining", String(total - done)) +
-    row("Runtime", runtime) +
-    row("Grid Version", baseMeta.gridVersion) +
-    row("Automation Version", AUTOMATION_VERSION) +
-    `</tbody></table>`;
+  return lines.join("<br/><br/>");
 }
 
-/** Suite-completion summary (grows as cases finish; complete once all 42 done). */
-function suiteCompletionSummary(state) {
-  const completed = new Set(state.completed || []);
-  const tosList = (state.tosList && state.tosList.length) ? state.tosList : TOS_LIST;
-  const rows = [];
-  for (const tos of tosList) {
-    for (const dir of DIRECTIONS) {
-      const lat = LATENCY_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
-      const pl = PL_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
-      rows.push(`<tr><td>${e(dir.label)}</td><td>${e(tos)}</td>` +
-        `<td>${lat}/${LATENCY_TCS.length}</td><td>${pl}/${PL_TCS.length}</td></tr>`);
+/** Column 4 — Results: observation prose in the reference-page style (no PASS/FAIL). */
+function resultsCell(c, r) {
+  const bits = [];
+  const nMin = r.windowSec ? Math.round(r.windowSec / 60)
+    : (r.startTime && r.endTime ? Math.round((new Date(r.endTime) - new Date(r.startTime)) / 60000) : 5);
+  if (r.switchObserved && r.switches && r.switches.length) {
+    const sw = r.switches[r.switches.length - 1];
+    const when = r.switchAt || sw.time;
+    let why = "";
+    if (c.suite === "latency" && r.switchLatencyMs != null) why = ` when active-link latency reached ${r.switchLatencyMs} ms`;
+    else if (c.suite === "packet-loss") why = ` when induced packet loss reached the switch threshold`;
+    bits.push(`Traffic switched from ${e(sw.fromLink)} to ${e(sw.toLink)} at ${e(when)}${why}.`);
+    if (sw.fromLinkLatency95P != null || sw.fromLinkPacketLoss95P != null) {
+      bits.push(`At switch: from-link latency95P ${e(sw.fromLinkLatency95P)} ms, packetLoss95P ${e(sw.fromLinkPacketLoss95P)}%.`);
     }
+  } else {
+    bits.push(`No load balancing observed. Traffic remained on the same link throughout the ${nMin}-minute test.`);
   }
-  return `<h2>Suite Completion Summary</h2><table><tbody>` +
-    `<tr><th>Direction</th><th>ToS</th><th>Latency Suite Completed</th><th>Packet Loss Suite Completed</th></tr>` +
-    rows.join("") + `</tbody></table>`;
+  bits.push(`Final configuration: ${e(finalConfig(c, r))}.`);
+  if (r.errors && r.errors.length) bits.push(`Errors: ${e(r.errors.join(" | "))}.`);
+  bits.push(`<em>Automation completed — observation only (no PASS/FAIL).</em>`);
+  return bits.join("<br/>");
+}
+
+/** One IPTV-style table row for a completed case. */
+function iptvRow(c, r) {
+  return `<tr><td>${tcCell(c, r)}</td><td>${logsCell(c, r)}</td>` +
+    `<td>${commandsCell(c, r)}</td><td>${resultsCell(c, r)}</td></tr>`;
 }
 
 function buildPageBody(state, baseMeta) {
   const date = (state.startedAt || "").slice(0, 10) || "unknown-date";
+  const done = (state.completed || []).length;
+  const total = state.total || TOTAL;
   const rows = (state.summaryRows || []).join("");
-  const sections = (state.sections || []).join("");
+  const meta =
+    `<p><strong>Execution ID:</strong> ${e(state.runId)} &nbsp;|&nbsp; ` +
+    `<strong>ToS:</strong> ${e((state.tosList && state.tosList.join(", ")) || "0x04, 0x24, 0x38")} &nbsp;|&nbsp; ` +
+    `<strong>Grid:</strong> ${e(baseMeta.gridVersion)} &nbsp;|&nbsp; ` +
+    `<strong>Progress:</strong> ${done}/${total} &nbsp;|&nbsp; ` +
+    `<strong>Spoke / Hub:</strong> ${e(baseMeta.spokeHost)} / ${e(baseMeta.hubHost)}</p>`;
   return (
     `<h1>SLA Regression Report - ${e(date)}</h1>` +
     `<p><em>Observations only — no PASS/FAIL. Manual validation to follow.</em></p>` +
-    executionSummary(state, baseMeta) +
-    `<h2>Test Execution Matrix</h2><table><tbody>${MATRIX_HEADER}${rows || ""}</tbody></table>` +
-    (sections || "") +
-    suiteCompletionSummary(state)
-  );
-}
-
-/** Full detail section for one testcase, in the fixed template layout. */
-function detailSection(c, r, baseMeta) {
-  const heading =
-    `<h1>Testcase ${String(c.n).padStart(2, "0")}</h1>` +
-    `<p><strong>${e(c.suiteLabel)} Suite — ${e(c.testcase)} (${e(c.testLabel)})</strong></p>`;
-  return (
-    heading +
-    configurationTable(c, r, baseMeta) +
-    testConfigurationTable(c) +
-    commandsSection(r) +
-    executionTimeline(r) +
-    trafficMovementTable(c, r) +
-    impairmentProgression(c, r) +
-    logCollectionTables(c, r) +
-    observationsList(c, r) +
-    screenshotsBlock(r) +
-    resultTable(c, r) +
-    `<hr/>`
+    meta +
+    `<table><tbody>${IPTV_HEADER}${rows || ""}</tbody></table>`
   );
 }
 
@@ -798,9 +789,7 @@ async function appendCase(conf, state, baseMeta, c, r) {
     catch (err) { engine.log(`WARN: attach ${path.basename(f)}: ${err.message}`); }
   }
   state.summaryRows = state.summaryRows || [];
-  state.sections = state.sections || [];
-  state.summaryRows.push(matrixRow(c, r));
-  state.sections.push(detailSection(c, r, baseMeta));
+  state.summaryRows.push(iptvRow(c, r)); // one Testcase|Logs|Commands|Results row
   await putPage(conf, state, baseMeta);
 }
 
@@ -895,6 +884,7 @@ async function runRegression(cfg, params, opts = {}) {
   try {
     for (const c of matrix) {
       if (engine.isAborted()) { log("regression aborted by user — stopping"); break; }
+      if (opts.only && !opts.only.has(c.id)) continue; // smoke: run only selected case ids
       if (completed.has(c.id)) { log(`skip ${c.id} — already completed`); continue; }
       if (opts.limit && ranThisRun >= opts.limit) { log(`reached --limit ${opts.limit} — stopping (smoke run)`); break; }
 
@@ -907,12 +897,22 @@ async function runRegression(cfg, params, opts = {}) {
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
-      const cmds = engine.buildTrafficCommands({ ...params, trafficDirection: c.direction, tos: c.tos });
+      // IPTV mode drives one UDP stream at the reference's per-direction demand
+      // (~66 Mbps upstream / ~90 Mbps downstream) so DMTS sees real load and
+      // load-balances — 2M is far too low for a managed flow to form.
+      const caseBw = state.iptvMode
+        ? (c.direction === "downstream" ? (params.iptvBwDown || "90M") : (params.iptvBwUp || "66M"))
+        : params.bandwidth;
+      const caseStreams = state.iptvMode ? "1" : params.parallelStreams;
+      const cmds = engine.buildTrafficCommands({
+        ...params, trafficDirection: c.direction, tos: c.tos,
+        bandwidth: caseBw, parallelStreams: caseStreams,
+      });
       const traffic = {
         type: String(params.trafficType || "UDP").toUpperCase(),
         direction: c.direction,
         tos: engine.parseTos(c.tos),
-        bandwidth: engine.parseBandwidth(params.bandwidth).value,
+        bandwidth: engine.parseBandwidth(caseBw).value,
         serverCmd: cmds.serverCmd || null,
         clientCmd: cmds.clientCmd || null,
       };
@@ -1012,6 +1012,8 @@ async function main() {
   if (maxArg) params.caseMaxSec = maxArg.slice("--max=".length);
   const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
   const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
+  const onlyArg = args.find((a) => a.startsWith("--only=")); // run only these case ids (smoke)
+  const only = onlyArg ? new Set(onlyArg.slice("--only=".length).split(/[,\s]+/).filter(Boolean)) : undefined;
 
   const check = engine.validateParams(params);
   if (!check.ok) { console.error(`invalid params: ${JSON.stringify(check.errors)}`); process.exit(1); }
@@ -1025,7 +1027,7 @@ async function main() {
     process.exit(0);
   }
 
-  const res = await runRegression(cfg, params, { resume: resume && !restart, limit });
+  const res = await runRegression(cfg, params, { resume: resume && !restart, limit, only });
   process.exit(res.completed >= res.total ? 0 : 1);
 }
 
@@ -1037,6 +1039,6 @@ module.exports = {
   runRegression, buildMatrix, caseWindowSec, buildTc,
   loadState, saveState, clearState, stateSummary,
   initialConfig, finalConfig, statusText,
-  buildPageBody, matrixRow, detailSection, ensurePage, appendCase,
+  buildPageBody, iptvRow, ensurePage, appendCase,
   PROFILE_NAME, STATE_FILE, TOTAL,
 };
