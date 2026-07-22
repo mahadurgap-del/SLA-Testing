@@ -96,8 +96,10 @@ function buildMatrix(tosList, iptv) {
   const list = (Array.isArray(tosList) && tosList.length) ? tosList : TOS_LIST;
   const cases = [];
   let n = 0;
-  for (const dir of DIRECTIONS) {
-    for (const tos of list) {
+  // ToS-outer so each ToS block holds its upstream+downstream, latency+PL cases
+  // together (matches "for each ToS, run upstream/downstream").
+  for (const tos of list) {
+    for (const dir of DIRECTIONS) {
       for (const t of LATENCY_TCS) {
         n++;
         const base = {
@@ -681,8 +683,8 @@ function suiteCompletionSummary(state) {
   const completed = new Set(state.completed || []);
   const tosList = (state.tosList && state.tosList.length) ? state.tosList : TOS_LIST;
   const rows = [];
-  for (const dir of DIRECTIONS) {
-    for (const tos of tosList) {
+  for (const tos of tosList) {
+    for (const dir of DIRECTIONS) {
       const lat = LATENCY_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
       const pl = PL_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
       rows.push(`<tr><td>${e(dir.label)}</td><td>${e(tos)}</td>` +
@@ -818,7 +820,7 @@ async function runRegression(cfg, params, opts = {}) {
   // ToS list: array or CSV string; default the full 3-ToS SLA set. IPTV runs
   // pass a single ToS -> a 2×7=14 case run.
   let tosList = params && params.regressionTosList;
-  if (typeof tosList === "string") tosList = tosList.split(",").map((s) => s.trim()).filter(Boolean);
+  if (typeof tosList === "string") tosList = tosList.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
   if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
   const matrix = buildMatrix(tosList, iptvMode);
 

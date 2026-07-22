@@ -416,11 +416,15 @@ const PAGE = (d, profileNames) => `<!doctype html>
   </fieldset>
 
   <fieldset class="reg-only"><legend>Regression options</legend><div class="grid">
-    <div><label>ToS / DSCP (blank = full 0x04,0x24,0x38 SLA matrix)</label>
-      <input name="regressionTos" value="0x04" placeholder="e.g. 0x04"><div class="errmsg"></div></div>
+    <div><label>ToS / DSCP list — one per line or comma-separated (blank = full 0x04,0x24,0x38 SLA matrix)</label>
+      <textarea name="regressionTos" rows="5" placeholder="0x04&#10;0x24&#10;0x34&#10;0x44&#10;0x84">0x04
+0x24
+0x34
+0x44
+0x84</textarea><div class="errmsg"></div></div>
     <div><label>&nbsp;</label>
       <label style="display:block;"><input type="checkbox" name="iptvMode" style="width:auto" checked> IPTV mode</label></div>
-    <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode: iperf3 traffic, single ToS above &rarr; 14 cases (7 &#215; upstream/downstream). Each case <b>ends on the first link switch</b> (packet-loss never runs the full ~10 min), link switching is detected from the netem overlay interfaces, and on switch only the DMTS <b>hourLog</b> is collected &mdash; Spoke for upstream, Hub for downstream. Unchecked + blank ToS = the original 42-case SLA matrix with full log/diag-pack collection.</div>
+    <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode runs the IPTV-page test logic for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>). Latency TC2 steps the active LEO link through the page sequences (up 40&hellip;250, down 25&hellip;135); TC3/TC4 hold LEO-vs-MEO / MEO-vs-GEO fixed; packet-loss is constant +2%/min, escalating periodic, and escalating random. Each case <b>ends on the first link switch</b>, detected from the netem overlay interfaces; on switch only the DMTS <b>hourLog</b> is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix.</div>
   </div></fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
@@ -843,8 +847,11 @@ async function startRegression(resume) {
   clearErrors();
   const iptv = form.querySelector('[name="iptvMode"]').checked;
   const tos = (form.querySelector('[name="regressionTos"]').value || "").trim();
+  const tosArr = tos.split(/[,\\s]+/).filter(Boolean);
+  const nTos = tosArr.length || 3;
   const scope = iptv
-    ? "IPTV mode: 14 cases (7 \\u00d7 upstream/downstream) at ToS " + (tos || "0x04") + ", ending each case on the first link switch"
+    ? nTos + " ToS (" + (tosArr.join(", ") || "0x04, 0x24, 0x38") + ") \\u00d7 14 = " + (nTos * 14) +
+      " cases, each ending on the first link switch"
     : "Full SLA matrix: 42 cases (2 directions \\u00d7 3 ToS \\u00d7 7)";
   if (!resume && !confirm(
     "Start the SLA regression?\\n\\n" +
