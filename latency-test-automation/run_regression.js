@@ -253,47 +253,20 @@ function stateSummary() {
  * storage and makes resume trivial.
  * ========================================================================= */
 
-const SUMMARY_HEADER =
-  "<tr>" +
-  ["Test ID", "Direction", "ToS", "Suite", "Testcase", "Runtime",
-   "Initial Configuration", "Final Configuration", "Switch Observed",
-   "Switch Time", "Artifacts", "Status"]
-    .map((h) => `<th>${h}</th>`).join("") +
-  "</tr>";
+const AUTOMATION_VERSION = (() => {
+  try { return require("./package.json").version || "1.0.0"; }
+  catch { return "1.0.0"; }
+})();
 
-function metaTable(state, baseMeta) {
-  const e = engine.escapeXml;
-  const completed = (state.completed || []).length;
-  return (
-    `<table><tbody>` +
-    `<tr><th>Profile</th><td>${e(state.profileName)}</td></tr>` +
-    `<tr><th>Started</th><td>${e(state.startedAt)}</td></tr>` +
-    `<tr><th>GRID version</th><td>${e(baseMeta.gridVersion)}</td></tr>` +
-    `<tr><th>Topology</th><td>${e(baseMeta.topology)}</td></tr>` +
-    `<tr><th>Spoke / Hub</th><td>${e(baseMeta.spokeHost)} / ${e(baseMeta.hubHost)}</td></tr>` +
-    `<tr><th>Progress</th><td>${completed} / ${TOTAL} test cases</td></tr>` +
-    `</tbody></table>` +
-    `<p><em>Observations only — no PASS/FAIL. Manual validation to follow.</em></p>`
-  );
-}
+const e = engine.escapeXml;
+const offset = (start, t) => (start && t ? engine.offsetStr(start, t) : "-");
 
-function buildPageBody(state, baseMeta) {
-  const rows = (state.summaryRows || []).join("");
-  const sections = (state.sections || []).join("");
-  return (
-    `<h1>SLA Full Regression (6&#215;7 Matrix)</h1>` +
-    metaTable(state, baseMeta) +
-    `<h2>Summary</h2><table><tbody>${SUMMARY_HEADER}${rows}</tbody></table>` +
-    `<h2>Test case detail</h2>${sections || "<p>(none yet)</p>"}`
-  );
-}
-
-/** Attachment reference macro for a local file path. */
+/** Attachment reference macro for an upload name. */
 function attRef(name) {
-  return `<ac:link><ri:attachment ri:filename="${engine.escapeXml(name)}"/></ac:link>`;
+  return `<ac:link><ri:attachment ri:filename="${e(name)}"/></ac:link>`;
 }
 
-/** Generic filenames collide across case folders — prefix with the folder name. */
+/** Generic filenames collide across case folders — prefix with the case-id folder. */
 const GENERIC = ["observations.txt", "summary.json", "summary.md", "report.html",
   "sla_traffic_client.log", "sla_traffic_server.log"];
 function uploadName(f) {
@@ -301,91 +274,349 @@ function uploadName(f) {
   return GENERIC.includes(b) ? `${path.basename(path.dirname(f))}_${b}` : b;
 }
 
-function caseArtifacts(r) {
+/** Which side's DMTS artifacts to SHOW/upload: upstream→Spoke, downstream→Hub.
+ *  (Both sides are still collected locally; only the relevant one is published.) */
+function shownSide(c) { return c.direction === "upstream" ? "spoke" : "hub"; }
+
+/** Files uploaded to Confluence for a case: only the relevant side + traffic
+ *  logs + reports + screenshots (keeps the page concise). */
+function caseUploadFiles(c, r) {
+  const seen = new Set();
   return [
-    ...(r.artifacts?.spoke || []),
-    ...(r.artifacts?.hub || []),
+    ...(r.artifacts?.[shownSide(c)] || []),
     ...(r.artifacts?.traffic || []),
-    ...(r.screenshots || []),
     ...(r.reportFiles || []),
-  ].filter(Boolean);
+    ...(r.screenshots || []),
+  ].filter((f) => f && !seen.has(f) && seen.add(f));
 }
 
-function summaryRow(c, r) {
-  const e = engine.escapeXml;
-  const files = caseArtifacts(r);
-  const artLinks = files.map((f) => attRef(uploadName(f))).join("<br/>") || "-";
+/* ---- link identity helpers (best-effort from DMTS switch data) ---- */
+function initialActiveLink(r) {
+  return (r.switches && r.switches[0] && r.switches[0].fromLink) || r.activeIface || "auto-detected";
+}
+function initialStandbyLink(r) {
+  return (r.switches && r.switches[0] && r.switches[0].toLink) || "auto-detected";
+}
+function finalActiveLink(r) {
+  if (r.switches && r.switches.length) return r.switches[r.switches.length - 1].toLink;
+  return initialActiveLink(r);
+}
+function finalStandbyLink(r) {
+  if (r.switches && r.switches.length) return r.switches[r.switches.length - 1].fromLink;
+  return initialStandbyLink(r);
+}
+
+/* ---- per-case sub-section builders ---- */
+
+function configurationTable(c, r, baseMeta) {
+  const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
+  const mins = r.windowSec ? `${Math.round(r.windowSec / 60)} min` : runtimeText(r);
+  return (
+    `<h4>Configuration</h4><table><tbody>` +
+    row("Direction", c.dirLabel) +
+    row("ToS", c.tos) +
+    row("Traffic", r.trafficType || "UDP") +
+    row("Runtime", mins) +
+    row("Client", baseMeta.clientHost || "-") +
+    row("Server", baseMeta.serverHost || "-") +
+    row("Spoke", baseMeta.spokeHost || "-") +
+    row("Hub", baseMeta.hubHost || "-") +
+    row("Active Link", initialActiveLink(r)) +
+    row("Standby Link", initialStandbyLink(r)) +
+    `</tbody></table>`
+  );
+}
+
+function testConfigurationTable(c) {
+  const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
+  if (c.suite === "latency") {
+    if (c.baseline) {
+      return `<h4>Test Configuration</h4><table><tbody>` +
+        row("Active Link Delay", "0 ms") + row("Standby Link Delay", "0 ms") +
+        row("Hold Time", "5 min (observe)") + row("Increment", "none") +
+        row("Maximum Delay", "0 ms") + `</tbody></table>`;
+    }
+    return `<h4>Test Configuration</h4><table><tbody>` +
+      row("Active Link Delay", `${c.active} ms`) +
+      row("Standby Link Delay", `${c.standby} ms`) +
+      row("Hold Time", "3 min") +
+      row("Increment", "50 ms every minute") +
+      row("Maximum Delay", `${c.ceiling} ms`) +
+      `</tbody></table>`;
+  }
+  if (c.plType === "constant") {
+    return `<h4>Test Configuration</h4><table><tbody>` +
+      row("Initial Loss", `${c.initialPct}%`) +
+      row("Hold Time", "3 min") +
+      row("Increment", `${c.stepPct}% every minute`) +
+      row("Maximum Loss", `${c.ceilingPct}%`) +
+      `</tbody></table>`;
+  }
+  if (c.plType === "burst") {
+    return `<h4>Test Configuration</h4><table><tbody>` +
+      row("Initial Loss", "clean") +
+      row("Hold Time", "3 min (clean)") +
+      row("Increment", "5% for 7 s every 30 s") +
+      row("Maximum Loss", "5% (burst)") +
+      `</tbody></table>`;
+  }
+  return `<h4>Test Configuration</h4><table><tbody>` +
+    row("Initial Loss", "clean") +
+    row("Hold Time", "3 min (clean)") +
+    row("Increment", "5% at random gap 20–60 s, dur 5–15 s") +
+    row("Maximum Loss", "5% (random)") +
+    `</tbody></table>`;
+}
+
+/** Friendly label for an impairment event string. */
+function timelineLabel(ev) {
+  const s = ev.event;
+  if (/^initial/i.test(s)) return "Impairment Applied";
+  if (/standby link/i.test(s)) return "Standby Link Set";
+  if (/^ramp/i.test(s)) return `Increment (${s.replace(/^ramp\s*/i, "")})`;
+  if (/^burst/i.test(s)) return "Burst Loss Applied";
+  if (/^random/i.test(s)) return "Random Loss Applied";
+  if (/^clear$/i.test(s)) return "Loss Cleared";
+  if (/reached max/i.test(s)) return "Ceiling Reached";
+  return s;
+}
+
+function executionTimeline(r) {
+  const rows = [{ t: "00:00", ev: "Traffic Started" }];
+  for (const ev of (r.impairments || [])) rows.push({ t: offset(r.startTime, ev.t), ev: timelineLabel(ev) });
+  for (const sw of (r.switches || [])) {
+    rows.push({ t: offset(r.startTime, sw.wallClock ?? sw.time), ev: `Traffic Switched (${sw.fromLink} → ${sw.toLink})` });
+  }
+  if (r.endTime) rows.push({ t: offset(r.startTime, r.endTime), ev: "Traffic Stopped" });
+  rows.sort((a, b) => a.t.localeCompare(b.t));
+  return `<h4>Execution Timeline</h4><table><tbody><tr><th>Time</th><th>Event</th></tr>` +
+    rows.map((x) => `<tr><td>${e(x.t)}</td><td>${e(x.ev)}</td></tr>`).join("") + `</tbody></table>`;
+}
+
+function trafficMovementTable(c, r) {
+  if (!r.switches || !r.switches.length) {
+    return `<h4>Traffic Movement</h4><p>No traffic movement observed during testcase.</p>`;
+  }
+  const reason = c.suite === "latency"
+    ? `active-link latency reached ${r.switchLatencyMs != null ? r.switchLatencyMs + " ms" : "the switch threshold"}`
+    : "active-link impairment increased";
+  const rows = r.switches.map((sw) =>
+    `<tr><td>${e(offset(r.startTime, sw.wallClock ?? sw.time))}</td><td>${e(sw.fromLink)}</td>` +
+    `<td>${e(sw.toLink)}</td><td>${e(reason)}</td></tr>`).join("");
+  return `<h4>Traffic Movement</h4><table><tbody>` +
+    `<tr><th>Time</th><th>From Link</th><th>To Link</th><th>Reason</th></tr>${rows}</tbody></table>`;
+}
+
+function impairmentProgression(c, r) {
+  const unit = c.suite === "latency" ? "ms" : "%";
+  let act = c.suite === "latency" ? c.active : (c.plType === "constant" ? c.initialPct : 0);
+  let sb = c.suite === "latency" ? c.standby : 0;
+  const rows = [{ t: "00:00", a: act, s: sb }];
+  for (const ev of (r.impairments || [])) {
+    const m = ev.event.match(/(\d+(?:\.\d+)?)\s*(ms|%)/);
+    if (m) { const v = Number(m[1]); if (/standby/i.test(ev.event)) sb = v; else act = v; }
+    else if (/^clear$/i.test(ev.event)) act = 0;
+    else continue;
+    rows.push({ t: offset(r.startTime, ev.t), a: act, s: sb });
+  }
+  const head = c.suite === "latency"
+    ? `<tr><th>Time</th><th>Active Link</th><th>Standby Link</th></tr>`
+    : `<tr><th>Time</th><th>Active Link Loss</th><th>Standby Link Loss</th></tr>`;
+  return `<h4>Impairment Progression</h4><table><tbody>${head}` +
+    rows.map((x) => `<tr><td>${e(x.t)}</td><td>${x.a}${unit}</td><td>${x.s}${unit}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+
+/** Find the local file matching a name test within a list. */
+function findFile(files, test) { return (files || []).find((f) => test(path.basename(f).toLowerCase())); }
+
+function logCollectionTables(c, r) {
+  const side = shownSide(c);
+  const sideLabel = side === "spoke" ? "Spoke" : "Hub";
+  const dirLabel = c.direction === "upstream" ? "Upstream" : "Downstream";
+  const dmts = r.artifacts?.[side] || [];
+  const reports = r.reportFiles || [];
+  const rowFor = (label, file) =>
+    `<tr><td>${e(label)}</td><td>${file ? "&#10003;" : "&#10007;"}</td>` +
+    `<td>${file ? attRef(uploadName(file)) : "-"}</td></tr>`;
+  const items = [
+    ["hourLog", findFile(dmts, (f) => f.includes("hourlog"))],
+    ["curLog", findFile(dmts, (f) => f.includes("curlog"))],
+    ["ubd", findFile(dmts, (f) => f.includes("_ubd.tar"))],
+    ["ubdLatest.tar", findFile(dmts, (f) => f.includes("ubdlatest"))],
+    ["Diag Pack", findFile(dmts, (f) => f.includes("diagpack"))],
+    ["HTML Report", findFile(reports, (f) => f.endsWith("report.html"))],
+    ["observations.txt", findFile(reports, (f) => f.endsWith("observations.txt")) || r.observationsFile],
+    ["summary.json", findFile(reports, (f) => f.endsWith("summary.json"))],
+  ];
+  const dmtsTable =
+    `<h4>Log Collection — ${dirLabel} (${sideLabel})</h4>` +
+    `<table><tbody><tr><th>Artifact</th><th>Status</th><th>Attachment</th></tr>` +
+    items.map(([l, f]) => rowFor(l, f)).join("") + `</tbody></table>`;
+
+  const traffic = r.artifacts?.traffic || [];
+  const clientLog = findFile(traffic, (f) => f.includes("client"));
+  const serverLog = findFile(traffic, (f) => f.includes("server"));
+  const trafficTable =
+    `<h5>Traffic Logs</h5><table><tbody><tr><th>Artifact</th><th>Attachment</th></tr>` +
+    `<tr><td>Client iperf Log</td><td>${clientLog ? attRef(uploadName(clientLog)) : "-"}</td></tr>` +
+    `<tr><td>Server iperf Log</td><td>${serverLog ? attRef(uploadName(serverLog)) : "-"}</td></tr>` +
+    `</tbody></table>`;
+  return dmtsTable + trafficTable;
+}
+
+function observationsList(c, r) {
+  const items = [];
+  if (r.trafficVerifiedBps != null) items.push("Traffic started successfully.");
+  else if (r.errors && r.errors.some((x) => /traffic/i.test(x))) items.push("Traffic did not verify — see errors.");
+  if (c.suite === "latency" && !c.baseline) items.push(`${c.testLabel} latency (${c.active} ms) applied on the active link.`);
+  else if (c.suite === "latency") items.push("Baseline — no impairment applied.");
+  else if (c.plType === "constant") items.push(`Constant packet loss (${c.initialPct}%) applied on the active link.`);
+  else if (c.plType === "burst") items.push("Burst packet loss (5% for 7 s every 30 s) applied on the active link.");
+  else items.push("Random packet loss applied on the active link.");
+  if (r.switchObserved && r.switches.length) {
+    const sw = r.switches[r.switches.length - 1];
+    items.push(c.suite === "latency" && r.switchLatencyMs != null
+      ? `Traffic switched to ${sw.toLink} after latency reached ${r.switchLatencyMs} ms.`
+      : `Traffic switched to ${sw.toLink}.`);
+    items.push("Hourlog collected immediately after switch.");
+  } else {
+    items.push("No traffic switch observed during the testcase.");
+  }
+  items.push("Reports generated successfully.");
+  items.push("Artifacts uploaded to Confluence.");
+  if (r.errors && r.errors.length) items.push(`Errors: ${r.errors.join(" | ")}`);
+  return `<h4>Observations</h4><ul>` + items.map((x) => `<li>${e(x)}</li>`).join("") + `</ul>`;
+}
+
+function screenshotsBlock(r) {
+  const shots = (r.screenshots || []).slice().sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  if (!shots.length) return "";
+  const caption = (name) =>
+    name.includes("01_before") ? "Before impairment"
+      : name.includes("02_after") ? "After impairment"
+        : name.includes("03_switch") ? "During traffic switch"
+          : name.includes("04_test_complete") ? "End of testcase"
+            : name.includes("99_") ? "Traffic not flowing" : name;
+  return `<h4>Screenshots</h4>` + shots.map((p) => {
+    const b = path.basename(p);
+    return `<p><strong>${e(caption(b))}</strong><br/>` +
+      `<ac:image ac:width="480"><ri:attachment ri:filename="${e(b)}"/></ac:image></p>`;
+  }).join("");
+}
+
+function resultTable(c, r) {
+  const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
+  return `<h4>Result</h4><table><tbody>` +
+    row("Traffic Switch", r.switchObserved ? "Yes" : "No") +
+    row("Switch Time", r.switchAt || (r.switches && r.switches[0] && r.switches[0].time) || "-") +
+    row("Final Active Link", finalActiveLink(r)) +
+    row("Final Standby Link", finalStandbyLink(r)) +
+    row("Automation Completed", "Yes") +
+    `</tbody></table>`;
+}
+
+/* ---- matrix row (Test Execution Matrix) ---- */
+function matrixRow(c, r) {
+  const side = shownSide(c);
+  const hourlog = findFile(r.artifacts?.[side], (f) => f.includes("hourlog"));
+  const diag = findFile(r.artifacts?.[side], (f) => f.includes("diagpack"));
+  const logsCell = [hourlog, diag].filter(Boolean).map((f) => attRef(uploadName(f))).join(" ") ||
+    ((r.artifacts?.[side] || []).length ? "&#10003;" : "-");
+  const report = findFile(r.reportFiles, (f) => f.endsWith("report.html"));
+  const mins = r.windowSec ? `${Math.round(r.windowSec / 60)} min` : runtimeText(r);
   return (
     "<tr>" +
-    `<td>${e(c.id)}</td>` +
+    `<td>${c.n}</td>` +
     `<td>${e(c.dirLabel)}</td>` +
     `<td>${e(c.tos)}</td>` +
     `<td>${e(c.suiteLabel)}</td>` +
     `<td>${e(c.testcase)} ${e(c.testLabel)}</td>` +
-    `<td>${e(runtimeText(r))}</td>` +
-    `<td>${e(initialConfig(c))}</td>` +
-    `<td>${e(finalConfig(c, r))}</td>` +
+    `<td>${e(mins)}</td>` +
     `<td>${r.switchObserved ? "Yes" : "No"}</td>` +
-    `<td>${e(r.switchAt || (r.switches && r.switches[0] && r.switches[0].time) || "-")}</td>` +
-    `<td>${artLinks}</td>` +
-    `<td>${e(statusText(r))}</td>` +
+    `<td>${logsCell}</td>` +
+    `<td>${report ? attRef(uploadName(report)) : "-"}</td>` +
     "</tr>"
   );
 }
 
-function detailSection(c, r) {
-  const e = engine.escapeXml;
+const MATRIX_HEADER =
+  "<tr>" + ["S.No", "Direction", "ToS", "Suite", "Test Case", "Runtime", "Switch Observed", "Logs", "Report"]
+    .map((h) => `<th>${h}</th>`).join("") + "</tr>";
+
+/* ---- top-level tables ---- */
+function executionSummary(state, baseMeta) {
   const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
-  const config =
-    `<h4>Configuration</h4><table><tbody>` +
-    row("Direction", c.dirLabel) +
-    row("ToS", c.tos) +
-    row("Suite", c.suiteLabel) +
-    row("Testcase", `${c.testcase} — ${c.testLabel}`) +
-    row("Runtime", runtimeText(r)) +
-    row("Initial configuration", initialConfig(c)) +
-    row("Final configuration", finalConfig(c, r)) +
-    (r.clientCmd ? row("Client command", r.clientCmd) : "") +
-    row("Window", `${r.startTime || "-"} .. ${r.endTime || "-"}`) +
+  const done = (state.completed || []).length;
+  const cases = state.cases || [];
+  const lastEnd = cases.length ? cases[cases.length - 1].endTime : null;
+  const endTime = done >= TOTAL && lastEnd ? lastEnd : "(in progress)";
+  let runtime = "-";
+  if (state.startedAt && lastEnd) {
+    const sec = Math.max(0, Math.round((new Date(lastEnd) - new Date(state.startedAt)) / 1000));
+    runtime = `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+  }
+  return `<h2>Execution Summary</h2><table><tbody>` +
+    row("Execution ID", state.runId) +
+    row("Start Time", state.startedAt) +
+    row("End Time", endTime) +
+    row("Total Testcases", String(TOTAL)) +
+    row("Completed", String(done)) +
+    row("Remaining", String(TOTAL - done)) +
+    row("Runtime", runtime) +
+    row("Grid Version", baseMeta.gridVersion) +
+    row("Automation Version", AUTOMATION_VERSION) +
     `</tbody></table>`;
+}
 
-  // Latency / packet-loss progression + timeline
-  const prog = (r.impairments && r.impairments.length)
-    ? `<h4>Progression / Timeline</h4><table><tbody>` +
-      `<tr><th>Time</th><th>Event</th><th>Link</th></tr>` +
-      r.impairments.map((ev) =>
-        `<tr><td>${e(engine.offsetStr(r.startTime, ev.t))}</td><td>${e(ev.event)}</td><td>${e(ev.iface)}</td></tr>`
-      ).join("") +
-      `</tbody></table>`
-    : "";
+/** Suite-completion summary (grows as cases finish; complete once all 42 done). */
+function suiteCompletionSummary(state) {
+  const completed = new Set(state.completed || []);
+  const rows = [];
+  for (const dir of DIRECTIONS) {
+    for (const tos of TOS_LIST) {
+      const lat = LATENCY_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
+      const pl = PL_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
+      rows.push(`<tr><td>${e(dir.label)}</td><td>${e(tos)}</td>` +
+        `<td>${lat}/${LATENCY_TCS.length}</td><td>${pl}/${PL_TCS.length}</td></tr>`);
+    }
+  }
+  return `<h2>Suite Completion Summary</h2><table><tbody>` +
+    `<tr><th>Direction</th><th>ToS</th><th>Latency Suite Completed</th><th>Packet Loss Suite Completed</th></tr>` +
+    rows.join("") + `</tbody></table>`;
+}
 
-  const moves = engine.trafficMovement(r);
-  const movement =
-    `<h4>Traffic movement / Link transitions</h4>` +
-    (moves.length
-      ? `<table><tbody><tr><th>Time</th><th>Link</th></tr>` +
-        moves.map((m) => `<tr><td>${e(m.at)}</td><td>${e(m.what)}</td></tr>`).join("") +
-        `</tbody></table>`
-      : `<p>No link switch observed.</p>`);
-
-  const checklist = engine.artifactChecklist(r)
-    .map(([name, ok]) => `<li>${ok ? "&#10003;" : "&#10007;"} ${e(name)}</li>`).join("");
-  const files = caseArtifacts(r);
-  const attachments =
-    `<h4>Artifacts</h4><ul>${checklist}</ul><p>` +
-    files.map((f) => attRef(uploadName(f))).join(" &nbsp; ") + `</p>`;
-
-  const shots = (r.screenshots || [])
-    .map((p) => `<ac:image ac:width="480"><ri:attachment ri:filename="${e(path.basename(p))}"/></ac:image>`)
-    .join(" ");
-  const errs = (r.errors && r.errors.length)
-    ? `<p><strong>Errors:</strong> ${e(r.errors.join(" | "))}</p>` : "";
-
+function buildPageBody(state, baseMeta) {
+  const date = (state.startedAt || "").slice(0, 10) || "unknown-date";
+  const rows = (state.summaryRows || []).join("");
+  const sections = (state.sections || []).join("");
   return (
-    `<h3>${e(c.id)} — ${e(c.suiteLabel)} ${e(c.testcase)} (${e(c.testLabel)})</h3>` +
-    config + prog + movement + attachments +
-    `<h4>Observation</h4><p><strong>${e(statusText(r))}</strong></p>` +
-    errs + shots + `<hr/>`
+    `<h1>SLA Regression Report - ${e(date)}</h1>` +
+    `<p><em>Observations only — no PASS/FAIL. Manual validation to follow.</em></p>` +
+    executionSummary(state, baseMeta) +
+    `<h2>Test Execution Matrix</h2><table><tbody>${MATRIX_HEADER}${rows || ""}</tbody></table>` +
+    (sections || "") +
+    suiteCompletionSummary(state)
+  );
+}
+
+/** Full detail section for one testcase, in the fixed template layout. */
+function detailSection(c, r, baseMeta) {
+  const heading =
+    `<h1>Testcase ${String(c.n).padStart(2, "0")}</h1>` +
+    `<p><strong>${e(c.suiteLabel)} Suite — ${e(c.testcase)} (${e(c.testLabel)})</strong></p>`;
+  return (
+    heading +
+    configurationTable(c, r, baseMeta) +
+    testConfigurationTable(c) +
+    executionTimeline(r) +
+    trafficMovementTable(c, r) +
+    impairmentProgression(c, r) +
+    logCollectionTables(c, r) +
+    observationsList(c, r) +
+    screenshotsBlock(r) +
+    resultTable(c, r) +
+    `<hr/>`
   );
 }
 
@@ -410,7 +641,7 @@ async function ensurePage(conf, state, baseMeta, parentCandidate) {
   }
   if (!space) throw new Error("Confluence: provide a Space key, or a Page URL/ID to create the regression page under");
 
-  const title = `SLA Full Regression (6x7 Matrix) — ${state.startedAt.replace(/[:]/g, "-")}`;
+  const title = `SLA Regression Report - ${state.startedAt.slice(0, 10)} (${state.runId})`;
   const payload = {
     type: "page", title, space: { key: space },
     ...(ancestors.length ? { ancestors } : {}),
@@ -449,15 +680,16 @@ async function putPage(conf, state, baseMeta) {
 
 /** Append one completed case to the shared page: attachments, row, section, PUT. */
 async function appendCase(conf, state, baseMeta, c, r) {
-  // upload artifacts first so the row/section attachment links resolve
-  for (const f of caseArtifacts(r)) {
+  // upload only the shown side + traffic + reports + screenshots so the
+  // row/section attachment links resolve (other side stays local only)
+  for (const f of caseUploadFiles(c, r)) {
     try { await engine.confUploadAttachment(conf, state.pageId, f, uploadName(f)); }
-    catch (e) { engine.log(`WARN: attach ${path.basename(f)}: ${e.message}`); }
+    catch (err) { engine.log(`WARN: attach ${path.basename(f)}: ${err.message}`); }
   }
   state.summaryRows = state.summaryRows || [];
   state.sections = state.sections || [];
-  state.summaryRows.push(summaryRow(c, r));
-  state.sections.push(detailSection(c, r));
+  state.summaryRows.push(matrixRow(c, r));
+  state.sections.push(detailSection(c, r, baseMeta));
   await putPage(conf, state, baseMeta);
 }
 
@@ -506,6 +738,8 @@ async function runRegression(cfg, params, opts = {}) {
   if (cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath)) await engine.sanitizeNetem(cfg);
 
   const baseMeta = await engine.collectRunMetadata(cfg, params.trafficType, "-", "-");
+  baseMeta.clientHost = cfg.clientIp || (params && params.clientIp) || "-";
+  baseMeta.serverHost = cfg.serverIp || (params && params.serverIp) || "-";
 
   // ---- Confluence page (create once / reuse) ----
   const conf = cfg.confluence;
@@ -568,11 +802,14 @@ async function runRegression(cfg, params, opts = {}) {
         };
       }
 
-      // ---- reports for this case ----
+      // ---- reports for this case (per-case dir = caseDir/<id>, matching the
+      // tcDir runTestCase used for observations.txt, so combos don't collide) ----
       try {
-        const html = engine.writeHtmlReport(caseDir, [r], caseMeta);
-        engine.writeSummary(caseDir, [r], caseMeta);
-        r.reportFiles = [html, path.join(caseDir, "summary.json")];
+        const tcDir = path.join(caseDir, c.id);
+        fs.mkdirSync(tcDir, { recursive: true });
+        const html = engine.writeHtmlReport(tcDir, [r], caseMeta);
+        engine.writeSummary(tcDir, [r], caseMeta);
+        r.reportFiles = [html, path.join(tcDir, "summary.json")];
         if (r.observationsFile) r.reportFiles.push(r.observationsFile);
       } catch (e) { log(`WARN: report generation ${c.id}: ${e.message}`); r.reportFiles = r.reportFiles || []; }
 
@@ -659,6 +896,6 @@ module.exports = {
   runRegression, buildMatrix, caseWindowSec, buildTc,
   loadState, saveState, clearState, stateSummary,
   initialConfig, finalConfig, statusText,
-  buildPageBody, summaryRow, detailSection, ensurePage, appendCase,
+  buildPageBody, matrixRow, detailSection, ensurePage, appendCase,
   PROFILE_NAME, STATE_FILE, TOTAL,
 };

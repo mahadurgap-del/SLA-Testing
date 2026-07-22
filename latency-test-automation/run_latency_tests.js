@@ -2162,6 +2162,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     }
   }
   result.switchObserved = result.switches.length > 0;
+  result.activeIface = sync.activeIface || null; // netem-side active link label, if detected
   if (isLatencyRamp) {
     // Regression cases carry an explicit plan (initial active delay + fixed
     // standby + ceiling); Custom Run reports from the global cfg.latencyRamp.
