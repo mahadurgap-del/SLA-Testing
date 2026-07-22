@@ -363,6 +363,13 @@ function uploadName(f) {
   const b = path.basename(f);
   return GENERIC.includes(b) ? `${path.basename(path.dirname(f))}_${b}` : b;
 }
+/** Case-scoped upload name: prefix the case id unless the filename already
+ *  carries it (hourLog tars do). Guarantees uniqueness on the one shared page
+ *  so per-case screenshots/reports don't overwrite each other. */
+function caseUploadName(c, f) {
+  const b = path.basename(f);
+  return b.includes(c.id) ? b : `${c.id}_${b}`;
+}
 
 /** Which side's DMTS artifacts to SHOW/upload: upstream→Spoke, downstream→Hub.
  *  (Both sides are still collected locally; only the relevant one is published.) */
@@ -646,15 +653,15 @@ function logsCell(c, r) {
   const sideLabel = side === "spoke" ? "Spoke" : "Hub";
   const parts = [];
   const hourlog = findFile(r.artifacts && r.artifacts[side], (f) => f.includes("hourlog"));
-  parts.push(`DMTS hourLog (${sideLabel}): ${hourlog ? attRef(uploadName(hourlog)) : "&mdash;"}`);
+  parts.push(`DMTS hourLog (${sideLabel}): ${hourlog ? attRef(caseUploadName(c, hourlog)) : "&mdash;"}`);
   const shots = r.screenshots || [];
-  if (shots.length) parts.push(`Screenshots: ` + shots.map((p) => attRef(uploadName(p))).join(" "));
+  if (shots.length) parts.push(`Screenshots: ` + shots.map((p) => attRef(caseUploadName(c, p))).join(" "));
   const report = findFile(r.reportFiles, (f) => f.endsWith("report.html"));
-  if (report) parts.push(`HTML report: ${attRef(uploadName(report))}`);
+  if (report) parts.push(`HTML report: ${attRef(caseUploadName(c, report))}`);
   const obs = findFile(r.reportFiles, (f) => f.endsWith("observations.txt")) || r.observationsFile;
-  if (obs) parts.push(`observations.txt: ${attRef(uploadName(obs))}`);
+  if (obs) parts.push(`observations.txt: ${attRef(caseUploadName(c, obs))}`);
   const sum = findFile(r.reportFiles, (f) => f.endsWith("summary.json"));
-  if (sum) parts.push(`summary.json: ${attRef(uploadName(sum))}`);
+  if (sum) parts.push(`summary.json: ${attRef(caseUploadName(c, sum))}`);
   return parts.join("<br/>");
 }
 
@@ -785,7 +792,7 @@ async function appendCase(conf, state, baseMeta, c, r) {
   // upload only the shown side + traffic + reports + screenshots so the
   // row/section attachment links resolve (other side stays local only)
   for (const f of caseUploadFiles(c, r)) {
-    try { await engine.confUploadAttachment(conf, state.pageId, f, uploadName(f)); }
+    try { await engine.confUploadAttachment(conf, state.pageId, f, caseUploadName(c, f)); }
     catch (err) { engine.log(`WARN: attach ${path.basename(f)}: ${err.message}`); }
   }
   state.summaryRows = state.summaryRows || [];
@@ -805,25 +812,31 @@ async function appendCase(conf, state, baseMeta, c, r) {
  */
 async function runRegression(cfg, params, opts = {}) {
   const log = (m) => engine.log(m); // streams to automation.log + the UI SSE
-  const iptvMode = !!(params && params.iptvMode);
-  // ToS list: array or CSV string; default the full 3-ToS SLA set. IPTV runs
-  // pass a single ToS -> a 2×7=14 case run.
-  let tosList = params && params.regressionTosList;
-  if (typeof tosList === "string") tosList = tosList.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
-  if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
-  const matrix = buildMatrix(tosList, iptvMode);
 
   // Force the regression-safe drivers regardless of what the form carried.
   cfg.trafficDriver = "ssh";
   cfg.impairmentDriver = "ssh-tc";
-  // Detection/impairment work off the netem overlay ports. Default to the four
-  // overlay interfaces if the profile left them unset.
   if (!cfg.netemCandidates || !cfg.netemCandidates.length) {
     cfg.netemCandidates = ["ens192", "ens193", "ens224", "ens225"];
   }
 
-  // ---- state (fresh or resumed) ----
+  // ---- state: load FIRST so a resume drives mode/ToS from the SAVED run, not
+  // from whatever flags this invocation happens to carry. ----
   let state = opts.resume ? loadState() : null;
+  let iptvMode, tosList;
+  if (state) {
+    // resume: authoritative values come from the saved state
+    iptvMode = !!state.iptvMode;
+    tosList = (Array.isArray(state.tosList) && state.tosList.length) ? state.tosList : TOS_LIST.slice();
+  } else {
+    // fresh run: derive from params
+    iptvMode = !!(params && params.iptvMode);
+    tosList = params && params.regressionTosList;
+    if (typeof tosList === "string") tosList = tosList.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
+  }
+  const matrix = buildMatrix(tosList, iptvMode);
+
   if (!state) {
     state = {
       runId: `sla-reg-${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}`,
@@ -839,10 +852,12 @@ async function runRegression(cfg, params, opts = {}) {
     };
     saveState(state);
   }
-  // resumed runs keep their original tosList/iptvMode; fall back for old files
+  // back-fill fields missing from older state files
   if (!state.tosList) state.tosList = tosList;
   if (state.iptvMode == null) state.iptvMode = iptvMode;
   if (!state.total) state.total = matrix.length;
+  if (!Array.isArray(state.cases)) state.cases = [];
+  if (!Array.isArray(state.summaryRows)) state.summaryRows = [];
   const total = state.total;
   const completed = new Set(state.completed || []);
 

@@ -1482,14 +1482,15 @@ async function clearNetemImpairment(cfg, iface) {
   }
 }
 
-/** Sleep, but never past the deadline — and wake early on abort. */
-async function sleepWithin(deadline, ms) {
+/** Sleep, but never past the deadline — and wake early on abort or when the
+ *  optional stopFn() turns true (used to end impairment promptly on a switch). */
+async function sleepWithin(deadline, ms, stopFn) {
   const end = Math.min(deadline, Date.now() + ms);
   while (Date.now() < end) {
-    if (isAborted()) return false;
-    await sleep(Math.min(2000, end - Date.now()));
+    if (isAborted() || (stopFn && stopFn())) return false;
+    await sleep(Math.min(1000, end - Date.now()));
   }
-  return Date.now() < deadline && !isAborted();
+  return Date.now() < deadline && !isAborted() && !(stopFn && stopFn());
 }
 
 const randInt = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
@@ -1540,7 +1541,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       } catch (e) {
         log(`WARN: ramp step to ${next}% failed (${e.message}) — retrying next interval`);
       }
-      if (!(await sleepWithin(deadline, s.rampIntervalSec * 1000))) break;
+      if (!(await sleepWithin(deadline, s.rampIntervalSec * 1000, () => sync.switched))) break;
     }
   } else if (plType === "burst") {
     if (s.preHoldSec > 0) {
@@ -1555,14 +1556,14 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
         const det = await detectActiveLink(cfg);
         await applyToLink(cfg, det.ports, { lossPct: s.burstLossPct }, impairedIfaces);
         note(label(det), `burst loss ${s.burstLossPct}%`);
-        await sleepWithin(deadline, s.burstDurationSec * 1000);
+        await sleepWithin(deadline, s.burstDurationSec * 1000, () => s.endOnSwitch && sync.switched);
         await clearLink(cfg, det.ports);
         note(label(det), "clear");
       } catch (e) {
         log(`WARN: burst cycle failed (${e.message}) — retrying next interval`);
       }
       if (!(await sleepWithin(deadline,
-        Math.max(1, s.burstIntervalSec - s.burstDurationSec) * 1000))) break;
+        Math.max(1, s.burstIntervalSec - s.burstDurationSec) * 1000, () => s.endOnSwitch && sync.switched))) break;
     }
   } else if (plType === "random") {
     if (s.preHoldSec > 0) {
@@ -1575,12 +1576,12 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     let rpct = s.escalate ? (s.initialPct != null ? s.initialPct : 2) : s.randomLossPct;
     while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       if (!(await sleepWithin(deadline,
-        randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
+        randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000, () => s.endOnSwitch && sync.switched))) break;
       try {
         const det = await detectActiveLink(cfg);
         await applyToLink(cfg, det.ports, { lossPct: rpct }, impairedIfaces);
         note(label(det), `random loss ${rpct}%`);
-        await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000);
+        await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000, () => s.endOnSwitch && sync.switched);
         await clearLink(cfg, det.ports);
         note(label(det), "clear");
       } catch (e) {
@@ -1602,7 +1603,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
         const det = await detectActiveLink(cfg);
         await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
         note(label(det), `periodic loss ${pct}% (on ${onSec}s)`);
-        await sleepWithin(deadline, onSec * 1000);
+        await sleepWithin(deadline, onSec * 1000, () => s.endOnSwitch && sync.switched);
         await clearLink(cfg, det.ports);
         note(label(det), `clear (off ${offSec}s)`);
       } catch (e) {
@@ -1610,7 +1611,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       }
       if (s.endOnSwitch && sync.switched) break;
       pct = Math.min(pct + step, ceil);
-      if (!(await sleepWithin(deadline, offSec * 1000))) break;
+      if (!(await sleepWithin(deadline, offSec * 1000, () => s.endOnSwitch && sync.switched))) break;
     }
   } else {
     throw new Error(`unknown packet-loss type: ${plType}`);
@@ -1727,7 +1728,7 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     const steps = plan.steps;
     log(`${tc.name}: stepping active-link latency through [${steps.join(", ")}] ms every ${r.intervalSec}s — end on switch`);
     for (let i = 1; i < steps.length && Date.now() < deadline && !isAborted() && !sync.switched; i++) {
-      if (!(await sleepWithin(deadline, r.intervalSec * 1000))) break;
+      if (!(await sleepWithin(deadline, r.intervalSec * 1000, () => sync.switched))) break;
       if (sync.switched) break;
       try {
         await applyToLink(cfg, activePorts, { delayMs: steps[i] }, impairedIfaces);
@@ -1787,7 +1788,7 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     } catch (e) {
       log(`WARN: ramp step to ${next}ms failed (${e.message}) — retrying next interval`);
     }
-    if (!(await sleepWithin(deadline, r.intervalSec * 1000))) break;
+    if (!(await sleepWithin(deadline, r.intervalSec * 1000, () => sync.switched))) break;
   }
   return events;
 }
@@ -2234,7 +2235,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
           const snapTar = await collectHourlogSnapshot(monCreds, monDir, `${tc.name}_switch`);
           if (snapTar) result.artifacts[monSide].push(snapTar);
         }
-      }, { endAfterSwitchMs: tc.endOnSwitch ? (tc.switchTailMs ?? 30000) : undefined });
+      }, { endAfterSwitchMs: tc.endOnSwitch ? (tc.switchTailMs ?? 12000) : undefined });
       const scheduleP = isDynamicPL
         ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null, sync, tc.plPlan || null)
         : isLatencyRamp
