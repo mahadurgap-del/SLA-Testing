@@ -411,6 +411,8 @@ function buildConfig(p) {
     plSchedule: {
       rampStepPct: parseInt(p.rampStepPct, 10) || 2,
       rampIntervalSec: parseInt(p.rampIntervalSec, 10) || 60,
+      stabilizeSec: parseInt(p.plStabilizeSec, 10) || 180,   // 3-min hold before ramp
+      rampMaxPct: parseInt(p.plRampMaxPct, 10) || 20,        // ceiling for the loss ramp
       burstIntervalSec: parseInt(p.burstIntervalSec, 10) || 30,
       burstDurationSec: parseInt(p.burstDurationSec, 10) || 7,
       burstLossPct: parseInt(p.burstLossPct, 10) || 5,
@@ -1486,8 +1488,12 @@ const randInt = (min, max) => min + Math.floor(Math.random() * (max - min + 1));
  * currently-active link), "random" (loss at random intervals for random
  * durations). Records every event via onEvent and returns the event list.
  */
-async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, onEvent) {
-  const s = cfg.plSchedule;
+async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, onEvent, sync, plan = null) {
+  // Regression profile may pass a per-TC plan that overrides the global
+  // schedule fields (and adds an optional `preHoldSec` clean hold before burst/
+  // random impairment begins). Custom Run passes no plan → cfg.plSchedule as-is.
+  const s = plan ? { ...cfg.plSchedule, ...plan } : cfg.plSchedule;
+  sync = sync || {};
   const deadline = Date.now() + durationMs;
   const events = [];
   const note = (link, event) => {
@@ -1500,22 +1506,35 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
   const label = (d) => `${d.bridge} (${d.ports.join("+")})`;
 
   if (plType === "constant") {
-    // The ramp stays on the initially-active link: traffic leaving it under
-    // increasing loss (and possibly returning) is exactly what we measure.
+    // Apply initial loss, HOLD for stabilizeSec (3 min) observing for a
+    // natural switch, then ramp +stepPct every intervalSec until a switch
+    // (sync.switched, set by the monitor) or the max — all on the initially
+    // active link.
     const det = await detectActiveLink(cfg);
-    let pct = 0;
-    while (Date.now() < deadline && !isAborted()) {
-      pct += s.rampStepPct;
+    let pct = s.rampStepPct;
+    await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
+    note(label(det), `initial loss ${pct}%`);
+    log(`packet-loss: hold ${s.stabilizeSec}s at ${pct}% before ramping — observing for a switch`);
+    const holdEnd = Math.min(deadline, Date.now() + s.stabilizeSec * 1000);
+    while (Date.now() < holdEnd && !isAborted() && !sync.switched) await sleep(2000);
+    while (Date.now() < deadline && !isAborted() && !sync.switched) {
+      if (pct >= s.rampMaxPct) { note(label(det), `reached max ${s.rampMaxPct}% — holding`); break; }
+      const next = Math.min(pct + s.rampStepPct, s.rampMaxPct);
       try {
-        await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
-        note(label(det), `loss ${pct}%`);
+        await applyToLink(cfg, det.ports, { lossPct: next }, impairedIfaces);
+        pct = next;
+        note(label(det), `ramp loss ${pct}%`);
       } catch (e) {
-        log(`WARN: ramp step failed (${e.message}) — retrying next interval`);
-        pct -= s.rampStepPct; // retry the same level next tick
+        log(`WARN: ramp step to ${next}% failed (${e.message}) — retrying next interval`);
       }
       if (!(await sleepWithin(deadline, s.rampIntervalSec * 1000))) break;
     }
   } else if (plType === "burst") {
+    if (s.preHoldSec > 0) {
+      log(`packet-loss burst: holding link CLEAN for ${s.preHoldSec}s before bursts — observing for a switch`);
+      const holdEnd = Math.min(deadline, Date.now() + s.preHoldSec * 1000);
+      while (Date.now() < holdEnd && !isAborted() && !sync.switched) await sleep(2000);
+    }
     while (Date.now() < deadline && !isAborted()) {
       try {
         const det = await detectActiveLink(cfg);
@@ -1531,6 +1550,11 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
         Math.max(1, s.burstIntervalSec - s.burstDurationSec) * 1000))) break;
     }
   } else if (plType === "random") {
+    if (s.preHoldSec > 0) {
+      log(`packet-loss random: holding link CLEAN for ${s.preHoldSec}s before random injection — observing for a switch`);
+      const holdEnd = Math.min(deadline, Date.now() + s.preHoldSec * 1000);
+      while (Date.now() < holdEnd && !isAborted() && !sync.switched) await sleep(2000);
+    }
     while (Date.now() < deadline && !isAborted()) {
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
@@ -1604,7 +1628,15 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
  */
 async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync) {
   const events = [];
-  const r = cfg.latencyRamp;
+  // Regression profile passes an explicit per-TC plan: the INITIAL value is
+  // applied to the active link, the standby link is held FIXED, and only the
+  // active link ramps up to the plan ceiling. Custom Run leaves tc.rampPlan
+  // undefined and keeps the global cfg.latencyRamp behavior below untouched.
+  const plan = tc.rampPlan || null;
+  const r = plan
+    ? { enabled: true, stabilizeSec: plan.stabilizeSec, stepMs: plan.stepMs,
+        intervalSec: plan.intervalSec, maxMs: plan.ceilingMs }
+    : cfg.latencyRamp;
   const deadline = Date.now() + durationMs;
   const note = (link, event) => {
     const ev = { t: new Date().toISOString(), iface: link, event };
@@ -1614,10 +1646,14 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
   };
   const label = (g) => `${g.bridge} (${g.ports.join("+")})`;
 
-  const hi = Math.max(tc.link1.delayMs, tc.link2.delayMs);
-  const lo = Math.min(tc.link1.delayMs, tc.link2.delayMs);
-  const band = (tc.link1.delayMs >= tc.link2.delayMs ? tc.link1.band : tc.link2.band) || "";
-  if (hi === 0) {
+  // In plan mode `hi` is the active-link INITIAL delay (not necessarily the
+  // larger of the pair — e.g. TC3 active 30ms vs standby 150ms) and `lo` is the
+  // fixed standby delay. In Custom Run mode the higher delay drives the active
+  // link, as before.
+  const hi = plan ? plan.initialActiveMs : Math.max(tc.link1.delayMs, tc.link2.delayMs);
+  const lo = plan ? plan.standbyMs : Math.min(tc.link1.delayMs, tc.link2.delayMs);
+  const band = plan ? "" : ((tc.link1.delayMs >= tc.link2.delayMs ? tc.link1.band : tc.link2.band) || "");
+  if (hi === 0 && lo === 0) {
     log(`${tc.name}: both links clean — no impairment to apply`);
     return events;
   }
@@ -1947,7 +1983,7 @@ async function collectEndOfTest(cfg, browser, tcName, result, spokeDir, hubDir) 
  * Run metadata
  * ========================================================================= */
 
-async function collectRunMetadata(cfg, trafficType, tos) {
+async function collectRunMetadata(cfg, trafficType, tos, direction) {
   let gridVersion = "(GRID_VERSION_CMD not set)";
   if (cfg.gridVersionCmd) {
     try {
@@ -1967,6 +2003,7 @@ async function collectRunMetadata(cfg, trafficType, tos) {
     topology: cfg.topology,
     trafficType,
     tos,
+    direction: direction || null,
     spokeHost: cfg.spoke.host,
     hubHost: cfg.hub.host,
     executedAt: new Date().toISOString(),
@@ -2105,7 +2142,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
         }
       });
       const scheduleP = isDynamicPL
-        ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null)
+        ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null, sync, tc.plPlan || null)
         : isLatencyRamp
           ? runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
           : Promise.resolve([]);
@@ -2126,15 +2163,19 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   }
   result.switchObserved = result.switches.length > 0;
   if (isLatencyRamp) {
-    const held = Math.max(tc.link1.delayMs, tc.link2.delayMs);
-    const ramped = cfg.latencyRamp.enabled;
+    // Regression cases carry an explicit plan (initial active delay + fixed
+    // standby + ceiling); Custom Run reports from the global cfg.latencyRamp.
+    const plan = tc.rampPlan || null;
+    const held = plan ? plan.initialActiveMs : Math.max(tc.link1.delayMs, tc.link2.delayMs);
+    const ramped = plan ? true : cfg.latencyRamp.enabled;
     result.latencyRamp = {
       mode: ramped ? "ramp" : "hold",
       initialMs: held,
+      standbyMs: plan ? plan.standbyMs : Math.min(tc.link1.delayMs, tc.link2.delayMs),
       windowSec: Math.round(durationMs / 1000),
-      maxMs: cfg.latencyRamp.maxMs,
-      stepMs: cfg.latencyRamp.stepMs,
-      stabilizeSec: cfg.latencyRamp.stabilizeSec,
+      maxMs: plan ? plan.ceilingMs : cfg.latencyRamp.maxMs,
+      stepMs: plan ? plan.stepMs : cfg.latencyRamp.stepMs,
+      stabilizeSec: plan ? plan.stabilizeSec : cfg.latencyRamp.stabilizeSec,
       switchLatencyMs: result.switchLatencyMs ?? null,
       maxReached: !!sync.maxReached,
     };
@@ -2179,8 +2220,12 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   await stageGate(cfg, `${tc.name}: logs collected`);
 
   result.endTime = new Date().toISOString();
-  result.result =
-    result.switchObserved === tc.expectSwitch && result.errors.length === 0
+  result.windowSec = Math.round(durationMs / 1000);
+  // Regression (observe-only) cases NEVER get a PASS/FAIL verdict — they record
+  // a neutral observation for manual analysis. Custom Run keeps PASS/FAIL.
+  result.result = tc.observeOnly
+    ? "OBSERVED"
+    : result.switchObserved === tc.expectSwitch && result.errors.length === 0
       ? "PASS"
       : "FAIL";
 
@@ -2479,6 +2524,7 @@ function buildStorageBody(results, meta) {
     `<tr><th>Executed at</th><td>${escapeXml(meta.executedAt)}</td></tr>` +
     `<tr><th>GRID version</th><td>${escapeXml(meta.gridVersion)}</td></tr>` +
     `<tr><th>Topology</th><td>${escapeXml(meta.topology)}</td></tr>` +
+    `<tr><th>Direction</th><td>${escapeXml(meta.direction ? meta.direction[0].toUpperCase() + meta.direction.slice(1) : "-")}</td></tr>` +
     `<tr><th>Traffic type / ToS</th><td>${escapeXml(meta.trafficType)} / ${escapeXml(meta.tos)}</td></tr>` +
     `<tr><th>Spoke / Hub</th><td>${escapeXml(meta.spokeHost)} / ${escapeXml(meta.hubHost)}</td></tr>` +
     `</tbody></table>`;
@@ -2505,8 +2551,9 @@ function buildStorageBody(results, meta) {
 
   const sections = results.map(buildCaseSection).join("");
 
+  const dirTos = `${meta.direction ? meta.direction[0].toUpperCase() + meta.direction.slice(1) : "?"} · ${meta.trafficType} · ToS ${meta.tos}`;
   return (
-    `<h2>Impairment validation run — ${escapeXml(meta.executedAt)}</h2>` +
+    `<h2>Impairment validation run — ${escapeXml(dirTos)} — ${escapeXml(meta.executedAt)}</h2>` +
     metaTable +
     `<h3>Results</h3><table><tbody>${header}${rows}</tbody></table>` +
     sections
@@ -2715,7 +2762,7 @@ async function runSuite(cfg, params) {
   }
   await stageGate(cfg, "Phase 1: infrastructure validation");
 
-  const meta = await collectRunMetadata(cfg, traffic.type, traffic.tos);
+  const meta = await collectRunMetadata(cfg, traffic.type, traffic.tos, traffic.direction);
   log(`run start: modes=[${modes.join(",")}] traffic=${traffic.type} ToS=${traffic.tos} ` +
       `tc=${tcFilter} duration=${durationMs / 1000}s/case, GRID=${meta.gridVersion}`);
 
@@ -3072,6 +3119,9 @@ module.exports = {
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
+  // internals reused by the regression orchestrator (run_regression.js)
+  runTestCase, collectRunMetadata, openNetemUi, activeImpairments, sleep, log,
+  confFetch, confUploadAttachment, confAuthHeader, resolveConfApiBase,
   // parsing / cases / reports (tests)
   lastCompleteRecord, findBalancedEnd, activeTc, activeTcs, linkStats,
   channelsOf, linkIdForDom, monitorLinkSwitches,

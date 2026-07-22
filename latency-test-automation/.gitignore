@@ -1,4 +1,8 @@
 node_modules/
 package-lock.json
 Latency_Test/
+Packet_Loss_Test/
+SLA_Regression/
 latency_test_run.log
+run_state.json
+run_state.json.tmp

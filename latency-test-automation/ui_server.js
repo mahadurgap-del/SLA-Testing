@@ -30,12 +30,30 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const engine = require("./run_latency_tests.js");
+const regression = require("./run_regression.js");
 
 const PORT = parseInt(process.env.UI_PORT ?? "8790", 10);
 const HOST = "127.0.0.1";
 const PROFILES_FILE = path.join(__dirname, "profiles.json");
 
 let running = false;
+
+// The "SLA Full Regression (6x7 Matrix)" profile fixes every test parameter
+// (runtime, latency/packet-loss progression, mode, ToS/direction placeholders,
+// drivers). The operator supplies ONLY the 5 connection targets + Confluence
+// creds; these overrides guarantee engine.validateParams() passes regardless of
+// what the (hidden) advanced fields hold. Real ToS/direction come per-case from
+// the matrix inside run_regression.js.
+const REGRESSION_FIXED = {
+  trafficDriver: "ssh", impairmentDriver: "ssh-tc", trafficTool: "iperf3",
+  trafficDirection: "upstream", tos: "0x04", mode: "all", tcChoice: "all",
+  durationSec: "300", baselineDurationSec: "300",
+  leoMinMs: "30", leoMaxMs: "50", meoMinMs: "150", meoMaxMs: "180", geoMinMs: "600", geoMaxMs: "1000",
+  latencyStabilizeSec: "180", latencyRampStepMs: "50", latencyRampIntervalSec: "60", latencyRampMaxMs: "1000",
+  rampStepPct: "2", rampIntervalSec: "60", plStabilizeSec: "180", plRampMaxPct: "20",
+  burstIntervalSec: "30", burstDurationSec: "7", burstLossPct: "5",
+  randomLossPct: "5", randomMinGapSec: "20", randomMaxGapSec: "60", randomMinDurSec: "5", randomMaxDurSec: "15",
+};
 
 /* ------------------------------------------------------------------------ */
 
@@ -261,6 +279,61 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    /* ---- SLA Full Regression (6x7 Matrix) profile ---- */
+
+    if (req.method === "GET" && url.pathname === "/api/regression/state") {
+      const state = regression.stateSummary();
+      return json(res, 200, { ok: true, running, state: state || { exists: false } });
+    }
+
+    if (req.method === "POST" &&
+        (url.pathname === "/api/regression/start" || url.pathname === "/api/regression/resume")) {
+      if (running) {
+        return json(res, 409, { ok: false, errors: { _global: "a run is already in progress" } });
+      }
+      const resume = url.pathname.endsWith("/resume");
+      const body = await readBody(req);
+      // Persist only the operator-supplied connection/Confluence values (so the
+      // Custom Run form's saved defaults are NOT polluted with the fixed
+      // regression schedule), then overlay the profile-fixed parameters.
+      const base = mergeSecrets(body);
+      rememberDefaults(base);
+      const p = { ...base, ...REGRESSION_FIXED };
+      p.confluence = true;
+      if (body.caseMaxSec) p.caseMaxSec = body.caseMaxSec;
+      if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
+
+      const check = engine.validateParams(p);
+      if (!p.confEmail) { check.ok = false; check.errors.confEmail = "required for Confluence upload"; }
+      if (!p.confToken) { check.ok = false; check.errors.confToken = "required (or set CONF_TOKEN env)"; }
+      if (!p.confPageId && !p.confSpace) {
+        check.ok = false;
+        check.errors.confPageId = "space key (to create the page in) or a page URL/ID (to create it under) required";
+      }
+      if (!check.ok) return json(res, 400, { ok: false, errors: check.errors });
+
+      const cfg = engine.buildConfig(p);
+      running = true;
+      json(res, 200, { ok: true, resume });
+      regression
+        .runRegression(cfg, p, { resume })
+        .catch((e) => {
+          engine.bus.emit("log", `${new Date().toISOString()} FATAL: ${e.message}`);
+          engine.setStatus({ phase: "error", error: e.message });
+        })
+        .finally(() => {
+          running = false;
+          engine.bus.emit("status", engine.getStatus());
+        });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/regression/reset") {
+      if (running) return json(res, 409, { ok: false, error: "stop the running regression first" });
+      regression.clearState();
+      return json(res, 200, { ok: true });
+    }
+
     res.writeHead(404);
     res.end("not found");
   } catch (e) {
@@ -318,10 +391,24 @@ const PAGE = (d, profileNames) => `<!doctype html>
   .path .node { display:inline-block; border:1px solid var(--line); background:#fff; border-radius:8px; padding:6px 16px; margin:4px 0; }
   .path .arrow { color:var(--mut); }
   pre.cmds { background:#f1f5f9; padding:8px 10px; border-radius:6px; font-size:12px; overflow-x:auto; text-align:left; }
+  #runtype { border:2px solid #1d4ed8; background:#eff6ff; }
+  #runtype label { display:inline; color:#1a1a2e; font-size:13px; margin-right:20px; white-space:normal; }
+  body[data-runtype="regression"] .custom-only { display:none; }
+  #regNote { display:none; font-size:12px; color:var(--mut); margin:6px 0 0; }
+  body[data-runtype="regression"] #regNote { display:block; }
+  #resumeBanner { display:none; border:2px solid #f59e0b; border-radius:8px; padding:14px; margin-bottom:14px; background:#fffbeb; }
+  #resumeBanner b { font-size:14px; }
+  .badge.obs { background:#e0e7ff; color:#3730a3; }
 </style></head><body>
 <h1>SLA Impairment Test Control Panel</h1>
+<div id="resumeBanner"></div>
 <div class="cols">
 <form id="f">
+  <fieldset id="runtype"><legend>Run type</legend>
+    <label><input type="radio" name="runtype" value="custom" style="width:auto" checked> <b>Custom Run</b> — configure and run a single traffic combination (existing behaviour)</label>
+    <label><input type="radio" name="runtype" value="regression" style="width:auto"> <b>SLA Full Regression (6&#215;7 Matrix)</b> — one-click 42-case suite</label>
+    <p id="regNote">Regression mode runs all 42 test cases automatically (2 directions &#215; 3 ToS &#215; [Latency TC1&#8211;4 + Packet-Loss TC1&#8211;3]). You provide only the connection targets (Client / Server / Spoke / Hub / Netem VM) and Confluence credentials below &mdash; runtime, latency &amp; packet-loss progression, log collection, reports, diag packs and Confluence upload are all fixed by the profile. Results are observations only (no PASS/FAIL); each case is uploaded to one shared Confluence page immediately after it finishes, and the run resumes from where it left off if interrupted.</p>
+  </fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
       <option value="">— select —</option>
@@ -355,7 +442,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
     </div>`).join("")}
   </div></fieldset>
 
-  <fieldset><legend>3 — Interface selection</legend><div class="grid">
+  <fieldset class="custom-only"><legend>3 — Interface selection</legend><div class="grid">
     <div><label>Client interface <button type="button" class="small grey" data-discover="client">Discover</button></label>
       <select name="clientIface" id="clientIfaceSel"><option value="">— (default route) —</option>
       ${d.clientIface ? `<option selected>${esc(d.clientIface)}</option>` : ""}</select>
@@ -367,7 +454,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <div class="errmsg" id="serverIfaceErr"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>4 — Traffic generation</legend><div class="grid3">
+  <fieldset class="custom-only"><legend>4 — Traffic generation</legend><div class="grid3">
     <div><label>Traffic via</label><select name="trafficDriver">
       <option value="ssh"${d.trafficDriver === "ssh" ? " selected" : ""}>SSH (this tool)</option>
       <option value="netem-ui"${d.trafficDriver === "netem-ui" ? " selected" : ""}>netem UI page</option></select><div class="errmsg"></div></div>
@@ -390,7 +477,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <div class="errmsg"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>4a — Latency ranges, RTT ms (mode: latency — a value is drawn at random per run and recorded in all reports)</legend><div class="grid3">
+  <fieldset class="custom-only"><legend>4a — Latency ranges, RTT ms (mode: latency — a value is drawn at random per run and recorded in all reports)</legend><div class="grid3">
     <div><label>LEO min</label><input name="leoMinMs" value="${esc(d.leoMinMs)}"><div class="errmsg"></div></div>
     <div><label>LEO max</label><input name="leoMaxMs" value="${esc(d.leoMaxMs)}"><div class="errmsg"></div></div>
     <div></div>
@@ -407,7 +494,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <div><label>Ramp ceiling (ms)</label><input name="latencyRampMaxMs" value="${esc(d.latencyRampMaxMs)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>4b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid3">
+  <fieldset class="custom-only"><legend>4b — Packet-loss schedule (mode: packet-loss — impairment auto-applied to the active link)</legend><div class="grid3">
     <div><label>TC1 ramp step (%)</label><input name="rampStepPct" value="${esc(d.rampStepPct)}"><div class="errmsg"></div></div>
     <div><label>TC1 ramp interval (s)</label><input name="rampIntervalSec" value="${esc(d.rampIntervalSec)}"><div class="errmsg"></div></div>
     <div><label>TC2 burst interval (s)</label><input name="burstIntervalSec" value="${esc(d.burstIntervalSec)}"><div class="errmsg"></div></div>
@@ -418,7 +505,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <input name="netemCandidates" value="${esc(d.netemCandidates)}"><div class="errmsg"></div></div>
   </div></fieldset>
 
-  <fieldset><legend>5 — Traffic command</legend>
+  <fieldset class="custom-only"><legend>5 — Traffic command</legend>
     <div style="padding: 0 8px;">
     <label><input type="checkbox" id="advanced" style="width:auto"> Advanced — edit commands before execution</label>
     <label>Server command</label><textarea name="serverCmd" rows="2" readonly>${esc(d.serverCmd)}</textarea><div class="errmsg"></div>
@@ -426,7 +513,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
     </div>
   </fieldset>
 
-  <fieldset><legend>6 — Test selection</legend><div class="grid4">
+  <fieldset class="custom-only"><legend>6 — Test selection</legend><div class="grid4">
     <div><label>Test case</label><select name="tcChoice">
       <option value="all"${d.tcChoice === "all" ? " selected" : ""}>All</option>
       <option value="1">TC1</option><option value="2">TC2</option>
@@ -543,7 +630,7 @@ function render(running, s) {
   $("s-collect").textContent = Object.entries(s.collection || {}).map(([k, v]) => k + ": " + v).join(", ") || "—";
   $("s-conf").textContent = s.confluence;
   $("s-results").innerHTML = (s.results || []).map(r =>
-    '<span class="badge ' + (r.result === "PASS" ? "pass" : "fail") + '">' + r.name + " " + r.result + "</span>").join("") || "—";
+    '<span class="badge ' + (r.result === "PASS" ? "pass" : r.result === "OBSERVED" ? "obs" : "fail") + '">' + r.name + " " + r.result + "</span>").join("") || "—";
   if (s.error) $("globalerr").textContent = s.error;
   startBtn.disabled = running;
   $("stop").disabled = !running;
@@ -684,6 +771,7 @@ $("profDel").addEventListener("click", async () => {
 form.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   clearErrors();
+  if (runType() === "regression") { startRegression(false); return; }
   const body = formBody();
   let cmds = { serverCmd: sCmd.value, clientCmd: cCmd.value };
   if (!$("advanced").checked) {
@@ -724,6 +812,74 @@ $("confirmGo").addEventListener("click", async () => {
   if (!out.ok) { startBtn.disabled = false; showErrors(out.errors); }
   pendingBody = null;
 });
+
+/* ---------- SLA Full Regression (6x7 Matrix) ---------- */
+function runType() {
+  const el = form.querySelector('[name="runtype"]:checked');
+  return el ? el.value : "custom";
+}
+function applyRunType() {
+  document.body.dataset.runtype = runType();
+  startBtn.textContent = runType() === "regression" ? "Start Full Regression" : "Start Test";
+  if (runType() === "regression") refreshRegressionState();
+}
+document.querySelectorAll('[name="runtype"]').forEach((el) => el.addEventListener("change", applyRunType));
+
+async function startRegression(resume) {
+  clearErrors();
+  if (!resume && !confirm(
+    "Start the SLA Full Regression (6x7 Matrix)?\\n\\n" +
+    "\\u2022 42 test cases run automatically (may take several hours).\\n" +
+    "\\u2022 A new Confluence page is created and each test case is uploaded to it immediately.\\n" +
+    "\\u2022 Observations only \\u2014 no PASS/FAIL.\\n\\n" +
+    "You can Stop at any time and Resume later.")) return;
+  startBtn.disabled = true;
+  const path = resume ? "/api/regression/resume" : "/api/regression/start";
+  const resp = await fetch(path, { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(formBody()) });
+  const out = await resp.json();
+  if (!out.ok) { startBtn.disabled = false; showErrors(out.errors || { _global: out.error || "start failed" }); }
+  else { $("resumeBanner").style.display = "none"; }
+}
+
+async function refreshRegressionState() {
+  let out;
+  try { out = await (await fetch("/api/regression/state")).json(); } catch { return; }
+  const s = out && out.state;
+  const banner = $("resumeBanner");
+  if (!s || !s.exists || s.done || out.running) { banner.style.display = "none"; return; }
+  const rf = s.resumeFrom;
+  banner.innerHTML =
+    "<b>Previous SLA Regression found.</b><br>" +
+    "Completed: " + s.completedCount + " / " + s.total + " testcases<br>" +
+    (rf ? "Resume from: <b>" + rf.direction + " \\u00b7 ToS " + rf.tos + " \\u00b7 " + rf.suite + " " + rf.testcase + "</b><br>" : "") +
+    (s.pageUrl ? '<a href="' + s.pageUrl + '" target="_blank" rel="noopener">open Confluence page</a><br>' : "") +
+    '<div style="margin-top:8px">' +
+    '<button type="button" id="regResume">Resume</button> ' +
+    '<button type="button" class="grey" id="regRestart">Restart</button> ' +
+    '<button type="button" class="grey" id="regCancel">Cancel</button></div>';
+  banner.style.display = "block";
+  $("regResume").addEventListener("click", () => startRegression(true));
+  $("regCancel").addEventListener("click", () => { banner.style.display = "none"; });
+  $("regRestart").addEventListener("click", async () => {
+    if (!confirm("Discard the saved progress and start the 42-case regression from the beginning? " +
+                 "(A new Confluence page will be created; the previous one is left as-is.)")) return;
+    await fetch("/api/regression/reset", { method: "POST" });
+    startRegression(false);
+  });
+}
+// On launch: if an unfinished regression exists, switch to regression mode and
+// surface the Resume/Restart/Cancel banner automatically.
+(async () => {
+  try {
+    const out = await (await fetch("/api/regression/state")).json();
+    if (out && out.state && out.state.exists && !out.state.done && !out.running) {
+      const r = form.querySelector('[name="runtype"][value="regression"]');
+      if (r) { r.checked = true; }
+    }
+  } catch {}
+  applyRunType();
+})();
 </script>
 </body></html>`;
 
