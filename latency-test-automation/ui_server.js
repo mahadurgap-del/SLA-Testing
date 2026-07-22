@@ -304,6 +304,9 @@ const server = http.createServer(async (req, res) => {
       // IPTV / single-ToS options from the regression form
       p.iptvMode = !!body.iptvMode;
       if (body.regressionTos && String(body.regressionTos).trim()) p.regressionTosList = String(body.regressionTos).trim();
+      if (body.iptvServerIp && String(body.iptvServerIp).trim()) p.iptvServerIp = String(body.iptvServerIp).trim();
+      if (body.iptvFlows && String(body.iptvFlows).trim()) p.iptvFlows = String(body.iptvFlows).trim();
+      if (body.iptvBw && String(body.iptvBw).trim()) p.iptvBw = String(body.iptvBw).trim();
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
@@ -424,6 +427,12 @@ const PAGE = (d, profileNames) => `<!doctype html>
 0x84</textarea><div class="errmsg"></div></div>
     <div><label>&nbsp;</label>
       <label style="display:block;"><input type="checkbox" name="iptvMode" style="width:auto" checked> IPTV mode</label></div>
+    <div><label>Server traffic IP (overlay data-plane)</label>
+      <input name="iptvServerIp" value="10.40.2.2" placeholder="10.40.2.2"><div class="errmsg"></div></div>
+    <div><label>Flows (parallel iperf streams)</label>
+      <input name="iptvFlows" value="40" placeholder="40"><div class="errmsg"></div></div>
+    <div><label>Per-flow bandwidth</label>
+      <input name="iptvBw" value="2M" placeholder="2M"><div class="errmsg"></div></div>
     <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode runs the IPTV-page test logic for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>). Latency TC2 steps the active LEO link through the page sequences (up 40&hellip;250, down 25&hellip;135); TC3/TC4 hold LEO-vs-MEO / MEO-vs-GEO fixed; packet-loss is constant +2%/min, escalating periodic, and escalating random. Each case <b>ends on the first link switch</b>, detected from the netem overlay interfaces; on switch only the DMTS <b>hourLog</b> is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix.</div>
   </div></fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">

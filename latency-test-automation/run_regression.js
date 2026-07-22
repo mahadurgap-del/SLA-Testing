@@ -897,16 +897,18 @@ async function runRegression(cfg, params, opts = {}) {
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
-      // IPTV mode drives one UDP stream at the reference's per-direction demand
-      // (~66 Mbps upstream / ~90 Mbps downstream) so DMTS sees real load and
-      // load-balances — 2M is far too low for a managed flow to form.
-      const caseBw = state.iptvMode
-        ? (c.direction === "downstream" ? (params.iptvBwDown || "90M") : (params.iptvBwUp || "66M"))
-        : params.bandwidth;
-      const caseStreams = state.iptvMode ? "1" : params.parallelStreams;
+      // IPTV mode: many 2M flows (>10) to the overlay DATA-PLANE server IP
+      // (default 10.40.2.2) so traffic routes through the DMTS spoke→hub path
+      // and DMTS forms managed flows to load-balance. Targeting the mgmt IP
+      // bypasses the overlay (DMTS sees nothing).
+      const caseBw = state.iptvMode ? (params.iptvBw || "2M") : params.bandwidth;
+      const caseStreams = state.iptvMode ? (params.iptvFlows || "40") : params.parallelStreams;
+      const caseServerIp = state.iptvMode
+        ? (params.iptvServerIp || params.serverTrafficIp || "10.40.2.2")
+        : (params.serverTrafficIp || params.serverIp);
       const cmds = engine.buildTrafficCommands({
         ...params, trafficDirection: c.direction, tos: c.tos,
-        bandwidth: caseBw, parallelStreams: caseStreams,
+        bandwidth: caseBw, parallelStreams: caseStreams, serverTrafficIp: caseServerIp,
       });
       const traffic = {
         type: String(params.trafficType || "UDP").toUpperCase(),
