@@ -301,6 +301,9 @@ const server = http.createServer(async (req, res) => {
       const p = { ...base, ...REGRESSION_FIXED };
       p.confluence = true;
       if (body.caseMaxSec) p.caseMaxSec = body.caseMaxSec;
+      // IPTV / single-ToS options from the regression form
+      p.iptvMode = !!body.iptvMode;
+      if (body.regressionTos && String(body.regressionTos).trim()) p.regressionTosList = String(body.regressionTos).trim();
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
@@ -396,6 +399,8 @@ const PAGE = (d, profileNames) => `<!doctype html>
   body[data-runtype="regression"] .custom-only { display:none; }
   #regNote { display:none; font-size:12px; color:var(--mut); margin:6px 0 0; }
   body[data-runtype="regression"] #regNote { display:block; }
+  .reg-only { display:none; }
+  body[data-runtype="regression"] .reg-only { display:block; }
   #resumeBanner { display:none; border:2px solid #f59e0b; border-radius:8px; padding:14px; margin-bottom:14px; background:#fffbeb; }
   #resumeBanner b { font-size:14px; }
   .badge.obs { background:#e0e7ff; color:#3730a3; }
@@ -407,8 +412,16 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <fieldset id="runtype"><legend>Run type</legend>
     <label><input type="radio" name="runtype" value="custom" style="width:auto" checked> <b>Custom Run</b> — configure and run a single traffic combination (existing behaviour)</label>
     <label><input type="radio" name="runtype" value="regression" style="width:auto"> <b>SLA Full Regression (6&#215;7 Matrix)</b> — one-click 42-case suite</label>
-    <p id="regNote">Regression mode runs all 42 test cases automatically (2 directions &#215; 3 ToS &#215; [Latency TC1&#8211;4 + Packet-Loss TC1&#8211;3]). You provide only the connection targets (Client / Server / Spoke / Hub / Netem VM) and Confluence credentials below &mdash; runtime, latency &amp; packet-loss progression, log collection, reports, diag packs and Confluence upload are all fixed by the profile. Results are observations only (no PASS/FAIL); each case is uploaded to one shared Confluence page immediately after it finishes, and the run resumes from where it left off if interrupted.</p>
+    <p id="regNote">Regression mode runs the test cases automatically per the profile. You provide only the connection targets (Client / Server / Spoke / Hub / Netem VM), the ToS below, and Confluence credentials &mdash; runtime, latency &amp; packet-loss progression, log collection, reports and Confluence upload are all fixed by the profile. Results are observations only (no PASS/FAIL); each case is uploaded to one shared Confluence page immediately after it finishes, and the run resumes from where it left off if interrupted.</p>
   </fieldset>
+
+  <fieldset class="reg-only"><legend>Regression options</legend><div class="grid">
+    <div><label>ToS / DSCP (blank = full 0x04,0x24,0x38 SLA matrix)</label>
+      <input name="regressionTos" value="0x04" placeholder="e.g. 0x04"><div class="errmsg"></div></div>
+    <div><label>&nbsp;</label>
+      <label style="display:block;"><input type="checkbox" name="iptvMode" style="width:auto" checked> IPTV mode</label></div>
+    <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode: iperf3 traffic, single ToS above &rarr; 14 cases (7 &#215; upstream/downstream). Each case <b>ends on the first link switch</b> (packet-loss never runs the full ~10 min), link switching is detected from the netem overlay interfaces, and on switch only the DMTS <b>hourLog</b> is collected &mdash; Spoke for upstream, Hub for downstream. Unchecked + blank ToS = the original 42-case SLA matrix with full log/diag-pack collection.</div>
+  </div></fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
       <option value="">— select —</option>
@@ -585,6 +598,7 @@ function formBody() {
   const fd = new FormData(form);
   const body = Object.fromEntries(fd.entries());
   body.confluence = fd.has("confluence");
+  body.iptvMode = fd.has("iptvMode");
   body.headless = !fd.has("headed");
   delete body.headed;
   if (!$("advanced").checked) { body.serverCmd = ""; body.clientCmd = ""; }
@@ -827,9 +841,14 @@ document.querySelectorAll('[name="runtype"]').forEach((el) => el.addEventListene
 
 async function startRegression(resume) {
   clearErrors();
+  const iptv = form.querySelector('[name="iptvMode"]').checked;
+  const tos = (form.querySelector('[name="regressionTos"]').value || "").trim();
+  const scope = iptv
+    ? "IPTV mode: 14 cases (7 \\u00d7 upstream/downstream) at ToS " + (tos || "0x04") + ", ending each case on the first link switch"
+    : "Full SLA matrix: 42 cases (2 directions \\u00d7 3 ToS \\u00d7 7)";
   if (!resume && !confirm(
-    "Start the SLA Full Regression (6x7 Matrix)?\\n\\n" +
-    "\\u2022 42 test cases run automatically (may take several hours).\\n" +
+    "Start the SLA regression?\\n\\n" +
+    "\\u2022 " + scope + " \\u2014 runs automatically.\\n" +
     "\\u2022 A new Confluence page is created and each test case is uploaded to it immediately.\\n" +
     "\\u2022 Observations only \\u2014 no PASS/FAIL.\\n\\n" +
     "You can Stop at any time and Resume later.")) return;

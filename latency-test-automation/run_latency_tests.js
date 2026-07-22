@@ -905,8 +905,11 @@ async function newestHourlogFile(conn) {
   return stdout.trim() || null;
 }
 
-async function monitorLinkSwitches(conn, durationMs, onSwitch) {
-  const deadline = Date.now() + durationMs;
+async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
+  // opts.endAfterSwitchMs: once the FIRST switch is seen, keep monitoring only
+  // this much longer, then stop (used by IPTV mode to end a case on switch).
+  // Absent → monitor the full duration, as before.
+  let deadline = Date.now() + durationMs;
   const switches = [];
   const prevDom = {};   // tcName -> last dom_link index seen
   let file = await newestHourlogFile(conn);
@@ -945,6 +948,10 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch) {
         };
         switches.push(sw);
         prevDom[a.name] = a.domLink;
+        if (opts.endAfterSwitchMs != null && switches.length === 1) {
+          deadline = Math.min(deadline, Date.now() + opts.endAfterSwitchMs);
+          log(`end-on-switch: monitoring ${Math.round(opts.endAfterSwitchMs / 1000)}s more then stopping the case`);
+        }
         checkpoint(true, "Link switch detected",
           `TC ${sw.tc}: link ${sw.fromLink} -> ${sw.toLink} at ${sw.time}`);
         log(`LINK SWITCH: TC ${sw.tc} link ${sw.fromLink} -> ${sw.toLink} at ${sw.time} ` +
@@ -1535,7 +1542,9 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       const holdEnd = Math.min(deadline, Date.now() + s.preHoldSec * 1000);
       while (Date.now() < holdEnd && !isAborted() && !sync.switched) await sleep(2000);
     }
-    while (Date.now() < deadline && !isAborted()) {
+    // s.endOnSwitch (IPTV mode): stop bursting once a switch occurs. Custom Run
+    // leaves it unset and keeps running for the full window.
+    while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       try {
         const det = await detectActiveLink(cfg);
         await applyToLink(cfg, det.ports, { lossPct: s.burstLossPct }, impairedIfaces);
@@ -1555,7 +1564,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       const holdEnd = Math.min(deadline, Date.now() + s.preHoldSec * 1000);
       while (Date.now() < holdEnd && !isAborted() && !sync.switched) await sleep(2000);
     }
-    while (Date.now() < deadline && !isAborted()) {
+    while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
       try {
@@ -2063,6 +2072,28 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
 
   const isDynamicPL = !!tc.plType;
   const sshTc = cfg.impairmentDriver === "ssh-tc";
+  // Which DMTS owns link selection for this case's direction (IPTV mode sets
+  // tc.monitorSide: upstream→spoke, downstream→hub). Default spoke, as before.
+  const monSide = tc.monitorSide === "hub" ? "hub" : "spoke";
+  const monCreds = monSide === "hub" ? cfg.hub : cfg.spoke;
+  const monDir = monSide === "hub" ? hubDir : spokeDir;
+  // End-of-test evidence: IPTV mode (tc.hourlogOnly) collects ONLY the relevant
+  // side's DMTS hourLog; otherwise the full spoke+hub DMTS logs + diag packs.
+  const collectFinalEvidence = async () => {
+    if (tc.hourlogOnly) {
+      try {
+        const snap = await collectHourlogSnapshot(monCreds, monDir, `${tc.name}_final`);
+        if (snap) result.artifacts[monSide].push(snap);
+        checkpoint(true, `${monSide} hourLog collected`, snap ? path.basename(snap) : "(none)");
+      } catch (e) {
+        result.errors.push(`${monSide} hourLog: ${e.message}`);
+        checkpoint(false, `${monSide} hourLog collected`, e.message.slice(0, 160));
+        log(`WARN: ${e.message}`);
+      }
+    } else {
+      await collectEndOfTest(cfg, browser, tc.name, result, spokeDir, hubDir);
+    }
+  };
   await shot("01_before_netem");
   if (isDynamicPL) {
     log(`${tc.name}: ${tc.describe} — impairment is applied at runtime to the auto-detected active link`);
@@ -2103,7 +2134,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     try { await stopTraffic(); } catch (e2) { result.errors.push(`stop traffic: ${e2.message}`); }
     // still collect DMTS evidence so a failed case can be analyzed
     log(`${tc.name} failed traffic verification — collecting logs for evidence anyway`);
-    await collectEndOfTest(cfg, browser, tc.name, result, spokeDir, hubDir);
+    await collectFinalEvidence();
     result.endTime = new Date().toISOString();
     result.observationsFile = path.join(tcDir, "observations.txt");
     fs.writeFileSync(result.observationsFile, observationsText(result));
@@ -2123,9 +2154,9 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   // a monitoring failure must not skip traffic stop / netem cleanup /
   // log collection — catch it, record it, and continue the teardown path
   try {
-    const spokeMonitor = await sshConnect(cfg.spoke);
+    const switchMonitor = await sshConnect(monCreds);
     try {
-      const monitorP = monitorLinkSwitches(spokeMonitor, durationMs, async (sw, isFirst) => {
+      const monitorP = monitorLinkSwitches(switchMonitor, durationMs, async (sw, isFirst) => {
         await shot(`03_switch_${result.switches.length}`);
         if (isFirst) {
           // stop the ramp and record the latency that triggered the switch
@@ -2137,10 +2168,10 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
               log(`${tc.name}: switch at ${sync.currentMs}ms on ${sync.activeIface} — stopping ramp`);
             }
           }
-          const snapTar = await collectHourlogSnapshot(cfg.spoke, spokeDir, `${tc.name}_switch`);
-          if (snapTar) result.artifacts.spoke.push(snapTar);
+          const snapTar = await collectHourlogSnapshot(monCreds, monDir, `${tc.name}_switch`);
+          if (snapTar) result.artifacts[monSide].push(snapTar);
         }
-      });
+      }, { endAfterSwitchMs: tc.endOnSwitch ? (tc.switchTailMs ?? 30000) : undefined });
       const scheduleP = isDynamicPL
         ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null, sync, tc.plPlan || null)
         : isLatencyRamp
@@ -2150,7 +2181,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       result.switches = switches;
       result.impairments = [...result.impairments, ...impairments];
     } finally {
-      spokeMonitor.end();
+      switchMonitor.end();
     }
   } catch (e) {
     result.errors.push(`monitoring: ${e.message}`);
@@ -2217,7 +2248,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     return result;
   }
 
-  await collectEndOfTest(cfg, browser, tc.name, result, spokeDir, hubDir);
+  await collectFinalEvidence();
   await stageGate(cfg, `${tc.name}: logs collected`);
 
   result.endTime = new Date().toISOString();

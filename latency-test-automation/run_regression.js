@@ -76,12 +76,14 @@ const STEP_MS = 50;          // latency ramp step
 const STEP_INTERVAL_SEC = 60; // one step per minute
 const TAIL_SEC = 60;         // continue monitoring after ceiling reached
 
-/** Build the ordered list of 42 case descriptors. */
-function buildMatrix() {
+/** Build the ordered case list. Default = full 6×7=42 matrix; pass a single
+ *  ToS (e.g. ["0x04"]) for a 2×7=14 IPTV-style run. */
+function buildMatrix(tosList) {
+  const list = (Array.isArray(tosList) && tosList.length) ? tosList : TOS_LIST;
   const cases = [];
   let n = 0;
   for (const dir of DIRECTIONS) {
-    for (const tos of TOS_LIST) {
+    for (const tos of list) {
       for (const t of LATENCY_TCS) {
         n++;
         cases.push({
@@ -107,18 +109,23 @@ function buildMatrix() {
   return cases;
 }
 
-/** Per-case observation window in seconds. */
+/** Per-case observation window in seconds. In IPTV mode cases end on the first
+ *  link switch (see buildTc), so these are the ceilings used only when NO switch
+ *  occurs — packet-loss is deliberately kept under 10 minutes. */
 function caseWindowSec(c, params) {
+  const iptv = params && params.iptvMode;
   let sec;
   if (c.suite === "latency") {
     if (c.baseline) sec = 300;
     else {
       const steps = Math.ceil((c.ceiling - c.active) / STEP_MS);
       sec = HOLD_SEC + steps * STEP_INTERVAL_SEC + TAIL_SEC;
+      if (iptv) sec = Math.min(sec, 600); // ≤10 min if no switch
     }
   } else if (c.plType === "constant") {
     const steps = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct);
     sec = HOLD_SEC + steps * STEP_INTERVAL_SEC + TAIL_SEC;
+    if (iptv) sec = Math.min(sec, 480); // PL: do not run ~10 min — cap at 8
   } else {
     sec = HOLD_SEC + 120; // burst / random: 5-minute case (3-min clean + 2-min active)
   }
@@ -127,8 +134,17 @@ function caseWindowSec(c, params) {
   return sec;
 }
 
-/** Build the engine `tc` object (schedule driver) for a case. */
-function buildTc(c) {
+/**
+ * Build the engine `tc` object (schedule driver) for a case.
+ * `opts.iptv` adds IPTV-run behaviour: monitor + collect only the direction's
+ * DMTS side (upstream→spoke, downstream→hub), end the case on the first link
+ * switch, and collect the hourLog only.
+ */
+function buildTc(c, opts = {}) {
+  const iptv = !!opts.iptv;
+  const iptvFields = iptv
+    ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true, hourlogOnly: true }
+    : {};
   if (c.suite === "latency") {
     return {
       n: c.n, name: c.id, mode: "latency",
@@ -141,19 +157,22 @@ function buildTc(c) {
         stabilizeSec: HOLD_SEC, stepMs: STEP_MS,
         intervalSec: STEP_INTERVAL_SEC, ceilingMs: c.ceiling,
       },
+      ...iptvFields,
     };
   }
   const none = { delayMs: 0, lossPct: 0 };
-  const plPlan =
+  const base =
     c.plType === "constant"
       ? { rampStepPct: c.stepPct, rampIntervalSec: STEP_INTERVAL_SEC, stabilizeSec: HOLD_SEC, rampMaxPct: c.ceilingPct }
       : c.plType === "burst"
         ? { preHoldSec: HOLD_SEC, burstLossPct: 5, burstDurationSec: 7, burstIntervalSec: 30 }
         : { preHoldSec: HOLD_SEC, randomLossPct: 5, randomMinGapSec: 20, randomMaxGapSec: 60, randomMinDurSec: 5, randomMaxDurSec: 15 };
+  const plPlan = iptv ? { ...base, endOnSwitch: true } : base;
   return {
     n: c.n, name: c.id, mode: "packet-loss", plType: c.plType,
     link1: none, link2: none, expectSwitch: true, observeOnly: true,
     describe: initialConfig(c), plPlan,
+    ...iptvFields,
   };
 }
 
@@ -228,16 +247,18 @@ function clearState() {
 function stateSummary() {
   const st = loadState();
   if (!st) return null;
-  const matrix = buildMatrix();
+  const matrix = buildMatrix(st.tosList);
+  const total = st.total || matrix.length;
   const completed = new Set(st.completed || []);
   const next = matrix.find((c) => !completed.has(c.id));
   return {
     exists: true,
     profileName: st.profileName || PROFILE_NAME,
     startedAt: st.startedAt || null,
-    total: TOTAL,
+    total,
     completedCount: completed.size,
-    done: completed.size >= TOTAL,
+    done: completed.size >= total,
+    iptvMode: !!st.iptvMode,
     pageId: st.pageId || null,
     pageUrl: st.pageUrl || null,
     resumeFrom: next
@@ -547,10 +568,11 @@ const MATRIX_HEADER =
 /* ---- top-level tables ---- */
 function executionSummary(state, baseMeta) {
   const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
+  const total = state.total || TOTAL;
   const done = (state.completed || []).length;
   const cases = state.cases || [];
   const lastEnd = cases.length ? cases[cases.length - 1].endTime : null;
-  const endTime = done >= TOTAL && lastEnd ? lastEnd : "(in progress)";
+  const endTime = done >= total && lastEnd ? lastEnd : "(in progress)";
   let runtime = "-";
   if (state.startedAt && lastEnd) {
     const sec = Math.max(0, Math.round((new Date(lastEnd) - new Date(state.startedAt)) / 1000));
@@ -558,11 +580,13 @@ function executionSummary(state, baseMeta) {
   }
   return `<h2>Execution Summary</h2><table><tbody>` +
     row("Execution ID", state.runId) +
+    row("Traffic profile", state.iptvMode ? "IPTV (iperf3 UDP, end-on-switch, hourLog only)" : "SLA regression") +
+    row("ToS", (state.tosList && state.tosList.join(", ")) || "0x04, 0x24, 0x38") +
     row("Start Time", state.startedAt) +
     row("End Time", endTime) +
-    row("Total Testcases", String(TOTAL)) +
+    row("Total Testcases", String(total)) +
     row("Completed", String(done)) +
-    row("Remaining", String(TOTAL - done)) +
+    row("Remaining", String(total - done)) +
     row("Runtime", runtime) +
     row("Grid Version", baseMeta.gridVersion) +
     row("Automation Version", AUTOMATION_VERSION) +
@@ -572,9 +596,10 @@ function executionSummary(state, baseMeta) {
 /** Suite-completion summary (grows as cases finish; complete once all 42 done). */
 function suiteCompletionSummary(state) {
   const completed = new Set(state.completed || []);
+  const tosList = (state.tosList && state.tosList.length) ? state.tosList : TOS_LIST;
   const rows = [];
   for (const dir of DIRECTIONS) {
-    for (const tos of TOS_LIST) {
+    for (const tos of tosList) {
       const lat = LATENCY_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
       const pl = PL_TCS.filter((t) => completed.has(`${dir.short}_${tos}_${t.tc}`)).length;
       rows.push(`<tr><td>${e(dir.label)}</td><td>${e(tos)}</td>` +
@@ -705,11 +730,22 @@ async function appendCase(conf, state, baseMeta, c, r) {
  */
 async function runRegression(cfg, params, opts = {}) {
   const log = (m) => engine.log(m); // streams to automation.log + the UI SSE
-  const matrix = buildMatrix();
+  const iptvMode = !!(params && params.iptvMode);
+  // ToS list: array or CSV string; default the full 3-ToS SLA set. IPTV runs
+  // pass a single ToS -> a 2×7=14 case run.
+  let tosList = params && params.regressionTosList;
+  if (typeof tosList === "string") tosList = tosList.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
+  const matrix = buildMatrix(tosList);
 
   // Force the regression-safe drivers regardless of what the form carried.
   cfg.trafficDriver = "ssh";
   cfg.impairmentDriver = "ssh-tc";
+  // Detection/impairment work off the netem overlay ports. Default to the four
+  // overlay interfaces if the profile left them unset.
+  if (!cfg.netemCandidates || !cfg.netemCandidates.length) {
+    cfg.netemCandidates = ["ens192", "ens193", "ens224", "ens225"];
+  }
 
   // ---- state (fresh or resumed) ----
   let state = opts.resume ? loadState() : null;
@@ -717,9 +753,10 @@ async function runRegression(cfg, params, opts = {}) {
     state = {
       runId: `sla-reg-${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}`,
       startedAt: new Date().toISOString(),
-      profileName: PROFILE_NAME,
+      profileName: iptvMode ? "SLA Regression — IPTV" : PROFILE_NAME,
       currentIndex: 0,
-      total: TOTAL,
+      total: matrix.length,
+      tosList, iptvMode,
       pageId: null, pageTitle: null, pageUrl: null,
       completed: [],
       summaryRows: [], sections: [],
@@ -727,11 +764,16 @@ async function runRegression(cfg, params, opts = {}) {
     };
     saveState(state);
   }
+  // resumed runs keep their original tosList/iptvMode; fall back for old files
+  if (!state.tosList) state.tosList = tosList;
+  if (state.iptvMode == null) state.iptvMode = iptvMode;
+  if (!state.total) state.total = matrix.length;
+  const total = state.total;
   const completed = new Set(state.completed || []);
 
   engine.clearAbort();
   engine.resetRunLogs();
-  engine.setStatus({ phase: "running", caseCount: TOTAL, caseIndex: completed.size, mode: "regression" });
+  engine.setStatus({ phase: "running", caseCount: total, caseIndex: completed.size, mode: "regression" });
 
   // ---- infrastructure once ----
   await engine.preflight(cfg);
@@ -770,9 +812,9 @@ async function runRegression(cfg, params, opts = {}) {
 
       state.currentIndex = c.n;
       engine.setStatus({ caseIndex: c.n, currentCase: c.id });
-      log(`########## CASE ${c.n}/${TOTAL} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
+      log(`########## CASE ${c.n}/${total} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
 
-      const tc = buildTc(c);
+      const tc = buildTc(c, { iptv: state.iptvMode });
       const durationMs = caseWindowSec(c, params) * 1000;
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
@@ -835,7 +877,7 @@ async function runRegression(cfg, params, opts = {}) {
       saveState(state);
       uiResults.push({ name: c.id, result: r.result || "OBSERVED" });
       engine.setStatus({ results: uiResults.slice() });
-      log(`CASE ${c.n}/${TOTAL} ${c.id} DONE — ${statusText(r)}${uploaded ? " — uploaded" : ""}`);
+      log(`CASE ${c.n}/${total} ${c.id} DONE — ${statusText(r)}${uploaded ? " — uploaded" : ""}`);
     }
   } finally {
     if (browser) { try { await browser.close(); } catch { /* ignore */ } }
@@ -850,8 +892,8 @@ async function runRegression(cfg, params, opts = {}) {
   const done = (state.completed || []).length;
   engine.setStatus({ phase: aborted ? "aborted" : "done", confluence: state.pageId ? `page ${state.pageId}` : "n/a" });
   engine.clearAbort();
-  log(`=== REGRESSION ${aborted ? "ABORTED" : "COMPLETE"} — ${done}/${TOTAL} cases — page ${state.pageId || "(none)"} ===`);
-  return { pageId: state.pageId, completed: done, total: TOTAL, state, aborted };
+  log(`=== REGRESSION ${aborted ? "ABORTED" : "COMPLETE"} — ${done}/${total} cases — page ${state.pageId || "(none)"} ===`);
+  return { pageId: state.pageId, completed: done, total, state, aborted };
 }
 
 /* ========================================================================= *
@@ -871,6 +913,10 @@ async function main() {
   const params = profiles.__default__;
   if (!params) { console.error("no saved profile (profiles.json __default__) — open the panel and Start once, or fill profiles.json"); process.exit(1); }
   params.confluence = true;
+  // CLI: --iptv enables IPTV mode; --tos=0x04[,0x24] restricts the ToS set.
+  if (args.includes("--iptv")) params.iptvMode = true;
+  const tosArg = args.find((a) => a.startsWith("--tos="));
+  if (tosArg) params.regressionTosList = tosArg.slice("--tos=".length);
 
   const check = engine.validateParams(params);
   if (!check.ok) { console.error(`invalid params: ${JSON.stringify(check.errors)}`); process.exit(1); }
@@ -878,14 +924,14 @@ async function main() {
 
   const summary = stateSummary();
   if (summary && !summary.done && !resume && !restart) {
-    console.log(`\nPrevious SLA Regression found — completed ${summary.completedCount}/${TOTAL}.`);
+    console.log(`\nPrevious SLA Regression found — completed ${summary.completedCount}/${summary.total}.`);
     console.log(`Resume from: ${summary.resumeFrom ? `${summary.resumeFrom.direction} · ToS ${summary.resumeFrom.tos} · ${summary.resumeFrom.suite} ${summary.resumeFrom.testcase}` : "(end)"}`);
     console.log(`Run with --resume to continue, or --restart to start over.\n`);
     process.exit(0);
   }
 
   const res = await runRegression(cfg, params, { resume: resume && !restart });
-  process.exit(res.completed >= TOTAL ? 0 : 1);
+  process.exit(res.completed >= res.total ? 0 : 1);
 }
 
 if (require.main === module) {

@@ -49,12 +49,26 @@ TC2 30→130 ms (standby 0); TC3 30→400 ms (standby 150); TC4 150→1500 ms (s
 constant 2→20 % (+2 %/min after a 3-min hold); PL2 burst 5 % for 7 s every 30 s;
 PL3 random 5 % (gap 20–60 s, dur 5–15 s) — PL2/PL3 hold clean for 3 min first.
 
+Under **Regression options** you can pick a **single ToS** (blank = the full
+`0x04,0x24,0x38` matrix) and toggle **IPTV mode**:
+
+- **IPTV mode** — iperf3 traffic at one ToS → **14 cases** (7 scenarios ×
+  upstream/downstream, modelled on the *IPTV Testing* reference page). Each case
+  **ends on the first link switch** (packet-loss never runs the full ~10 min),
+  link switching is detected from the netem overlay interfaces, and on a switch
+  only the DMTS **hourLog** is collected — **Spoke** for upstream, **Hub** for
+  downstream (the other side is not shown/uploaded). Give it a different ToS per
+  traffic class per run.
+- **Off + blank ToS** — the original 42-case SLA matrix with full DMTS logs +
+  Grid Diag Packs from both Spoke and Hub.
+
 CLI equivalent (uses the saved `profiles.json __default__`):
 
 ```bash
-node run_regression.js            # fresh full run
-node run_regression.js --resume   # continue an interrupted run
-node run_regression.js --restart  # discard state and start over
+node run_regression.js                     # fresh full 42-case run
+node run_regression.js --iptv --tos=0x04   # 14-case IPTV run at ToS 0x04
+node run_regression.js --resume            # continue an interrupted run
+node run_regression.js --restart           # discard state and start over
 ```
 
 The **Custom Run** flow (single combination, PASS/FAIL) is unchanged.
