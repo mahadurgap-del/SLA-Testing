@@ -805,10 +805,12 @@ async function runRegression(cfg, params, opts = {}) {
   catch (e) { console.log(`WARN: netem UI page unavailable for screenshots (${(e.message || "").split("\n")[0]}) — continuing`); }
 
   const uiResults = [];
+  let ranThisRun = 0; // for opts.limit (smoke tests)
   try {
     for (const c of matrix) {
       if (engine.isAborted()) { log("regression aborted by user — stopping"); break; }
       if (completed.has(c.id)) { log(`skip ${c.id} — already completed`); continue; }
+      if (opts.limit && ranThisRun >= opts.limit) { log(`reached --limit ${opts.limit} — stopping (smoke run)`); break; }
 
       state.currentIndex = c.n;
       engine.setStatus({ caseIndex: c.n, currentCase: c.id });
@@ -855,29 +857,32 @@ async function runRegression(cfg, params, opts = {}) {
         if (r.observationsFile) r.reportFiles.push(r.observationsFile);
       } catch (e) { log(`WARN: report generation ${c.id}: ${e.message}`); r.reportFiles = r.reportFiles || []; }
 
-      // ---- Confluence append (immediately) ----
-      let uploaded = false;
-      if (conf) {
-        engine.setStatus({ confluence: `appending ${c.id}` });
-        try { await appendCase(conf, state, baseMeta, c, r); uploaded = true; engine.setStatus({ confluence: `appended ${c.id}` }); }
-        catch (e) { engine.setStatus({ confluence: `append FAILED: ${e.message}` }); log(`ERROR: Confluence append ${c.id}: ${e.message}`); }
-      }
-
-      // ---- checkpoint ----
+      // ---- checkpoint (mark complete BEFORE the Confluence render so the page's
+      // Execution Summary / Suite Completion counts include this case) ----
       completed.add(c.id);
       state.completed = [...completed];
-      state.cases.push({
+      const caseRec = {
         id: c.id, direction: c.direction, tos: c.tos, suite: c.suiteLabel, testcase: c.testcase,
         status: statusText(r), startTime: r.startTime, endTime: r.endTime,
-        uploaded, logsCollected: !!(r.artifacts && (r.artifacts.spoke.length || r.artifacts.hub.length)),
+        uploaded: false, logsCollected: !!(r.artifacts && (r.artifacts.spoke.length || r.artifacts.hub.length)),
         reportsGenerated: !!(r.reportFiles && r.reportFiles.length),
         switchObserved: !!r.switchObserved, switchTime: r.switchAt || null,
         initialConfig: initialConfig(c), finalConfig: finalConfig(c, r),
-      });
+      };
+      state.cases.push(caseRec);
+
+      // ---- Confluence append (immediately) ----
+      if (conf) {
+        engine.setStatus({ confluence: `appending ${c.id}` });
+        try { await appendCase(conf, state, baseMeta, c, r); caseRec.uploaded = true; engine.setStatus({ confluence: `appended ${c.id}` }); }
+        catch (e) { engine.setStatus({ confluence: `append FAILED: ${e.message}` }); log(`ERROR: Confluence append ${c.id}: ${e.message}`); }
+      }
+
       saveState(state);
       uiResults.push({ name: c.id, result: r.result || "OBSERVED" });
       engine.setStatus({ results: uiResults.slice() });
-      log(`CASE ${c.n}/${total} ${c.id} DONE — ${statusText(r)}${uploaded ? " — uploaded" : ""}`);
+      ranThisRun++;
+      log(`CASE ${c.n}/${total} ${c.id} DONE — ${statusText(r)}${caseRec.uploaded ? " — uploaded" : ""}`);
     }
   } finally {
     if (browser) { try { await browser.close(); } catch { /* ignore */ } }
@@ -917,6 +922,10 @@ async function main() {
   if (args.includes("--iptv")) params.iptvMode = true;
   const tosArg = args.find((a) => a.startsWith("--tos="));
   if (tosArg) params.regressionTosList = tosArg.slice("--tos=".length);
+  const maxArg = args.find((a) => a.startsWith("--max="));   // per-case window cap (s)
+  if (maxArg) params.caseMaxSec = maxArg.slice("--max=".length);
+  const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
+  const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
 
   const check = engine.validateParams(params);
   if (!check.ok) { console.error(`invalid params: ${JSON.stringify(check.errors)}`); process.exit(1); }
@@ -930,7 +939,7 @@ async function main() {
     process.exit(0);
   }
 
-  const res = await runRegression(cfg, params, { resume: resume && !restart });
+  const res = await runRegression(cfg, params, { resume: resume && !restart, limit });
   process.exit(res.completed >= res.total ? 0 : 1);
 }
 
