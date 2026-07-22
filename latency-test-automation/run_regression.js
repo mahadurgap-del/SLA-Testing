@@ -54,31 +54,45 @@ const DIRECTIONS = [
 ];
 const TOS_LIST = ["0x04", "0x24", "0x38"];
 
-// Latency suite. `active` = initial delay applied to the auto-detected active
-// link; `standby` = fixed delay held on the standby link for the whole case;
-// `ceiling` = active-link ramp ceiling (+50ms/60s, after a 180s hold).
+// Latency suite. Each entry carries BOTH the original SLA-matrix spec (active/
+// standby/ceiling uniform ramp) and an `iptv` spec modelled on the IPTV Testing
+// Confluence page. buildMatrix() resolves one or the other per mode.
+//   IPTV latency: TC2 steps the active (LEO) link through an explicit per-
+//   direction sequence; TC3/TC4 HOLD fixed active/standby and observe.
 const LATENCY_TCS = [
-  { tc: "TC1", label: "Baseline", baseline: true, active: 0, standby: 0, ceiling: 0 },
-  { tc: "TC2", label: "LEO", active: 30, standby: 0, ceiling: 130 },
-  { tc: "TC3", label: "LEO vs MEO", active: 30, standby: 150, ceiling: 400 },
-  { tc: "TC4", label: "MEO vs GEO", active: 150, standby: 600, ceiling: 1500 },
+  { tc: "TC1", label: "Baseline", baseline: true, active: 0, standby: 0, ceiling: 0,
+    iptv: { label: "Baseline" } },
+  { tc: "TC2", label: "LEO", active: 30, standby: 0, ceiling: 130,
+    iptv: { label: "LEO Latency", standby: 0,
+            steps: { upstream: [40, 75, 100, 135, 170, 200, 250], downstream: [25, 40, 75, 110, 135] } } },
+  { tc: "TC3", label: "LEO vs MEO", active: 30, standby: 150, ceiling: 400,
+    iptv: { label: "LEO vs MEO", hold: true, active: 30, standby: 200 } },
+  { tc: "TC4", label: "MEO vs GEO", active: 150, standby: 600, ceiling: 1500,
+    iptv: { label: "MEO vs GEO", hold: true, active: 198, standby: 500 } },
 ];
 
-// Packet-loss suite. All impairment is auto-applied to the detected active link.
+// Packet-loss suite. IPTV spec (per the page): constant +2%/60s from the start
+// (no 3-min hold); periodic = escalating on/off loss; random = escalating random
+// loss to a threshold. All end on the first switch.
 const PL_TCS = [
-  { tc: "PL_TC1", label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 20 },
-  { tc: "PL_TC2", label: "Burst Loss", plType: "burst" },
-  { tc: "PL_TC3", label: "Random Loss", plType: "random" },
+  { tc: "PL_TC1", label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 20,
+    iptv: { label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 20, holdSec: 0 } },
+  { tc: "PL_TC2", label: "Burst Loss", plType: "burst",
+    iptv: { label: "Periodic Loss", plType: "periodic", initialPct: 2, stepPct: 2, ceilingPct: 6, onSec: 20, offSec: 20 } },
+  { tc: "PL_TC3", label: "Random Loss", plType: "random",
+    iptv: { label: "Random Loss", plType: "random", escalate: true, initialPct: 2, stepPct: 2, ceilingPct: 12,
+            minGap: 10, maxGap: 30, minDur: 5, maxDur: 15 } },
 ];
 
-const HOLD_SEC = 180;        // 3-minute hold / stabilize / clean pre-hold
-const STEP_MS = 50;          // latency ramp step
+const HOLD_SEC = 180;        // 3-minute hold / stabilize / clean pre-hold (SLA mode)
+const STEP_MS = 50;          // latency ramp step (SLA mode)
 const STEP_INTERVAL_SEC = 60; // one step per minute
 const TAIL_SEC = 60;         // continue monitoring after ceiling reached
 
-/** Build the ordered case list. Default = full 6×7=42 matrix; pass a single
- *  ToS (e.g. ["0x04"]) for a 2×7=14 IPTV-style run. */
-function buildMatrix(tosList) {
+/** Build the ordered case list, resolving each case for the run mode.
+ *  tosList: default = full 6×7=42 matrix; a single ToS → 2×7=14. iptv: use the
+ *  IPTV spec (explicit steps / fixed holds / periodic+escalating loss). */
+function buildMatrix(tosList, iptv) {
   const list = (Array.isArray(tosList) && tosList.length) ? tosList : TOS_LIST;
   const cases = [];
   let n = 0;
@@ -86,22 +100,36 @@ function buildMatrix(tosList) {
     for (const tos of list) {
       for (const t of LATENCY_TCS) {
         n++;
-        cases.push({
+        const base = {
           n, id: `${dir.short}_${tos}_${t.tc}`,
           direction: dir.key, dirShort: dir.short, dirLabel: dir.label, tos,
           suite: "latency", suiteLabel: "Latency",
-          testcase: t.tc, testLabel: t.label, baseline: !!t.baseline,
-          active: t.active, standby: t.standby, ceiling: t.ceiling,
-        });
+          testcase: t.tc, baseline: !!t.baseline,
+        };
+        if (iptv) {
+          const i = t.iptv || {};
+          const steps = i.steps ? (i.steps[dir.key] || []) : null;
+          cases.push({ ...base, testLabel: i.label || t.label,
+            steps, hold: !!i.hold,
+            active: steps && steps.length ? steps[0] : (i.active != null ? i.active : t.active),
+            standby: i.standby != null ? i.standby : t.standby, ceiling: null });
+        } else {
+          cases.push({ ...base, testLabel: t.label,
+            active: t.active, standby: t.standby, ceiling: t.ceiling, steps: null, hold: false });
+        }
       }
       for (const t of PL_TCS) {
         n++;
+        const spec = iptv ? (t.iptv || {}) : t;
         cases.push({
           n, id: `${dir.short}_${tos}_${t.tc}`,
           direction: dir.key, dirShort: dir.short, dirLabel: dir.label, tos,
           suite: "packet-loss", suiteLabel: "Packet Loss",
-          testcase: t.tc, testLabel: t.label, plType: t.plType,
-          initialPct: t.initialPct, stepPct: t.stepPct, ceilingPct: t.ceilingPct,
+          testcase: t.tc, testLabel: (iptv && t.iptv && t.iptv.label) || t.label,
+          plType: spec.plType || t.plType,
+          initialPct: spec.initialPct, stepPct: spec.stepPct, ceilingPct: spec.ceilingPct,
+          onSec: spec.onSec, offSec: spec.offSec, escalate: !!spec.escalate, holdSec: spec.holdSec,
+          minGap: spec.minGap, maxGap: spec.maxGap, minDur: spec.minDur, maxDur: spec.maxDur,
         });
       }
     }
@@ -109,25 +137,34 @@ function buildMatrix(tosList) {
   return cases;
 }
 
-/** Per-case observation window in seconds. In IPTV mode cases end on the first
- *  link switch (see buildTc), so these are the ceilings used only when NO switch
- *  occurs — packet-loss is deliberately kept under 10 minutes. */
+/** Per-case observation window in seconds. IPTV cases end on the first switch,
+ *  so these are the ceilings used only when NO switch occurs. */
 function caseWindowSec(c, params) {
   const iptv = params && params.iptvMode;
   let sec;
   if (c.suite === "latency") {
     if (c.baseline) sec = 300;
-    else {
+    else if (c.steps && c.steps.length) sec = c.steps.length * STEP_INTERVAL_SEC + TAIL_SEC; // explicit sequence
+    else if (c.hold) sec = 300;                                                              // fixed-hold observe
+    else {                                                                                   // SLA uniform ramp
       const steps = Math.ceil((c.ceiling - c.active) / STEP_MS);
       sec = HOLD_SEC + steps * STEP_INTERVAL_SEC + TAIL_SEC;
-      if (iptv) sec = Math.min(sec, 600); // ≤10 min if no switch
     }
   } else if (c.plType === "constant") {
+    const hold = c.holdSec != null ? c.holdSec : HOLD_SEC;
     const steps = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct);
-    sec = HOLD_SEC + steps * STEP_INTERVAL_SEC + TAIL_SEC;
-    if (iptv) sec = Math.min(sec, 480); // PL: do not run ~10 min — cap at 8
+    sec = hold + steps * STEP_INTERVAL_SEC + TAIL_SEC;
+    if (iptv) sec = Math.min(sec, 480);
+  } else if (c.plType === "periodic") {
+    const cycles = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct) + 1;
+    sec = cycles * ((c.onSec || 20) + (c.offSec || 20)) + TAIL_SEC;
+    if (iptv) sec = Math.min(sec, 480);
+  } else if (c.plType === "random" && iptv && c.escalate) {
+    const events = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct) + 1;
+    sec = events * ((c.maxGap || 30) + (c.maxDur || 15)) + TAIL_SEC;
+    sec = Math.min(sec, 480);
   } else {
-    sec = HOLD_SEC + 120; // burst / random: 5-minute case (3-min clean + 2-min active)
+    sec = HOLD_SEC + 120; // SLA burst / random
   }
   const cap = parseInt(params && params.caseMaxSec, 10);
   if (cap && cap > 0) sec = Math.min(sec, cap);
@@ -135,10 +172,10 @@ function caseWindowSec(c, params) {
 }
 
 /**
- * Build the engine `tc` object (schedule driver) for a case.
+ * Build the engine `tc` object (schedule driver) for a resolved case.
  * `opts.iptv` adds IPTV-run behaviour: monitor + collect only the direction's
- * DMTS side (upstream→spoke, downstream→hub), end the case on the first link
- * switch, and collect the hourLog only.
+ * DMTS side (upstream→spoke, downstream→hub), end on the first link switch,
+ * and collect the hourLog only.
  */
 function buildTc(c, opts = {}) {
   const iptv = !!opts.iptv;
@@ -146,33 +183,49 @@ function buildTc(c, opts = {}) {
     ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true, hourlogOnly: true }
     : {};
   if (c.suite === "latency") {
+    let rampPlan = null;
+    if (!c.baseline) {
+      if (c.steps && c.steps.length) {
+        rampPlan = { initialActiveMs: c.steps[0], standbyMs: c.standby, steps: c.steps,
+                     intervalSec: STEP_INTERVAL_SEC, stabilizeSec: 0 };
+      } else if (c.hold) {
+        rampPlan = { initialActiveMs: c.active, standbyMs: c.standby, hold: true, stabilizeSec: 0 };
+      } else {
+        rampPlan = { initialActiveMs: c.active, standbyMs: c.standby, stabilizeSec: HOLD_SEC,
+                     stepMs: STEP_MS, intervalSec: STEP_INTERVAL_SEC, ceilingMs: c.ceiling };
+      }
+    }
     return {
       n: c.n, name: c.id, mode: "latency",
       link1: { delayMs: c.active, lossPct: 0 },
       link2: { delayMs: c.standby, lossPct: 0 },
-      expectSwitch: !c.baseline, baseline: c.baseline,
-      observeOnly: true,
-      rampPlan: c.baseline ? null : {
-        initialActiveMs: c.active, standbyMs: c.standby,
-        stabilizeSec: HOLD_SEC, stepMs: STEP_MS,
-        intervalSec: STEP_INTERVAL_SEC, ceilingMs: c.ceiling,
-      },
-      ...iptvFields,
+      expectSwitch: !c.baseline, baseline: c.baseline, observeOnly: true,
+      rampPlan, ...iptvFields,
     };
   }
   const none = { delayMs: 0, lossPct: 0 };
-  const base =
-    c.plType === "constant"
-      ? { rampStepPct: c.stepPct, rampIntervalSec: STEP_INTERVAL_SEC, stabilizeSec: HOLD_SEC, rampMaxPct: c.ceilingPct }
-      : c.plType === "burst"
-        ? { preHoldSec: HOLD_SEC, burstLossPct: 5, burstDurationSec: 7, burstIntervalSec: 30 }
-        : { preHoldSec: HOLD_SEC, randomLossPct: 5, randomMinGapSec: 20, randomMaxGapSec: 60, randomMinDurSec: 5, randomMaxDurSec: 15 };
+  let base;
+  if (c.plType === "constant") {
+    base = { rampStepPct: c.stepPct, rampIntervalSec: STEP_INTERVAL_SEC,
+             stabilizeSec: c.holdSec != null ? c.holdSec : HOLD_SEC, rampMaxPct: c.ceilingPct };
+  } else if (c.plType === "periodic") {
+    base = { initialPct: c.initialPct, stepPct: c.stepPct, ceilingPct: c.ceilingPct,
+             onSec: c.onSec || 20, offSec: c.offSec || 20 };
+  } else if (c.plType === "random" && c.escalate) {
+    base = { escalate: true, initialPct: c.initialPct, stepPct: c.stepPct, ceilingPct: c.ceilingPct,
+             randomMinGapSec: c.minGap || 10, randomMaxGapSec: c.maxGap || 30,
+             randomMinDurSec: c.minDur || 5, randomMaxDurSec: c.maxDur || 15 };
+  } else if (c.plType === "burst") {
+    base = { preHoldSec: iptv ? 0 : HOLD_SEC, burstLossPct: 5, burstDurationSec: 7, burstIntervalSec: 30 };
+  } else {
+    base = { preHoldSec: iptv ? 0 : HOLD_SEC, randomLossPct: 5,
+             randomMinGapSec: 20, randomMaxGapSec: 60, randomMinDurSec: 5, randomMaxDurSec: 15 };
+  }
   const plPlan = iptv ? { ...base, endOnSwitch: true } : base;
   return {
     n: c.n, name: c.id, mode: "packet-loss", plType: c.plType,
     link1: none, link2: none, expectSwitch: true, observeOnly: true,
-    describe: initialConfig(c), plPlan,
-    ...iptvFields,
+    describe: initialConfig(c), plPlan, ...iptvFields,
   };
 }
 
@@ -181,10 +234,18 @@ function buildTc(c, opts = {}) {
  * ========================================================================= */
 
 function initialConfig(c) {
-  if (c.suite === "latency") return `Active ${c.active} ms / Standby ${c.standby} ms`;
-  if (c.plType === "constant") return `Active ${c.initialPct}% loss / Standby clean`;
-  if (c.plType === "burst") return `Active 5% burst (7s every 30s) / Standby clean`;
-  return `Active 5% random (gap 20-60s, dur 5-15s) / Standby clean`;
+  if (c.suite === "latency") {
+    if (c.baseline) return "Active 0 ms / Standby 0 ms (baseline)";
+    if (c.steps && c.steps.length) return `Active LEO ramp [${c.steps.join(", ")}] ms / Standby ${c.standby} ms`;
+    if (c.hold) return `Active ${c.active} ms / Standby ${c.standby} ms (fixed hold)`;
+    return `Active ${c.active} ms / Standby ${c.standby} ms`;
+  }
+  if (c.plType === "constant") return `Active ${c.initialPct}% loss, +${c.stepPct}%/min / Standby clean`;
+  if (c.plType === "periodic") return `Active periodic ${c.initialPct}→${c.ceilingPct}% (on ${c.onSec || 20}s/off ${c.offSec || 20}s) / Standby clean`;
+  if (c.plType === "random") return c.escalate
+    ? `Active random ${c.initialPct}→${c.ceilingPct}% / Standby clean`
+    : `Active 5% random (gap 20-60s, dur 5-15s) / Standby clean`;
+  return `Active 5% burst (7s every 30s) / Standby clean`;
 }
 
 function finalConfig(c, r) {
@@ -192,14 +253,20 @@ function finalConfig(c, r) {
   if (c.suite === "latency") {
     if (c.baseline) return "No impairment (baseline)";
     if (sw && r.switchLatencyMs != null) return `Active reached ${r.switchLatencyMs} ms at switch`;
-    if (r && r.latencyRamp && r.latencyRamp.maxReached) return `Active ramped to ceiling ${c.ceiling} ms (no switch)`;
-    return `Active ramped up to ${c.ceiling} ms; window ended`;
+    if (sw) return "Switched";
+    if (c.steps && c.steps.length) return `Active stepped to ${c.steps[c.steps.length - 1]} ms (no switch)`;
+    if (c.hold) return `Held active ${c.active} ms / standby ${c.standby} ms — no switch`;
+    return `Active ramped to ceiling ${c.ceiling} ms (no switch)`;
   }
-  if (c.plType === "constant") {
-    if (sw) return "Switch during loss ramp";
-    return `Reached ${c.ceilingPct}% loss (no switch)`;
+  if (sw) {
+    return c.plType === "constant" ? "Switch during loss ramp"
+      : c.plType === "periodic" ? "Switch during periodic loss"
+        : "Switch during random loss";
   }
-  return sw ? "Switch during impairment" : `${c.plType} loss applied for the window (no switch)`;
+  if (c.plType === "constant") return `Reached ${c.ceilingPct}% loss (no switch)`;
+  if (c.plType === "periodic") return `Periodic loss reached ${c.ceilingPct}% (no switch)`;
+  if (c.plType === "random" && c.escalate) return `Random loss reached ${c.ceilingPct}% (no switch)`;
+  return `${c.plType} loss applied for the window (no switch)`;
 }
 
 /** Neutral observation string for the Status column — never PASS/FAIL. */
@@ -247,7 +314,7 @@ function clearState() {
 function stateSummary() {
   const st = loadState();
   if (!st) return null;
-  const matrix = buildMatrix(st.tosList);
+  const matrix = buildMatrix(st.tosList, st.iptvMode);
   const total = st.total || matrix.length;
   const completed = new Set(st.completed || []);
   const next = matrix.find((c) => !completed.has(c.id));
@@ -350,43 +417,48 @@ function configurationTable(c, r, baseMeta) {
 
 function testConfigurationTable(c) {
   const row = (k, v) => `<tr><th>${e(k)}</th><td>${e(v)}</td></tr>`;
+  const tbl = (rows) => `<h4>Test Configuration</h4><table><tbody>${rows}</tbody></table>`;
   if (c.suite === "latency") {
     if (c.baseline) {
-      return `<h4>Test Configuration</h4><table><tbody>` +
-        row("Active Link Delay", "0 ms") + row("Standby Link Delay", "0 ms") +
-        row("Hold Time", "5 min (observe)") + row("Increment", "none") +
-        row("Maximum Delay", "0 ms") + `</tbody></table>`;
+      return tbl(row("Active Link Delay", "0 ms") + row("Standby Link Delay", "0 ms") +
+        row("Hold Time", "5 min (observe)") + row("Increment", "none") + row("Maximum Delay", "0 ms"));
     }
-    return `<h4>Test Configuration</h4><table><tbody>` +
-      row("Active Link Delay", `${c.active} ms`) +
-      row("Standby Link Delay", `${c.standby} ms`) +
-      row("Hold Time", "3 min") +
-      row("Increment", "50 ms every minute") +
-      row("Maximum Delay", `${c.ceiling} ms`) +
-      `</tbody></table>`;
+    if (c.steps && c.steps.length) { // explicit LEO ramp sequence
+      return tbl(row("Active Link", "LEO (ramped)") +
+        row("Latency Sequence", `${c.steps.join(", ")} ms`) +
+        row("Standby Link Delay", `${c.standby} ms`) +
+        row("Step Interval", "60 s per step (ends on switch)") +
+        row("Maximum Delay", `${c.steps[c.steps.length - 1]} ms`));
+    }
+    if (c.hold) { // fixed hold (LEO-vs-MEO / MEO-vs-GEO)
+      return tbl(row("Active Link Delay", `${c.active} ms (fixed)`) +
+        row("Standby Link Delay", `${c.standby} ms (fixed)`) +
+        row("Hold Time", "5 min (observe)") + row("Increment", "none"));
+    }
+    return tbl(row("Active Link Delay", `${c.active} ms`) + row("Standby Link Delay", `${c.standby} ms`) +
+      row("Hold Time", "3 min") + row("Increment", "50 ms every minute") + row("Maximum Delay", `${c.ceiling} ms`));
   }
   if (c.plType === "constant") {
-    return `<h4>Test Configuration</h4><table><tbody>` +
-      row("Initial Loss", `${c.initialPct}%`) +
-      row("Hold Time", "3 min") +
-      row("Increment", `${c.stepPct}% every minute`) +
-      row("Maximum Loss", `${c.ceilingPct}%`) +
-      `</tbody></table>`;
+    return tbl(row("Initial Loss", `${c.initialPct}%`) +
+      row("Hold Time", (c.holdSec != null ? c.holdSec : 180) === 0 ? "none (ramp from start)" : "3 min") +
+      row("Increment", `${c.stepPct}% every 60 s`) + row("Maximum Loss", `${c.ceilingPct}%`));
+  }
+  if (c.plType === "periodic") {
+    return tbl(row("Pattern", `on ${c.onSec || 20} s / off ${c.offSec || 20} s`) +
+      row("Initial Loss", `${c.initialPct}%`) + row("Escalation", `+${c.stepPct}% per cycle`) +
+      row("Maximum Loss", `${c.ceilingPct}%`) + row("End", "on first link switch"));
+  }
+  if (c.plType === "random" && c.escalate) {
+    return tbl(row("Pattern", `random gap ${c.minGap || 10}–${c.maxGap || 30} s, dur ${c.minDur || 5}–${c.maxDur || 15} s`) +
+      row("Initial Loss", `${c.initialPct}%`) + row("Escalation", `+${c.stepPct}% per event`) +
+      row("Maximum Loss", `${c.ceilingPct}%`) + row("End", "on first link switch"));
   }
   if (c.plType === "burst") {
-    return `<h4>Test Configuration</h4><table><tbody>` +
-      row("Initial Loss", "clean") +
-      row("Hold Time", "3 min (clean)") +
-      row("Increment", "5% for 7 s every 30 s") +
-      row("Maximum Loss", "5% (burst)") +
-      `</tbody></table>`;
+    return tbl(row("Initial Loss", "clean") + row("Hold Time", "3 min (clean)") +
+      row("Increment", "5% for 7 s every 30 s") + row("Maximum Loss", "5% (burst)"));
   }
-  return `<h4>Test Configuration</h4><table><tbody>` +
-    row("Initial Loss", "clean") +
-    row("Hold Time", "3 min (clean)") +
-    row("Increment", "5% at random gap 20–60 s, dur 5–15 s") +
-    row("Maximum Loss", "5% (random)") +
-    `</tbody></table>`;
+  return tbl(row("Initial Loss", "clean") + row("Hold Time", "3 min (clean)") +
+    row("Increment", "5% at random gap 20–60 s, dur 5–15 s") + row("Maximum Loss", "5% (random)"));
 }
 
 /** Friendly label for an impairment event string. */
@@ -508,6 +580,17 @@ function observationsList(c, r) {
   items.push("Artifacts uploaded to Confluence.");
   if (r.errors && r.errors.length) items.push(`Errors: ${r.errors.join(" | ")}`);
   return `<h4>Observations</h4><ul>` + items.map((x) => `<li>${e(x)}</li>`).join("") + `</ul>`;
+}
+
+function commandsSection(r) {
+  const rows = [];
+  if (r.serverCmd) rows.push(["iperf3 server", r.serverCmd]);
+  if (r.clientCmd) rows.push(["iperf3 client", r.clientCmd]);
+  if (!rows.length) return "";
+  return `<h4>Commands</h4><table><tbody>` +
+    rows.map(([k, v]) => `<tr><th>${e(k)}</th><td><code>${e(v)}</code></td></tr>`).join("") +
+    `</tbody></table>` +
+    `<p style="font-size:11px;color:#64748b">Netem impairment applied via <code>tc</code> on the netem VM overlay ports — the exact per-step values are in Impairment Progression above.</p>`;
 }
 
 function screenshotsBlock(r) {
@@ -634,6 +717,7 @@ function detailSection(c, r, baseMeta) {
     heading +
     configurationTable(c, r, baseMeta) +
     testConfigurationTable(c) +
+    commandsSection(r) +
     executionTimeline(r) +
     trafficMovementTable(c, r) +
     impairmentProgression(c, r) +
@@ -736,7 +820,7 @@ async function runRegression(cfg, params, opts = {}) {
   let tosList = params && params.regressionTosList;
   if (typeof tosList === "string") tosList = tosList.split(",").map((s) => s.trim()).filter(Boolean);
   if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
-  const matrix = buildMatrix(tosList);
+  const matrix = buildMatrix(tosList, iptvMode);
 
   // Force the regression-safe drivers regardless of what the form carried.
   cfg.trafficDriver = "ssh";

@@ -53,12 +53,20 @@ Under **Regression options** you can pick a **single ToS** (blank = the full
 `0x04,0x24,0x38` matrix) and toggle **IPTV mode**:
 
 - **IPTV mode** — iperf3 traffic at one ToS → **14 cases** (7 scenarios ×
-  upstream/downstream, modelled on the *IPTV Testing* reference page). Each case
-  **ends on the first link switch** (packet-loss never runs the full ~10 min),
-  link switching is detected from the netem overlay interfaces, and on a switch
-  only the DMTS **hourLog** is collected — **Spoke** for upstream, **Hub** for
-  downstream (the other side is not shown/uploaded). Give it a different ToS per
-  traffic class per run.
+  upstream/downstream), with the test logic taken from the *IPTV Testing*
+  reference page:
+  - **Latency** — TC1 baseline (0/0, observe 5 min); TC2 steps the active (LEO)
+    link through an explicit per-direction sequence (upstream
+    `40,75,100,135,170,200,250` ms, downstream `25,40,75,110,135` ms); TC3 holds
+    LEO 30 / MEO 200 ms fixed; TC4 holds MEO 198 / GEO 500 ms fixed.
+  - **Packet loss** — constant `+2%/60 s` from the start (no 3-min hold);
+    periodic = escalating on/off loss (`+2%`/cycle to ~6%); random = escalating
+    random loss to a threshold. All end on the first link switch.
+  - Each case **ends on the first link switch**; switching is detected from the
+    netem overlay interfaces; on a switch only the DMTS **hourLog** is collected
+    — **Spoke** for upstream, **Hub** for downstream (other side not shown). The
+    report includes the iperf **commands** and the per-step impairment
+    progression. Give it a different ToS per traffic class per run.
 - **Off + blank ToS** — the original 42-case SLA matrix with full DMTS logs +
   Grid Diag Packs from both Spoke and Hub.
 

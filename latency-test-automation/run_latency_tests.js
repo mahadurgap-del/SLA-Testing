@@ -1564,19 +1564,47 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       const holdEnd = Math.min(deadline, Date.now() + s.preHoldSec * 1000);
       while (Date.now() < holdEnd && !isAborted() && !sync.switched) await sleep(2000);
     }
+    // s.escalate (IPTV): grow the random-loss magnitude each event until a
+    // switch / ceiling. Custom Run leaves it unset → fixed s.randomLossPct.
+    let rpct = s.escalate ? (s.initialPct != null ? s.initialPct : 2) : s.randomLossPct;
     while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000))) break;
       try {
         const det = await detectActiveLink(cfg);
-        await applyToLink(cfg, det.ports, { lossPct: s.randomLossPct }, impairedIfaces);
-        note(label(det), `random loss ${s.randomLossPct}%`);
+        await applyToLink(cfg, det.ports, { lossPct: rpct }, impairedIfaces);
+        note(label(det), `random loss ${rpct}%`);
         await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000);
         await clearLink(cfg, det.ports);
         note(label(det), "clear");
       } catch (e) {
         log(`WARN: random-loss event failed (${e.message}) — retrying after next gap`);
       }
+      if (s.escalate) rpct = Math.min(rpct + (s.stepPct != null ? s.stepPct : 2), s.ceilingPct != null ? s.ceilingPct : 12);
+    }
+  } else if (plType === "periodic") {
+    // Escalating PERIODIC loss (IPTV): apply pct for onSec, clear for offSec,
+    // +stepPct each cycle until switch / ceiling. New type — Custom Run never
+    // uses it, so this is purely additive.
+    let pct = s.initialPct != null ? s.initialPct : 2;
+    const onSec = s.onSec != null ? s.onSec : 20;
+    const offSec = s.offSec != null ? s.offSec : 20;
+    const ceil = s.ceilingPct != null ? s.ceilingPct : 6;
+    const step = s.stepPct != null ? s.stepPct : 2;
+    while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
+      try {
+        const det = await detectActiveLink(cfg);
+        await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
+        note(label(det), `periodic loss ${pct}% (on ${onSec}s)`);
+        await sleepWithin(deadline, onSec * 1000);
+        await clearLink(cfg, det.ports);
+        note(label(det), `clear (off ${offSec}s)`);
+      } catch (e) {
+        log(`WARN: periodic cycle failed (${e.message}) — retrying next cycle`);
+      }
+      if (s.endOnSwitch && sync.switched) break;
+      pct = Math.min(pct + step, ceil);
+      if (!(await sleepWithin(deadline, offSec * 1000))) break;
     }
   } else {
     throw new Error(`unknown packet-loss type: ${plType}`);
@@ -1683,6 +1711,35 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     note(label(standby), `delay ${lo}ms (standby link)`);
   } else if (lo > 0) {
     log(`WARN: no second link found — set NETEM_CANDIDATE_IFACES; skipping the ${lo}ms side`);
+  }
+
+  // Regression plan variant A — explicit step SEQUENCE on the active link
+  // (IPTV LEO ramp, e.g. up [40,75,100,135,170,200,250]). steps[0] is the
+  // initial already applied above; step through the rest one per intervalSec,
+  // end on switch, then hold the final value until the window closes.
+  if (plan && Array.isArray(plan.steps) && plan.steps.length) {
+    const steps = plan.steps;
+    log(`${tc.name}: stepping active-link latency through [${steps.join(", ")}] ms every ${r.intervalSec}s — end on switch`);
+    for (let i = 1; i < steps.length && Date.now() < deadline && !isAborted() && !sync.switched; i++) {
+      if (!(await sleepWithin(deadline, r.intervalSec * 1000))) break;
+      if (sync.switched) break;
+      try {
+        await applyToLink(cfg, activePorts, { delayMs: steps[i] }, impairedIfaces);
+        current = steps[i];
+        sync.currentMs = current;
+        note(label(det), `step delay ${current}ms`);
+      } catch (e) { log(`WARN: step to ${steps[i]}ms failed (${e.message}) — retrying next interval`); }
+    }
+    if (!sync.switched) note(label(det), `reached final step ${current}ms — holding until test ends`);
+    return events;
+  }
+
+  // Regression plan variant B — fixed HOLD (IPTV LEO-vs-MEO / MEO-vs-GEO): keep
+  // active + standby fixed for the whole window and observe (no ramp).
+  if (plan && plan.hold) {
+    log(`${tc.name}: holding active ${current}ms / standby ${lo}ms for ${Math.round(durationMs / 1000)}s — observing for a switch`);
+    setStatus({ netem: `holding ${current}ms (standby ${lo}ms)` });
+    return events;
   }
 
   // DEFAULT (ramp disabled): hold the configured values for the whole window
