@@ -307,7 +307,8 @@ const server = http.createServer(async (req, res) => {
       if (body.iptvServerIp && String(body.iptvServerIp).trim()) p.iptvServerIp = String(body.iptvServerIp).trim();
       if (body.iptvPort && String(body.iptvPort).trim()) p.iptvPort = String(body.iptvPort).trim();
       if (body.iptvFlows && String(body.iptvFlows).trim()) p.iptvFlows = String(body.iptvFlows).trim();
-      if (body.iptvBw && String(body.iptvBw).trim()) p.iptvBw = String(body.iptvBw).trim();
+      if (body.iptvBwUp && String(body.iptvBwUp).trim()) p.iptvBwUp = String(body.iptvBwUp).trim();
+      if (body.iptvBwDown && String(body.iptvBwDown).trim()) p.iptvBwDown = String(body.iptvBwDown).trim();
       if (body.iptvPktLen && String(body.iptvPktLen).trim()) p.iptvPktLen = String(body.iptvPktLen).trim();
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
@@ -433,10 +434,12 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <input name="iptvServerIp" value="10.40.2.2" placeholder="10.40.2.2"><div class="errmsg"></div></div>
     <div><label>Server port</label>
       <input name="iptvPort" value="5201" placeholder="5201"><div class="errmsg"></div></div>
-    <div><label>Flows (parallel iperf streams)</label>
-      <input name="iptvFlows" value="1" placeholder="1"><div class="errmsg"></div></div>
-    <div><label>Per-flow bandwidth</label>
-      <input name="iptvBw" value="8M" placeholder="8M"><div class="errmsg"></div></div>
+    <div><label>Flows (-P parallel streams)</label>
+      <input name="iptvFlows" value="10" placeholder="10"><div class="errmsg"></div></div>
+    <div><label>Upstream per-flow bandwidth (spoke)</label>
+      <input name="iptvBwUp" value="3M" placeholder="3M"><div class="errmsg"></div></div>
+    <div><label>Downstream per-flow bandwidth (hub)</label>
+      <input name="iptvBwDown" value="6M" placeholder="6M"><div class="errmsg"></div></div>
     <div><label>Packet size (-l bytes)</label>
       <input name="iptvPktLen" value="1200" placeholder="1200"><div class="errmsg"></div></div>
     <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode runs the IPTV-page test logic for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>). Latency TC2 steps the active LEO link through the page sequences (up 40&hellip;250, down 25&hellip;135); TC3/TC4 hold LEO-vs-MEO / MEO-vs-GEO fixed; packet-loss is constant +2%/min, escalating periodic, and escalating random. Each case <b>ends on the first link switch</b>, detected from the netem overlay interfaces; on switch only the DMTS <b>hourLog</b> is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix.</div>

@@ -923,12 +923,15 @@ async function runRegression(cfg, params, opts = {}) {
       }
       log(`${c.id}: overlay netem cleared (${overlayPorts.join(",")}) — clean baseline`);
 
-      // IPTV mode traffic pattern (operator-specified):
-      //   iperf3 -u -c 10.40.2.2 -p 5201 -b 8M -l 1200   (single UDP flow,
-      //   1200-byte packets, to the overlay data-plane IP so it routes through
-      //   the DMTS spoke→hub path). Overridable via iptv* params.
-      const caseBw = state.iptvMode ? (params.iptvBw || "8M") : params.bandwidth;
-      const caseStreams = state.iptvMode ? (params.iptvFlows || "1") : params.parallelStreams;
+      // IPTV mode traffic pattern (operator-specified), per direction:
+      //   upstream (spoke):   iperf3 -u -c 10.40.2.2 -p 5201 -b 3M -l 1200 -P 10  (30 Mbps)
+      //   downstream (hub):   iperf3 -u -c 10.40.2.2 -p 5201 -b 6M -l 1200 -P 10  (60 Mbps)
+      // 1200-byte packets to the overlay data-plane IP; -S <tos> per case.
+      // Overridable via iptvBwUp/iptvBwDown/iptvFlows/iptvPktLen/iptvServerIp/iptvPort.
+      const caseBw = state.iptvMode
+        ? (c.direction === "downstream" ? (params.iptvBwDown || "6M") : (params.iptvBwUp || "3M"))
+        : params.bandwidth;
+      const caseStreams = state.iptvMode ? (params.iptvFlows || "10") : params.parallelStreams;
       const caseServerIp = state.iptvMode
         ? (params.iptvServerIp || params.serverTrafficIp || "10.40.2.2")
         : (params.serverTrafficIp || params.serverIp);
