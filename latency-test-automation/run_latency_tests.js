@@ -1431,10 +1431,16 @@ async function applyNetemImpairment(cfg, iface, spec) {
   const parts = [];
   if (spec.delayMs) parts.push(`delay ${spec.delayMs}ms`);
   if (spec.lossPct) parts.push(`loss ${spec.lossPct}%`);
+  // netem's default queue is 1000 packets. High-rate UDP + high delay overflows
+  // it and drops ~everything (shows as huge spurious "loss"). Give it a large
+  // limit so the CONFIGURED delay/loss is what's applied — buffering, not drops.
+  // (Override with NETEM_LIMIT env; default 500000 packets ~ caps at need, never
+  // actually fills beyond rate*delay.)
+  const netemLimit = parseInt(envOr("NETEM_LIMIT", "500000"), 10);
   const conn = await sshConnect(cfg.netemSsh);
   try {
     const cmd = parts.length
-      ? `tc qdisc replace dev ${iface} root netem ${parts.join(" ")}`
+      ? `tc qdisc replace dev ${iface} root netem limit ${netemLimit} ${parts.join(" ")}`
       : `tc qdisc del dev ${iface} root`;
     const r = await sudoExec(conn, cfg.netemSsh, cmd, { timeoutMs: 20000 });
     if (r.code !== 0 && parts.length) {

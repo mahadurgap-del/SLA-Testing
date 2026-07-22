@@ -897,18 +897,32 @@ async function runRegression(cfg, params, opts = {}) {
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
-      // IPTV mode: many 2M flows (>10) to the overlay DATA-PLANE server IP
-      // (default 10.40.2.2) so traffic routes through the DMTS spoke→hub path
-      // and DMTS forms managed flows to load-balance. Targeting the mgmt IP
-      // bypasses the overlay (DMTS sees nothing).
-      const caseBw = state.iptvMode ? (params.iptvBw || "2M") : params.bandwidth;
-      const caseStreams = state.iptvMode ? (params.iptvFlows || "40") : params.parallelStreams;
+      // CLEAN SLATE: clear netem on every overlay port before this case begins,
+      // so a case never inherits the previous case's latency/loss (don't rely on
+      // the prior case's teardown). Each case starts from a known-clean baseline.
+      const overlayPorts = (cfg.netemCandidates && cfg.netemCandidates.length)
+        ? cfg.netemCandidates : ["ens192", "ens193", "ens224", "ens225"];
+      for (const iface of overlayPorts) {
+        try { await engine.clearNetemImpairment(cfg, iface); }
+        catch (e) { log(`WARN: pre-case netem clear ${iface}: ${e.message}`); }
+      }
+      log(`${c.id}: overlay netem cleared (${overlayPorts.join(",")}) — clean baseline`);
+
+      // IPTV mode traffic pattern (operator-specified):
+      //   iperf3 -u -c 10.40.2.2 -p 5201 -b 8M -l 1200   (single UDP flow,
+      //   1200-byte packets, to the overlay data-plane IP so it routes through
+      //   the DMTS spoke→hub path). Overridable via iptv* params.
+      const caseBw = state.iptvMode ? (params.iptvBw || "8M") : params.bandwidth;
+      const caseStreams = state.iptvMode ? (params.iptvFlows || "1") : params.parallelStreams;
       const caseServerIp = state.iptvMode
         ? (params.iptvServerIp || params.serverTrafficIp || "10.40.2.2")
         : (params.serverTrafficIp || params.serverIp);
+      const casePort = state.iptvMode ? (params.iptvPort || "5201") : params.serverPort;
+      const casePkt = state.iptvMode ? (params.iptvPktLen || "1200") : params.packetSize;
       const cmds = engine.buildTrafficCommands({
         ...params, trafficDirection: c.direction, tos: c.tos,
         bandwidth: caseBw, parallelStreams: caseStreams, serverTrafficIp: caseServerIp,
+        serverPort: casePort, packetSize: casePkt,
       });
       const traffic = {
         type: String(params.trafficType || "UDP").toUpperCase(),
