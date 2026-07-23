@@ -64,7 +64,8 @@ const LATENCY_TCS = [
     iptv: { label: "Baseline" } },
   { tc: "TC2", label: "LEO", active: 30, standby: 0, ceiling: 130,
     iptv: { label: "LEO Latency", standby: 0,
-            steps: { upstream: [40, 75, 100, 135, 170, 200, 250], downstream: [25, 40, 75, 110, 135] } } },
+            steps: { upstream: [40, 75, 100, 135, 170, 200, 250, 300, 350, 400],
+                     downstream: [25, 40, 75, 110, 135, 175, 215, 260, 320, 400] } } },
   { tc: "TC3", label: "LEO vs MEO", active: 30, standby: 150, ceiling: 400,
     iptv: { label: "LEO vs MEO", hold: true, active: 30, standby: 200 } },
   { tc: "TC4", label: "MEO vs GEO", active: 150, standby: 600, ceiling: 1500,
@@ -76,11 +77,11 @@ const LATENCY_TCS = [
 // loss to a threshold. All end on the first switch.
 const PL_TCS = [
   { tc: "PL_TC1", label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 20,
-    iptv: { label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 20, holdSec: 0 } },
+    iptv: { label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 30, holdSec: 0 } },
   { tc: "PL_TC2", label: "Burst Loss", plType: "burst",
-    iptv: { label: "Periodic Loss", plType: "periodic", initialPct: 2, stepPct: 2, ceilingPct: 6, onSec: 20, offSec: 20 } },
+    iptv: { label: "Periodic Loss", plType: "periodic", initialPct: 2, stepPct: 2, ceilingPct: 30, onSec: 20, offSec: 20 } },
   { tc: "PL_TC3", label: "Random Loss", plType: "random",
-    iptv: { label: "Random Loss", plType: "random", escalate: true, initialPct: 2, stepPct: 2, ceilingPct: 12,
+    iptv: { label: "Random Loss", plType: "random", escalate: true, initialPct: 2, stepPct: 2, ceilingPct: 30,
             minGap: 10, maxGap: 30, minDur: 5, maxDur: 15 } },
 ];
 
@@ -635,7 +636,7 @@ function resultTable(c, r) {
  * ========================================================================= */
 
 const IPTV_HEADER =
-  "<tr>" + ["Testcase", "Logs", "Commands", "Results"].map((h) => `<th>${h}</th>`).join("") + "</tr>";
+  "<tr>" + ["S.No", "Testcase", "Logs", "Commands", "Results"].map((h) => `<th>${h}</th>`).join("") + "</tr>";
 
 /** Column 1 — Testcase: traffic type / direction / suite+TC / ToS / config. */
 function tcCell(c, r) {
@@ -706,7 +707,7 @@ function resultsCell(c, r) {
 
 /** One IPTV-style table row for a completed case. */
 function iptvRow(c, r) {
-  return `<tr><td>${tcCell(c, r)}</td><td>${logsCell(c, r)}</td>` +
+  return `<tr><td>${c.n}</td><td>${tcCell(c, r)}</td><td>${logsCell(c, r)}</td>` +
     `<td>${commandsCell(c, r)}</td><td>${resultsCell(c, r)}</td></tr>`;
 }
 
@@ -835,7 +836,10 @@ async function runRegression(cfg, params, opts = {}) {
     if (typeof tosList === "string") tosList = tosList.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
     if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
   }
-  const matrix = buildMatrix(tosList, iptvMode);
+  let matrix = buildMatrix(tosList, iptvMode);
+  // --only <ids>: run just those cases as a self-contained set (keeps each
+  // case's real S.No; total reflects the subset). Used for targeted re-runs.
+  if (opts.only && opts.only.size) matrix = matrix.filter((c) => opts.only.has(c.id));
 
   if (!state) {
     state = {
