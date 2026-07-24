@@ -840,6 +840,14 @@ async function runRegression(cfg, params, opts = {}) {
   // --only <ids>: run just those cases as a self-contained set (keeps each
   // case's real S.No; total reflects the subset). Used for targeted re-runs.
   if (opts.only && opts.only.size) matrix = matrix.filter((c) => opts.only.has(c.id));
+  // Optional PL loss-ceiling override (e.g. --lossmax=15): cap every packet-loss
+  // case's escalation ceiling so no case applies more than N% loss.
+  const lossCap = parseInt(params && params.iptvLossCeiling, 10);
+  if (lossCap > 0) {
+    for (const c of matrix) if (c.suite === "packet-loss" && c.ceilingPct != null) {
+      c.ceilingPct = Math.min(c.ceilingPct, lossCap);
+    }
+  }
 
   if (!state) {
     state = {
@@ -912,7 +920,7 @@ async function runRegression(cfg, params, opts = {}) {
       log(`########## CASE ${c.n}/${total} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
 
       const tc = buildTc(c, { iptv: state.iptvMode });
-      const durationMs = caseWindowSec(c, params) * 1000;
+      const durationMs = (params.forceCaseSec ? parseInt(params.forceCaseSec, 10) : caseWindowSec(c, params)) * 1000;
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
@@ -1048,6 +1056,10 @@ async function main() {
   if (tosArg) params.regressionTosList = tosArg.slice("--tos=".length);
   const maxArg = args.find((a) => a.startsWith("--max="));   // per-case window cap (s)
   if (maxArg) params.caseMaxSec = maxArg.slice("--max=".length);
+  const lossArg = args.find((a) => a.startsWith("--lossmax=")); // cap PL escalation ceiling (%)
+  if (lossArg) params.iptvLossCeiling = parseInt(lossArg.slice("--lossmax=".length), 10);
+  const winArg = args.find((a) => a.startsWith("--win="));   // force exact per-case window (s)
+  if (winArg) params.forceCaseSec = parseInt(winArg.slice("--win=".length), 10);
   const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
   const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
   const onlyArg = args.find((a) => a.startsWith("--only=")); // run only these case ids (smoke)
