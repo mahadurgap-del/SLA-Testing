@@ -1482,6 +1482,43 @@ async function clearNetemImpairment(cfg, iface) {
   }
 }
 
+/**
+ * Mandatory clean-up gate between test cases so every case is INDEPENDENT.
+ * Steps: (1) stop iperf on client+server, (2/3/4) clear all netem latency+loss
+ * on the overlay ports back to a clean 0ms/0% state, (5) verify the active link,
+ * (6) wait a short settle delay. Idempotent + best-effort — a failure on any
+ * host is logged, never fatal (the next case still starts as clean as possible).
+ * Returns the detected active link label (or null).
+ */
+async function resetLabBetweenCases(cfg, { settleSec = 3, label = "" } = {}) {
+  const tag = label ? `${label}: ` : "";
+  // 1. stop any leftover iperf on both traffic hosts (defensive — runTestCase
+  //    already stops its own traffic, but a crashed/interrupted case may leak).
+  for (const [name, creds] of [["client", cfg.clientSsh], ["server", cfg.serverSsh]]) {
+    if (!creds) continue;
+    try {
+      const conn = await sshConnect(creds);
+      try { await sshExec(conn, "pkill -9 -f iperf3 2>/dev/null; true", { timeoutMs: 15000 }); }
+      finally { conn.end(); }
+    } catch (e) { log(`WARN: ${tag}stop iperf on ${name} failed: ${(e.message || "").split("\n")[0]}`); }
+  }
+  // 2/3/4. clear latency + loss on every overlay port -> clean 0ms/0%
+  const ports = (cfg.netemCandidates && cfg.netemCandidates.length)
+    ? cfg.netemCandidates : ["ens192", "ens193", "ens224", "ens225"];
+  for (const iface of ports) {
+    try { await clearNetemImpairment(cfg, iface); }
+    catch (e) { log(`WARN: ${tag}netem clear ${iface} failed: ${(e.message || "").split("\n")[0]}`); }
+  }
+  // 5. verify the active link is up / stable (best-effort — informational).
+  let active = null;
+  try { const det = await detectActiveLink(cfg); active = (det && (det.bridge || (det.ports || []).join("+"))) || null; }
+  catch (e) { log(`WARN: ${tag}active-link check failed: ${(e.message || "").split("\n")[0]}`); }
+  // 6. short settle delay before the next case begins.
+  if (settleSec > 0) await sleep(settleSec * 1000);
+  log(`${tag}lab reset — iperf stopped, netem cleared on ${ports.join(",")}${active ? `, active link ${active}` : ""} (settled ${settleSec}s)`);
+  return active;
+}
+
 /** Sleep, but never past the deadline — and wake early on abort or when the
  *  optional stopFn() turns true (used to end impairment promptly on a switch). */
 async function sleepWithin(deadline, ms, stopFn) {
@@ -3220,6 +3257,7 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
+  resetLabBetweenCases,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,

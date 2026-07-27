@@ -960,16 +960,16 @@ async function runRegression(cfg, params, opts = {}) {
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
-      // CLEAN SLATE: clear netem on every overlay port before this case begins,
-      // so a case never inherits the previous case's latency/loss (don't rely on
-      // the prior case's teardown). Each case starts from a known-clean baseline.
-      const overlayPorts = (cfg.netemCandidates && cfg.netemCandidates.length)
-        ? cfg.netemCandidates : ["ens192", "ens193", "ens224", "ens225"];
-      for (const iface of overlayPorts) {
-        try { await engine.clearNetemImpairment(cfg, iface); }
-        catch (e) { log(`WARN: pre-case netem clear ${iface}: ${e.message}`); }
-      }
-      log(`${c.id}: overlay netem cleared (${overlayPorts.join(",")}) — clean baseline`);
+      // CLEAN SLATE: mandatory reset gate before every case so no case inherits
+      // the previous case's traffic or impairment. Stops iperf on both hosts,
+      // clears all latency+loss on every overlay port back to 0ms/0%, verifies
+      // the active link, and settles briefly. Belt-and-suspenders on top of
+      // runTestCase's own teardown — a crashed/interrupted case still leaves the
+      // next one a known-clean baseline.
+      await engine.resetLabBetweenCases(cfg, {
+        settleSec: params.iptvResetSettleSec != null ? params.iptvResetSettleSec : 3,
+        label: c.id,
+      });
 
       // IPTV mode traffic pattern (operator-specified), per direction:
       //   upstream (spoke):   iperf3 -u -c 10.40.2.2 -p 5201 -b 3M -l 1200 -P 10  (30 Mbps)
@@ -1085,7 +1085,9 @@ async function main() {
   })();
   const params = profiles.__default__;
   if (!params) { console.error("no saved profile (profiles.json __default__) — open the panel and Start once, or fill profiles.json"); process.exit(1); }
-  params.confluence = true;
+  // Confluence is optional: on by default, --no-confluence runs local-only
+  // (hourLogs + reports still land under SLA_Regression/).
+  params.confluence = !args.includes("--no-confluence");
   // CLI: --iptv enables IPTV mode; --tos=0x04[,0x24] restricts the ToS set.
   if (args.includes("--iptv")) params.iptvMode = true;
   const tosArg = args.find((a) => a.startsWith("--tos="));

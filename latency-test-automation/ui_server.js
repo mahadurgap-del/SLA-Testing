@@ -299,7 +299,10 @@ const server = http.createServer(async (req, res) => {
       const base = mergeSecrets(body);
       rememberDefaults(base);
       const p = { ...base, ...REGRESSION_FIXED };
-      p.confluence = true;
+      // Confluence is OPTIONAL: honour the form checkbox. When off, the run still
+      // collects DMTS hourLogs + writes per-case reports locally (SLA_Regression/),
+      // it just skips the page upload.
+      p.confluence = !!body.confluence;
       if (body.caseMaxSec) p.caseMaxSec = body.caseMaxSec;
       // IPTV / single-ToS options from the regression form
       p.iptvMode = !!body.iptvMode;
@@ -317,11 +320,13 @@ const server = http.createServer(async (req, res) => {
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
-      if (!p.confEmail) { check.ok = false; check.errors.confEmail = "required for Confluence upload"; }
-      if (!p.confToken) { check.ok = false; check.errors.confToken = "required (or set CONF_TOKEN env)"; }
-      if (!p.confPageId && !p.confSpace) {
-        check.ok = false;
-        check.errors.confPageId = "space key (to create the page in) or a page URL/ID (to create it under) required";
+      if (p.confluence) {
+        if (!p.confEmail) { check.ok = false; check.errors.confEmail = "required for Confluence upload"; }
+        if (!p.confToken) { check.ok = false; check.errors.confToken = "required (or set CONF_TOKEN env)"; }
+        if (!p.confPageId && !p.confSpace) {
+          check.ok = false;
+          check.errors.confPageId = "space key (to create the page in) or a page URL/ID (to create it under) required";
+        }
       }
       if (!check.ok) return json(res, 400, { ok: false, errors: check.errors });
 
@@ -422,7 +427,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <fieldset id="runtype"><legend>Run type</legend>
     <label><input type="radio" name="runtype" value="custom" style="width:auto" checked> <b>Custom Run</b> — configure and run a single traffic combination (existing behaviour)</label>
     <label><input type="radio" name="runtype" value="regression" style="width:auto"> <b>SLA Full Regression (6&#215;7 Matrix)</b> — one-click 42-case suite</label>
-    <p id="regNote">Regression mode runs the test cases automatically per the profile. You provide only the connection targets (Client / Server / Spoke / Hub / Netem VM), the ToS below, and Confluence credentials &mdash; runtime, latency &amp; packet-loss progression, log collection, reports and Confluence upload are all fixed by the profile. Results are observations only (no PASS/FAIL); each case is uploaded to one shared Confluence page immediately after it finishes, and the run resumes from where it left off if interrupted.</p>
+    <p id="regNote">Regression mode runs the test cases automatically per the profile. You provide only the connection targets (Client / Server / Spoke / Hub / Netem VM) and the ToS below &mdash; runtime, latency &amp; packet-loss progression, log collection and reports are all fixed by the profile. Results are observations only (no PASS/FAIL); the run resumes from where it left off if interrupted. <b>Confluence is optional</b>: leave &ldquo;Upload results to Confluence&rdquo; checked to publish each case to a shared page, or uncheck it to run local-only &mdash; DMTS hourLogs and per-case reports are always saved under <code>SLA_Regression/</code> regardless.</p>
   </fieldset>
 
   <fieldset class="reg-only"><legend>Regression options</legend><div class="grid">
@@ -877,10 +882,13 @@ async function startRegression(resume) {
     ? nTos + " ToS (" + (tosArr.join(", ") || "0x04, 0x24, 0x38") + ") \\u00d7 14 = " + (nTos * 14) +
       " cases, each ending on the first link switch"
     : "Full SLA matrix: 42 cases (2 directions \\u00d7 3 ToS \\u00d7 7)";
+  const confOn = form.querySelector('[name="confluence"]') && form.querySelector('[name="confluence"]').checked;
   if (!resume && !confirm(
     "Start the SLA regression?\\n\\n" +
     "\\u2022 " + scope + " \\u2014 runs automatically.\\n" +
-    "\\u2022 A new Confluence page is created and each test case is uploaded to it immediately.\\n" +
+    "\\u2022 " + (confOn
+      ? "A new Confluence page is created and each test case is uploaded to it immediately."
+      : "Confluence OFF \\u2014 hourLogs + reports are saved locally only (SLA_Regression/).") + "\\n" +
     "\\u2022 Observations only \\u2014 no PASS/FAIL.\\n\\n" +
     "You can Stop at any time and Resume later.")) return;
   startBtn.disabled = true;
