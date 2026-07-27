@@ -2412,6 +2412,11 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
         // snapshot anyway but flag it NOT COVERED rather than saving a capture
         // that predates the window (the exact failure seen on the flaky run).
         const cov = await waitForHourlogCoverage(monCreds, hourlogBaselineMs, durationMs, { maxWaitMs: 120000 });
+        // Record the DMTS CONTENT-time window so the analysis can match records by
+        // content-clock (the hourLog content lags wall-clock, so wall-clock windows
+        // from summary.json won't line up with the records).
+        result.hourlogContentStart = hourlogBaselineMs ? new Date(hourlogBaselineMs).toISOString() : null;
+        result.hourlogContentEnd = cov.recordMs ? new Date(cov.recordMs).toISOString() : null;
         if (cov.covered) {
           log(`${tc.name}: ${monSide} hourLog covers the window (content advanced ${cov.advancedSec}s) — snapshotting`);
         } else {
