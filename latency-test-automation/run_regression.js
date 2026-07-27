@@ -1111,6 +1111,8 @@ async function main() {
   if (winArg) params.forceCaseSec = parseInt(winArg.slice("--win=".length), 10);
   const stabArg = args.find((a) => a.startsWith("--stabilize=")); // post-switch stabilise before hourLog (s)
   if (stabArg) params.iptvStabilizeSec = parseInt(stabArg.slice("--stabilize=".length), 10);
+  const sipArg = args.find((a) => a.startsWith("--serverip=")); // overlay data-plane target IP
+  if (sipArg) params.iptvServerIp = sipArg.slice("--serverip=".length);
   const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
   const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
   const onlyArg = args.find((a) => a.startsWith("--only=")); // run only these case ids (smoke)

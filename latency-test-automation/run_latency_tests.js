@@ -704,19 +704,26 @@ function sftpGet(conn, remotePath, localPath) {
 async function preflight(cfg) {
   setStatus({ phase: "preflight" });
 
-  const httpCheck = async (name, url) => {
+  const httpCheck = async (name, url, { optional = false } = {}) => {
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), 10000);
       const resp = await fetch(url, { signal: ctrl.signal });
       clearTimeout(t);
       checkpoint(true, `${name} reachable`, `HTTP ${resp.status}`);
+      return true;
     } catch (e) {
-      checkpoint(false, `${name} reachable`, e.message);
+      checkpoint(!optional ? false : true, `${name} reachable`, optional ? `${e.message} (optional — skipping)` : e.message);
+      if (optional) { log(`WARN: ${name} unreachable at ${url} — ${e.message}; continuing (screenshots skipped)`); return false; }
       throw new Error(`${name} unreachable at ${url}: ${e.message}`);
     }
   };
-  await httpCheck("Netem UI", cfg.netemUiUrl);
+  // Netem UI is screenshot-only; netem is CONTROLLED over SSH (checked below), so
+  // a down UI must NOT block the run. Skip screenshots when it's unreachable.
+  if (cfg.netemUiUrl) {
+    const up = await httpCheck("Netem UI", cfg.netemUiUrl, { optional: true });
+    if (!up) cfg.netemUiUrl = null;
+  }
   if (cfg.gridUiSpoke) await httpCheck("Grid UI (spoke)", cfg.gridUiSpoke);
   if (cfg.gridUiHub) await httpCheck("Grid UI (hub)", cfg.gridUiHub);
 
@@ -1842,6 +1849,7 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
  * ========================================================================= */
 
 async function openNetemUi(cfg) {
+  if (!cfg.netemUiUrl) { log("netem UI disabled/unreachable — screenshots skipped"); return { browser: null, page: null }; }
   const browser = await chromium.launch({ headless: cfg.headless });
   const page = await browser.newPage();
   log(`opening netem UI ${cfg.netemUiUrl}`);
