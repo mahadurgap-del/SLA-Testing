@@ -1112,6 +1112,8 @@ function buildTrafficCommands(p) {
       if (streams && streams > 1) c += ` -P ${streams}`;
       if (tos) c += ` -S ${tos}`;
       if (pktSize) c += ` -l ${pktSize}`;
+      const interval = parsePosInt(p.reportInterval, { optional: true }).value;
+      if (interval) c += ` -i ${interval}`;
       if (cPort) c += ` --cport ${cPort}`;
       if (p.clientBindIp) c += ` -B ${p.clientBindIp}`;
       return { serverCmd, clientCmd: c };

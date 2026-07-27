@@ -876,12 +876,12 @@ async function runRegression(cfg, params, opts = {}) {
   // --only <ids>: run just those cases as a self-contained set (keeps each
   // case's real S.No; total reflects the subset). Used for targeted re-runs.
   if (opts.only && opts.only.size) matrix = matrix.filter((c) => opts.only.has(c.id));
-  // Optional PL loss-ceiling override (e.g. --lossmax=15): cap every packet-loss
-  // case's escalation ceiling so no case applies more than N% loss.
+  // Optional PL loss-ceiling override (e.g. --lossmax=13): SET every packet-loss
+  // case's escalation ceiling to N% — the max loss to push to if no switch occurs.
   const lossCap = parseInt(params && params.iptvLossCeiling, 10);
   if (lossCap > 0) {
     for (const c of matrix) if (c.suite === "packet-loss" && c.ceilingPct != null) {
-      c.ceilingPct = Math.min(c.ceilingPct, lossCap);
+      c.ceilingPct = lossCap;
     }
   }
 
@@ -990,10 +990,16 @@ async function runRegression(cfg, params, opts = {}) {
         : (params.serverTrafficIp || params.serverIp);
       const casePort = state.iptvMode ? (params.iptvPort || "5201") : params.serverPort;
       const casePkt = state.iptvMode ? (params.iptvPktLen || "1200") : params.packetSize;
+      const caseInterval = state.iptvMode ? (params.iptvInterval || "10") : params.reportInterval;
+      // iperf -t must cover the whole case window (+buffer) so traffic never
+      // stops mid-escalation; the case is actually ended by the monitor +
+      // stopTraffic (on switch/stabilise or window end), not by iperf's -t.
+      const caseDur = Math.round(durationMs / 1000) + 15;
       const cmds = engine.buildTrafficCommands({
         ...params, trafficDirection: c.direction, tos: c.tos,
         bandwidth: caseBw, parallelStreams: caseStreams, serverTrafficIp: caseServerIp,
-        serverPort: casePort, packetSize: casePkt,
+        serverPort: casePort, packetSize: casePkt, reportInterval: caseInterval,
+        durationSec: String(caseDur),
       });
       const traffic = {
         type: String(params.trafficType || "UDP").toUpperCase(),
