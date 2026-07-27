@@ -2280,6 +2280,55 @@ async function collectHourlogSnapshot(creds, destDir, tag) {
   }
 }
 
+/**
+ * Collect the DMTS DAY log: curLog/ holds TODAY's live day-log as
+ * <hour>/<5-min-bucket>.txt (same record format as hourLog), rotated at
+ * midnight into dmts_logs_0.tar.xz (gzip despite the .xz name; contains
+ * dayLog/<hour>/...). One end-of-run grab of curLog therefore covers every case
+ * window of the day — unlike hourLog, which only retains ~60 minutes. When
+ * `sinceMs` falls on a previous host-day (run crossed midnight), the rotated
+ * daily tars covering it are fetched too. Returns the local file paths.
+ */
+async function collectDayLog(creds, destDir, tag, { sinceMs = null } = {}) {
+  const conn = await sshConnect(creds);
+  const saved = [];
+  try {
+    fs.mkdirSync(destDir, { recursive: true });
+    // today's live day log (curLog)
+    const remoteTar = `/tmp/dmts_daylog_${tag}_$(hostname).tar.gz`;
+    log(`collecting DMTS day log (curLog) [${tag}]`);
+    const tar = await sudoExec(conn, creds,
+      `tar czf ${remoteTar} -C ${DMTS_LOG_DIR} curLog`, { timeoutMs: 600000 });
+    if (tar.code !== 0) throw new Error(`curLog tar failed (rc=${tar.code})`);
+    await sudoExec(conn, creds, `chown ${creds.user}:${creds.user} /tmp/dmts_daylog_${tag}_*.tar.gz`);
+    const { stdout } = await sshExec(conn, `ls -t /tmp/dmts_daylog_${tag}_*.tar.gz | head -1`);
+    const remotePath = stdout.trim();
+    const localPath = path.join(destDir, path.basename(remotePath));
+    await sftpGet(conn, remotePath, localPath);
+    await sshExec(conn, `rm -f ${remotePath}`);
+    log(`day log saved: ${localPath}`);
+    saved.push(localPath);
+    // run crossed midnight → also fetch the rotated daily tar(s) covering sinceMs
+    if (sinceMs != null) {
+      const { stdout: hostDay } = await sshExec(conn, "date -u +%Y-%m-%d");
+      const daysBack = Math.max(0, Math.floor(
+        (Date.parse(String(hostDay).trim() + "T00:00:00Z") - sinceMs) / 86400000) + 1);
+      for (let i = 0; i < Math.min(daysBack, 3); i++) {
+        const rot = `${DMTS_LOG_DIR}/dmts_logs_${i}.tar.xz`;
+        const { code } = await sshExec(conn, `test -f ${rot}`);
+        if (code !== 0) { log(`WARN: rotated day log ${rot} not present — skipping`); continue; }
+        const local = path.join(destDir, `dmts_logs_${i}_${tag}.tar.gz`); // gzip content
+        await sftpGet(conn, rot, local);
+        log(`rotated day log saved: ${local}`);
+        saved.push(local);
+      }
+    }
+    return saved;
+  } finally {
+    conn.end();
+  }
+}
+
 /** End-of-test evidence collection from spoke and hub (DMTS logs + diag
  *  packs). Also runs for early-failed cases so failures are analyzable. */
 async function collectEndOfTest(cfg, browser, tcName, result, spokeDir, hubDir) {
@@ -3514,7 +3563,7 @@ module.exports = {
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
   resetLabBetweenCases, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
   parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
-  collectHourlogSnapshot,
+  collectHourlogSnapshot, collectDayLog,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,

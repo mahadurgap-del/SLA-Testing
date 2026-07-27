@@ -6,4 +6,4 @@ SLA_Regression/
 latency_test_run.log
 run_state.json
 run_state.json.tmp
-SLA_Regression/_hourlog_archive/
+SLA_Regression/_daylog/
