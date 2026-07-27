@@ -912,6 +912,56 @@ async function newestHourlogFile(conn) {
   return stdout.trim() || null;
 }
 
+/** Epoch-ms mtime of the newest DMTS hourLog file (structure-independent), or
+ *  null. DMTS bumps this whenever it writes a record. */
+async function newestHourlogMtimeMs(conn) {
+  const { stdout } = await sshExec(conn,
+    `f=$(ls -t ${HOURLOG_DIR}/*.txt 2>/dev/null | head -1); [ -n "$f" ] && stat -c %Y "$f"`,
+    { timeoutMs: 15000 });
+  const sec = parseInt(String(stdout).trim(), 10);
+  return Number.isFinite(sec) ? sec * 1000 : null;
+}
+
+/** Connect, read the newest hourLog mtime once, disconnect. Returns ms or null.
+ *  Captured at case start as the baseline for the coverage check. */
+async function getHourlogMtime(creds) {
+  let conn;
+  try { conn = await sshConnect(creds); } catch { return null; }
+  try { return await newestHourlogMtimeMs(conn); }
+  catch { return null; }
+  finally { conn.end(); }
+}
+
+/**
+ * Verify the DMTS hourLog COVERS the just-finished test by confirming it was
+ * written DURING the test — i.e. the newest file's mtime ADVANCED past the
+ * baseline captured at case start. This is cadence-independent (DMTS writes fast
+ * under traffic, slowly when idle) and directly answers "did DMTS record the
+ * test window?". A frozen log (DMTS crashed) or an unreachable host never
+ * advances, so the caller flags the evidence instead of saving a stale file.
+ * `sinceMs` is the baseline mtime; null baseline → require any recent write.
+ */
+async function waitForHourlogAdvance(creds, sinceMs, { maxWaitMs = 90000 } = {}) {
+  let conn;
+  try { conn = await sshConnect(creds); }
+  catch (e) { return { covered: false, mtimeMs: null, error: e.message }; }
+  const deadline = Date.now() + maxWaitMs;
+  let mtimeMs = null, lastErr = null;
+  try {
+    while (Date.now() < deadline && !isAborted()) {
+      try {
+        mtimeMs = await newestHourlogMtimeMs(conn);
+        // advanced past the baseline => DMTS wrote during/after the test window.
+        if (mtimeMs != null && (sinceMs == null || mtimeMs > sinceMs)) {
+          return { covered: true, mtimeMs, advancedSec: sinceMs == null ? null : Math.round((mtimeMs - sinceMs) / 1000) };
+        }
+      } catch (e) { lastErr = e.message; }
+      await sleep(3000);
+    }
+  } finally { conn.end(); }
+  return { covered: false, mtimeMs, error: lastErr };
+}
+
 async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
   // opts.endAfterSwitchMs: once the FIRST switch is seen, keep monitoring only
   // this much longer, then stop (used by IPTV mode to end a case on switch).
@@ -2192,14 +2242,33 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   const monSide = tc.monitorSide === "hub" ? "hub" : "spoke";
   const monCreds = monSide === "hub" ? cfg.hub : cfg.spoke;
   const monDir = monSide === "hub" ? hubDir : spokeDir;
+  // Baseline: the newest hourLog file's mtime BEFORE the test runs. At collection
+  // we require it to have advanced (DMTS wrote during the test) — that, not an
+  // absolute freshness threshold, is what proves the log covers the window.
+  const hourlogBaselineMs = tc.hourlogOnly ? await getHourlogMtime(monCreds) : null;
   // End-of-test evidence: IPTV mode (tc.hourlogOnly) collects ONLY the relevant
   // side's DMTS hourLog; otherwise the full spoke+hub DMTS logs + diag packs.
   const collectFinalEvidence = async () => {
     if (tc.hourlogOnly) {
       try {
-        const snap = await collectHourlogSnapshot(monCreds, monDir, `${tc.name}_final`);
+        // Confirm the hourLog COVERS the test: wait until its newest file advanced
+        // past the pre-test baseline (DMTS wrote during the window). If it never
+        // advances — DMTS frozen or host unreachable (VM blip) — snapshot anyway
+        // but flag it as not covering the window rather than saving stale evidence.
+        const cov = await waitForHourlogAdvance(monCreds, hourlogBaselineMs, { maxWaitMs: 90000 });
+        if (cov.covered) {
+          log(`${tc.name}: ${monSide} hourLog covers the window (advanced${cov.advancedSec != null ? ` ${cov.advancedSec}s` : ""}) — snapshotting`);
+        } else {
+          const detail = cov.error ? cov.error.split("\n")[0] : "hourLog did not advance during the test (DMTS frozen?)";
+          result.errors.push(`${monSide} hourLog may NOT cover the test window (${detail})`);
+          result.hourlogStale = true;
+          log(`WARN: ${tc.name}: ${monSide} hourLog did not advance (${detail}) — snapshot may predate the test window`);
+        }
+        const snap = await collectHourlogSnapshot(monCreds, monDir,
+          `${tc.name}_final${cov.covered ? "" : "_STALE"}`);
         if (snap) result.artifacts[monSide].push(snap);
-        checkpoint(true, `${monSide} hourLog collected`, snap ? path.basename(snap) : "(none)");
+        checkpoint(cov.covered, `${monSide} hourLog collected`,
+          (snap ? path.basename(snap) : "(none)") + (cov.covered ? "" : " — STALE, may not cover window"));
       } catch (e) {
         result.errors.push(`${monSide} hourLog: ${e.message}`);
         checkpoint(false, `${monSide} hourLog collected`, e.message.slice(0, 160));
@@ -3267,7 +3336,7 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  resetLabBetweenCases,
+  resetLabBetweenCases, waitForHourlogAdvance, getHourlogMtime, newestHourlogMtimeMs,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,

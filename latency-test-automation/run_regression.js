@@ -736,6 +736,7 @@ function resultsCell(c, r) {
     bits.push(`Final active link: ${e(finalActiveLink(r))}.`);
   }
   bits.push(`Final configuration: ${e(finalConfig(c, r))}.`);
+  if (r.hourlogStale) bits.push(`<strong>&#9888; hourLog may not cover the test window</strong> (DMTS log was frozen / host unreachable at collection — evidence flagged <code>_STALE</code>).`);
   if (r.errors && r.errors.length) bits.push(`Errors: ${e(r.errors.join(" | "))}.`);
   bits.push(`<em>Automation completed — observation only (no PASS/FAIL).</em>`);
   return bits.join("<br/>");
