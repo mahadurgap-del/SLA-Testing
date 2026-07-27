@@ -940,6 +940,22 @@ async function runRegression(cfg, params, opts = {}) {
     }
   }
 
+  // ---- netem→DMTS link map (so impairment targets the link the monitored
+  //      traffic actually rides, not the busiest-pps link). Use a configured map
+  //      if provided; else auto-calibrate when --calibrate is set. Absent → the
+  //      engine falls back to pps detection (legacy behaviour, no regression). ----
+  if (params.netemLinkMap && typeof params.netemLinkMap === "object") {
+    cfg._netemLinkMap = params.netemLinkMap;
+    log(`netem→DMTS link map (configured): ${JSON.stringify(cfg._netemLinkMap)}`);
+  } else if (params.calibrateLinks) {
+    try {
+      const calCreds = cfg.spoke || cfg.hub;
+      cfg._netemLinkMap = await engine.calibrateNetemLinkMap(cfg, calCreds, {});
+      const n = Object.keys(cfg._netemLinkMap || {}).length;
+      log(`netem→DMTS link map (calibrated): ${n ? JSON.stringify(cfg._netemLinkMap) : "(empty — impairment falls back to pps)"}`);
+    } catch (e) { log(`WARN: link calibration failed (${e.message}) — impairment falls back to pps`); }
+  }
+
   // ---- browser (screenshots only; optional) ----
   let browser = null, page = null;
   try { ({ browser, page } = await engine.openNetemUi(cfg)); }
@@ -1114,6 +1130,7 @@ async function main() {
   if (stabArg) params.iptvStabilizeSec = parseInt(stabArg.slice("--stabilize=".length), 10);
   const sipArg = args.find((a) => a.startsWith("--serverip=")); // overlay data-plane target IP
   if (sipArg) params.iptvServerIp = sipArg.slice("--serverip=".length);
+  if (args.includes("--calibrate")) params.calibrateLinks = true; // build netem→DMTS link map at start
   const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
   const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
   const onlyArg = args.find((a) => a.startsWith("--only=")); // run only these case ids (smoke)

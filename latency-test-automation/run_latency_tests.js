@@ -824,7 +824,11 @@ function lastCompleteRecord(text, maxAttempts = 5000) {
     } catch {
       continue;
     }
-    if (rec && typeof rec === "object" && !Array.isArray(rec) && "scores" in rec) return rec;
+    // Accept a DMTS record in either format: current (tc_link_rate/dmts_output +
+    // channels) or legacy (scores.per_tc). Requiring only "scores" silently
+    // dropped every record in the current format — breaking switch detection.
+    if (rec && typeof rec === "object" && !Array.isArray(rec) &&
+        ("tc_link_rate" in rec || "dmts_output" in rec || "scores" in rec)) return rec;
   }
   return null;
 }
@@ -861,8 +865,26 @@ function findBalancedEnd(text, start) {
  * Returns [{ name, domLink, tc }].
  */
 function activeTcs(record) {
-  const perTc = record?.scores?.per_tc ?? {};
   const out = [];
+  // Preferred (current DMTS format): per-TC link assignment lives in
+  // tc_link_rate[] / dmts_output[] as { TC_Name, link, link_name }, where `link`
+  // is the real link_id. `linkId` here is that id (NOT a channels[] index).
+  const rate = Array.isArray(record?.tc_link_rate) ? record.tc_link_rate
+    : (Array.isArray(record?.dmts_output) ? record.dmts_output : null);
+  if (rate) {
+    const seen = new Set();
+    for (const t of rate) {
+      const name = t && (t.TC_Name || t.tc_name);
+      const link = t && (t.link ?? t.link_id);
+      if (!name || name === "__internal_hp__" || link == null || link < 0) continue;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, linkId: link, linkName: t.link_name || t.link_Name || null, byId: true, tc: t });
+    }
+    if (out.length) return out;
+  }
+  // Legacy format: scores.per_tc with dom_link = INDEX into channels[].
+  const perTc = record?.scores?.per_tc ?? {};
   for (const [key, tc] of Object.entries(perTc)) {
     if (!tc || typeof tc !== "object") continue;
     const name = tc.name || key;
@@ -870,10 +892,8 @@ function activeTcs(record) {
     const qoe = tc.qoe;
     if (qoe === null || qoe === undefined) continue;
     if (["IDLE", "NOREF"].includes(String(qoe).toUpperCase())) continue;
-    // dom_link < 0 (e.g. -1) = no dominant link / traffic gap — not a real
-    // link, so ignore it (prevents phantom X -> -1 -> X "switches")
     if (tc.dom_link === null || tc.dom_link === undefined || tc.dom_link < 0) continue;
-    out.push({ name, domLink: tc.dom_link, tc });
+    out.push({ name, linkId: linkIdForDom(record, tc.dom_link), linkName: null, byId: false, domLink: tc.dom_link, tc });
   }
   return out;
 }
@@ -912,54 +932,72 @@ async function newestHourlogFile(conn) {
   return stdout.trim() || null;
 }
 
-/** Epoch-ms mtime of the newest DMTS hourLog file (structure-independent), or
- *  null. DMTS bumps this whenever it writes a record. */
-async function newestHourlogMtimeMs(conn) {
-  const { stdout } = await sshExec(conn,
-    `f=$(ls -t ${HOURLOG_DIR}/*.txt 2>/dev/null | head -1); [ -n "$f" ] && stat -c %Y "$f"`,
-    { timeoutMs: 15000 });
-  const sec = parseInt(String(stdout).trim(), 10);
-  return Number.isFinite(sec) ? sec * 1000 : null;
+/** Parse a DMTS record timestamp "YYYY-MM-DD HH:MM:SS:mmm" (UTC) to epoch ms.
+ *  Note the non-standard space + ":mmm" millis — Date.parse mis-handles it. */
+function parseDmtsTime(s) {
+  const m = String(s).match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?::(\d{1,3}))?/);
+  if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +(m[7] || 0));
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
 }
 
-/** Connect, read the newest hourLog mtime once, disconnect. Returns ms or null.
- *  Captured at case start as the baseline for the coverage check. */
-async function getHourlogMtime(creds) {
+/** Epoch-ms of the NEWEST record's own timestamp across the two newest hourLog
+ *  bucket files (the log CONTENT clock — which can lag wall-clock/mtime when DMTS
+ *  is under load). Returns null if unreadable. */
+async function newestHourlogRecordTimeMs(conn) {
+  const { stdout: fl } = await sshExec(conn, `ls -t ${HOURLOG_DIR}/*.txt 2>/dev/null | head -2`, { timeoutMs: 15000 });
+  const files = String(fl).trim().split(/\s+/).filter(Boolean);
+  let best = null;
+  for (const f of files) {
+    const { stdout } = await sshExec(conn, `tail -c 262144 '${f}'`, { timeoutMs: 20000 });
+    // scan record `time` fields; keep the max
+    for (const mm of String(stdout).matchAll(/"time"\s*:\s*"([^"]+)"/g)) {
+      const t = parseDmtsTime(mm[1]);
+      if (t != null && (best == null || t > best)) best = t;
+    }
+  }
+  return best;
+}
+
+/** Connect, read the newest record CONTENT time once, disconnect. Baseline for
+ *  the coverage check (captured at case start). Returns epoch ms or null. */
+async function getHourlogRecordTime(creds) {
   let conn;
   try { conn = await sshConnect(creds); } catch { return null; }
-  try { return await newestHourlogMtimeMs(conn); }
+  try { return await newestHourlogRecordTimeMs(conn); }
   catch { return null; }
   finally { conn.end(); }
 }
 
 /**
- * Verify the DMTS hourLog COVERS the just-finished test by confirming it was
- * written DURING the test — i.e. the newest file's mtime ADVANCED past the
- * baseline captured at case start. This is cadence-independent (DMTS writes fast
- * under traffic, slowly when idle) and directly answers "did DMTS record the
- * test window?". A frozen log (DMTS crashed) or an unreachable host never
- * advances, so the caller flags the evidence instead of saving a stale file.
- * `sinceMs` is the baseline mtime; null baseline → require any recent write.
+ * Verify the DMTS hourLog CONTENT covers the just-finished test window: wait
+ * until the newest record's own timestamp has advanced at least `needAdvanceMs`
+ * (the window duration) past the baseline captured at case start. This is what
+ * actually failed on the flaky run — the log FILE kept being touched (mtime
+ * moved) while the record CONTENT lagged minutes behind, so captures ended
+ * before their window. If content never catches up (host struggling / DMTS
+ * frozen / unreachable), returns covered:false so the caller flags it NOT
+ * COVERED rather than saving a capture that predates the window.
  */
-async function waitForHourlogAdvance(creds, sinceMs, { maxWaitMs = 90000 } = {}) {
+async function waitForHourlogCoverage(creds, baselineMs, needAdvanceMs, { maxWaitMs = 120000 } = {}) {
   let conn;
   try { conn = await sshConnect(creds); }
-  catch (e) { return { covered: false, mtimeMs: null, error: e.message }; }
+  catch (e) { return { covered: false, recordMs: null, error: e.message }; }
   const deadline = Date.now() + maxWaitMs;
-  let mtimeMs = null, lastErr = null;
+  let recordMs = null, lastErr = null;
+  const target = baselineMs != null ? baselineMs + Math.max(0, needAdvanceMs || 0) : null;
   try {
     while (Date.now() < deadline && !isAborted()) {
       try {
-        mtimeMs = await newestHourlogMtimeMs(conn);
-        // advanced past the baseline => DMTS wrote during/after the test window.
-        if (mtimeMs != null && (sinceMs == null || mtimeMs > sinceMs)) {
-          return { covered: true, mtimeMs, advancedSec: sinceMs == null ? null : Math.round((mtimeMs - sinceMs) / 1000) };
+        recordMs = await newestHourlogRecordTimeMs(conn);
+        if (recordMs != null && (target == null || recordMs >= target)) {
+          return { covered: true, recordMs, advancedSec: baselineMs != null ? Math.round((recordMs - baselineMs) / 1000) : null };
         }
       } catch (e) { lastErr = e.message; }
-      await sleep(3000);
+      await sleep(4000);
     }
   } finally { conn.end(); }
-  return { covered: false, mtimeMs, error: lastErr };
+  return { covered: false, recordMs, laggingSec: (recordMs != null && target != null) ? Math.round((target - recordMs) / 1000) : null, error: lastErr };
 }
 
 async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
@@ -968,7 +1006,7 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
   // Absent → monitor the full duration, as before.
   let deadline = Date.now() + durationMs;
   const switches = [];
-  const prevDom = {};   // tcName -> last dom_link index seen
+  const prevLink = {};  // tcName -> last link_id seen
   let file = await newestHourlogFile(conn);
   log(`monitoring hourlog ${file ?? "(none yet)"} for ${Math.round(durationMs / 1000)}s (watching dom_link per TC)`);
 
@@ -983,28 +1021,31 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
       const { stdout: tail } = await sshExec(conn, `tail -c 262144 '${file}'`);
       const record = lastCompleteRecord(tail);
       const active = record ? activeTcs(record) : [];
+      const nameById = {};
+      for (const a of active) if (a.linkName != null) nameById[a.linkId] = a.linkName;
       for (const a of active) {
-        const prev = prevDom[a.name];
+        const prev = prevLink[a.name];
         if (prev === undefined) {
-          prevDom[a.name] = a.domLink;
-          log(`active TC ${a.name} starts on dom_link ${a.domLink} (link ${linkIdForDom(record, a.domLink)})`);
+          prevLink[a.name] = a.linkId;
+          log(`active TC ${a.name} starts on link ${a.linkId}${a.linkName ? ` (${a.linkName})` : ""}`);
           continue;
         }
-        if (a.domLink === prev) continue;
-        // dom_link changed for this TC -> link switch
-        const fromLink = linkIdForDom(record, prev);
-        const toLink = linkIdForDom(record, a.domLink);
+        if (a.linkId === prev) continue;
+        // the TC's link_id changed -> link switch
+        const fromLink = prev;
+        const toLink = a.linkId;
         const stats = linkStats(record, fromLink);
         const sw = {
           tc: a.name,
-          fromLink, toLink, fromDom: prev, toDom: a.domLink,
+          fromLink, toLink, fromDom: prev, toDom: a.linkId,
+          fromLinkName: nameById[fromLink] || null, toLinkName: a.linkName || nameById[toLink] || null,
           time: record.time ?? record.timestamp ?? record.ts ?? new Date().toISOString(),
           wallClock: new Date().toISOString(),
           fromLinkLatency95P: stats.latency95P,
           fromLinkPacketLoss95P: stats.packetLoss95P,
         };
         switches.push(sw);
-        prevDom[a.name] = a.domLink;
+        prevLink[a.name] = a.linkId;
         if (opts.endAfterSwitchMs != null && switches.length === 1) {
           deadline = Math.min(deadline, Date.now() + opts.endAfterSwitchMs);
           log(`end-on-switch: monitoring ${Math.round(opts.endAfterSwitchMs / 1000)}s more then stopping the case`);
@@ -1418,6 +1459,105 @@ async function detectActiveLink(cfg, sampleSeconds = 3) {
   }
 }
 
+/** Per-link latency95P keyed by DMTS link_id, from the newest hourLog record. */
+async function linkLatency95PById(conn) {
+  const file = await newestHourlogFile(conn);
+  if (!file) return {};
+  const { stdout } = await sshExec(conn, `tail -c 262144 '${file}'`);
+  const rec = lastCompleteRecord(stdout);
+  const out = {};
+  if (rec) for (const ch of channelsOf(rec)) if (ch && ch.link_id != null) out[ch.link_id] = ch.latency95P ?? 0;
+  return out;
+}
+
+/**
+ * Which DMTS link the monitored traffic actually rides right now. Prefers the TC
+ * matching `tcMatch` (name/regex); otherwise the busiest-rate TC (that's our
+ * iperf during a test). Returns { name, linkId, linkName } or null.
+ */
+async function readTcActiveLink(conn, tcMatch) {
+  const file = await newestHourlogFile(conn);
+  if (!file) return null;
+  const { stdout } = await sshExec(conn, `tail -c 262144 '${file}'`);
+  const rec = lastCompleteRecord(stdout);
+  if (!rec) return null;
+  const tcs = activeTcs(rec);
+  if (!tcs.length) return null;
+  if (tcMatch) {
+    const re = tcMatch instanceof RegExp ? tcMatch : new RegExp(tcMatch, "i");
+    const hit = tcs.find((t) => re.test(t.name));
+    if (hit) return { name: hit.name, linkId: hit.linkId, linkName: hit.linkName };
+  }
+  // busiest-rate TC (carries our test traffic)
+  let best = null, bestRate = -1;
+  for (const t of tcs) { const r = t.tc && (t.tc.rate ?? t.tc.allocated_bwd ?? 0); if (r > bestRate) { bestRate = r; best = t; } }
+  best = best || tcs[0];
+  return { name: best.name, linkId: best.linkId, linkName: best.linkName };
+}
+
+/**
+ * Build the netem-interface -> DMTS-link map by calibration: impair each bridge
+ * with a signature delay, see which DMTS link_id's latency95P rises, record
+ * linkId -> ports. Run ONCE per run. Returns { linkId: [ports] } (may be partial).
+ */
+async function calibrateNetemLinkMap(cfg, monCreds, { signatureMs = 400, settleSec = 45 } = {}) {
+  const map = {};
+  let det;
+  try { det = await detectActiveLink(cfg); } catch (e) { log(`calib: cannot enumerate links (${e.message})`); return map; }
+  const bridges = (det.groups || []).map((g) => ({ bridge: g.bridge, ports: g.ports })).filter((b) => b.ports.length);
+  if (!bridges.length) return map;
+  let mon;
+  try { mon = await sshConnect(monCreds); } catch (e) { log(`calib: monitor unreachable (${e.message})`); return map; }
+  log(`calibrating netem→DMTS link map (${bridges.length} bridges, ${signatureMs}ms signature)…`);
+  try {
+    for (const b of bridges) {
+      const before = await linkLatency95PById(mon);
+      try { await applyToLink(cfg, b.ports, { delayMs: signatureMs }, null); }
+      catch (e) { log(`calib: apply to ${b.bridge} failed (${e.message})`); continue; }
+      await sleep(settleSec * 1000);
+      const after = await linkLatency95PById(mon);
+      try { await clearLink(cfg, b.ports); } catch { /* ignore */ }
+      let bestId = null, bestDelta = 0;
+      for (const id of Object.keys(after)) { const d = (after[id] || 0) - (before[id] || 0); if (d > bestDelta) { bestDelta = d; bestId = id; } }
+      if (bestId != null && bestDelta > signatureMs * 0.5) {
+        map[bestId] = b.ports;
+        log(`calib: bridge ${b.bridge} (${b.ports.join("+")}) → DMTS link ${bestId} (+${Math.round(bestDelta)}ms)`);
+      } else {
+        log(`calib: bridge ${b.bridge} → no link responded clearly (max +${Math.round(bestDelta)}ms) — skipped`);
+      }
+      await sleep(8000); // let DMTS 95P settle back before the next bridge
+    }
+  } finally { mon.end(); }
+  return map;
+}
+
+/**
+ * Resolve which netem ports to impair for this case. When a calibrated
+ * cfg._netemLinkMap exists (IPTV mode), target the link the monitored traffic is
+ * actually on (from DMTS) — this is the fix for impairing the standby link. Falls
+ * back to the busiest-pps link (legacy behaviour) whenever anything is missing.
+ */
+async function impairTargetPorts(cfg) {
+  const det = await detectActiveLink(cfg); // pps result carries .groups for standby logic
+  const map = cfg._netemLinkMap;
+  if (map && Object.keys(map).length && cfg._monCreds) {
+    try {
+      const conn = await sshConnect(cfg._monCreds);
+      try {
+        const tl = await readTcActiveLink(conn, cfg._monitorTcMatch);
+        if (tl && map[tl.linkId]) {
+          if (det.ports.join("+") !== map[tl.linkId].join("+")) {
+            log(`impair target: traffic on DMTS link ${tl.linkId} (${tl.linkName || "?"}) → ports ${map[tl.linkId].join("+")} (pps would have picked ${det.bridge})`);
+          }
+          return { ...det, ports: map[tl.linkId], bridge: `link${tl.linkId}${tl.linkName ? ` (${tl.linkName})` : ""}`, linkId: tl.linkId, source: "dmts" };
+        }
+        if (tl) log(`WARN: traffic TC ${tl.name} on link ${tl.linkId} (${tl.linkName || "?"}) not in calibrated map — using pps ${det.bridge}`);
+      } finally { conn.end(); }
+    } catch (e) { log(`WARN: TC-link target failed (${e.message}) — using pps`); }
+  }
+  return { ...det, source: "pps" };
+}
+
 /** Apply a netem spec to every port of a link, tracking each in impairedIfaces. */
 async function applyToLink(cfg, ports, spec, impairedIfaces) {
   for (const iface of ports) {
@@ -1620,7 +1760,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     // natural switch, then ramp +stepPct every intervalSec until a switch
     // (sync.switched, set by the monitor) or the max — all on the initially
     // active link.
-    const det = await detectActiveLink(cfg);
+    const det = await impairTargetPorts(cfg);
     let pct = s.initialPct != null ? s.initialPct : s.rampStepPct;
     await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
     sync.currentMs = pct;
@@ -1651,7 +1791,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     // leaves it unset and keeps running for the full window.
     while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       try {
-        const det = await detectActiveLink(cfg);
+        const det = await impairTargetPorts(cfg);
         await applyToLink(cfg, det.ports, { lossPct: s.burstLossPct }, impairedIfaces);
         note(label(det), `burst loss ${s.burstLossPct}%`);
         await sleepWithin(deadline, s.burstDurationSec * 1000, () => s.endOnSwitch && sync.switched);
@@ -1676,7 +1816,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000, () => s.endOnSwitch && sync.switched))) break;
       try {
-        const det = await detectActiveLink(cfg);
+        const det = await impairTargetPorts(cfg);
         await applyToLink(cfg, det.ports, { lossPct: rpct }, impairedIfaces);
         sync.currentMs = rpct;
         note(label(det), `random loss ${rpct}%`);
@@ -1699,7 +1839,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     const step = s.stepPct != null ? s.stepPct : 2;
     while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       try {
-        const det = await detectActiveLink(cfg);
+        const det = await impairTargetPorts(cfg);
         await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
         sync.currentMs = pct;
         note(label(det), `periodic loss ${pct}% (on ${onSec}s)`);
@@ -1740,7 +1880,7 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
     log(`${tc.name}: both links clean — no impairment to apply`);
     return events;
   }
-  const det = await detectActiveLink(cfg);
+  const det = await impairTargetPorts(cfg);
   await applyToLink(cfg, det.ports, { delayMs: hi }, impairedIfaces);
   note(label(det), `delay ${hi}ms (active link)`);
   if (lo > 0) {
@@ -1804,7 +1944,7 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
 
   // 1. detect active link (bridge + all ports) + apply the initial delays to
   //    EVERY port of the link (bridged traffic uses both ports)
-  const det = await detectActiveLink(cfg);
+  const det = await impairTargetPorts(cfg);
   const activePorts = det.ports;
   sync.activeIface = label(det);
   const standby = det.groups.find((g) => g.bridge !== det.bridge);
@@ -2242,27 +2382,34 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   const monSide = tc.monitorSide === "hub" ? "hub" : "spoke";
   const monCreds = monSide === "hub" ? cfg.hub : cfg.spoke;
   const monDir = monSide === "hub" ? hubDir : spokeDir;
-  // Baseline: the newest hourLog file's mtime BEFORE the test runs. At collection
-  // we require it to have advanced (DMTS wrote during the test) — that, not an
-  // absolute freshness threshold, is what proves the log covers the window.
-  const hourlogBaselineMs = tc.hourlogOnly ? await getHourlogMtime(monCreds) : null;
+  // Baseline: the newest RECORD's own timestamp BEFORE the test runs. At
+  // collection we require the record content-clock to advance at least one window
+  // duration past this — that proves the log CONTENT (not just the file mtime)
+  // covers the just-finished window.
+  const hourlogBaselineMs = tc.hourlogOnly ? await getHourlogRecordTime(monCreds) : null;
+  // Let impairTargetPorts read the monitored side's DMTS hourLog to target the
+  // link actually carrying the traffic (needs a calibrated cfg._netemLinkMap).
+  cfg._monCreds = monCreds;
+  cfg._monitorTcMatch = tc.monitorTcMatch || null;
   // End-of-test evidence: IPTV mode (tc.hourlogOnly) collects ONLY the relevant
   // side's DMTS hourLog; otherwise the full spoke+hub DMTS logs + diag packs.
   const collectFinalEvidence = async () => {
     if (tc.hourlogOnly) {
       try {
-        // Confirm the hourLog COVERS the test: wait until its newest file advanced
-        // past the pre-test baseline (DMTS wrote during the window). If it never
-        // advances — DMTS frozen or host unreachable (VM blip) — snapshot anyway
-        // but flag it as not covering the window rather than saving stale evidence.
-        const cov = await waitForHourlogAdvance(monCreds, hourlogBaselineMs, { maxWaitMs: 90000 });
+        // Confirm the hourLog CONTENT covers the test: wait until the newest
+        // record's own timestamp advanced ≥ one window past the pre-test baseline.
+        // If content never catches up (DMTS lagging/frozen or host unreachable),
+        // snapshot anyway but flag it NOT COVERED rather than saving a capture
+        // that predates the window (the exact failure seen on the flaky run).
+        const cov = await waitForHourlogCoverage(monCreds, hourlogBaselineMs, durationMs, { maxWaitMs: 120000 });
         if (cov.covered) {
-          log(`${tc.name}: ${monSide} hourLog covers the window (advanced${cov.advancedSec != null ? ` ${cov.advancedSec}s` : ""}) — snapshotting`);
+          log(`${tc.name}: ${monSide} hourLog covers the window (content advanced ${cov.advancedSec}s) — snapshotting`);
         } else {
-          const detail = cov.error ? cov.error.split("\n")[0] : "hourLog did not advance during the test (DMTS frozen?)";
-          result.errors.push(`${monSide} hourLog may NOT cover the test window (${detail})`);
+          const detail = cov.error ? cov.error.split("\n")[0]
+            : (cov.laggingSec != null ? `record content still ${cov.laggingSec}s short of the window end` : "no records");
+          result.errors.push(`${monSide} hourLog NOT COVERED — ${detail}`);
           result.hourlogStale = true;
-          log(`WARN: ${tc.name}: ${monSide} hourLog did not advance (${detail}) — snapshot may predate the test window`);
+          log(`WARN: ${tc.name}: ${monSide} hourLog NOT COVERED (${detail}) — capture predates/undershoots the window`);
         }
         const snap = await collectHourlogSnapshot(monCreds, monDir,
           `${tc.name}_final${cov.covered ? "" : "_STALE"}`);
@@ -3336,7 +3483,8 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  resetLabBetweenCases, waitForHourlogAdvance, getHourlogMtime, newestHourlogMtimeMs,
+  resetLabBetweenCases, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
+  parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
