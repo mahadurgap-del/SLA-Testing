@@ -95,6 +95,17 @@ const PL_TCS = [
             minGap: 10, maxGap: 30, minDur: 5, maxDur: 15 } },
 ];
 
+// DMTS traffic class that carries each ToS's iperf traffic — the class to monitor
+// for the active link and to target impairment at. Matched (case-insensitive) as a
+// regex against TC_Name; anchors keep FileT distinct from Short-fileT. Unknown ToS
+// falls back to the busiest-rate TC (our traffic) in readTcActiveLink.
+//   0x54 = file-T (FileT-*), 0x64 = shortfile-t (Short-fileT_*), 0x74 = streaming.
+const TOS_TC_MATCH = {
+  "0x54": "^FileT",
+  "0x64": "Short-?fileT",
+  "0x74": "Streaming",
+};
+
 const HOLD_SEC = 180;        // 3-minute hold / stabilize / clean pre-hold (SLA mode)
 const STEP_MS = 50;          // latency ramp step (SLA mode)
 const STEP_INTERVAL_SEC = 60; // one step per minute
@@ -204,7 +215,9 @@ function buildTc(c, opts = {}) {
   const stabilizeAfterSwitchMs = (opts.stabilizeSec != null ? opts.stabilizeSec : 60) * 1000;
   const iptvFields = iptv
     ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true,
-        hourlogOnly: true, stabilizeAfterSwitchMs }
+        hourlogOnly: true, stabilizeAfterSwitchMs,
+        // which DMTS traffic class this ToS rides — monitor its link + target it
+        monitorTcMatch: TOS_TC_MATCH[String(c.tos).toLowerCase()] || null }
     : {};
   if (c.suite === "latency") {
     let rampPlan = null;

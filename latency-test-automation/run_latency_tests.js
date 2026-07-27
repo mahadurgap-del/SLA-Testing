@@ -1020,7 +1020,14 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
       if (!file) { await sleep(2000); continue; }
       const { stdout: tail } = await sshExec(conn, `tail -c 262144 '${file}'`);
       const record = lastCompleteRecord(tail);
-      const active = record ? activeTcs(record) : [];
+      let active = record ? activeTcs(record) : [];
+      // opts.tcMatch: watch only the traffic class under test (e.g. ^FileT for
+      // 0x54) so an unrelated class's reshuffle doesn't end the case early.
+      if (opts.tcMatch) {
+        const re = opts.tcMatch instanceof RegExp ? opts.tcMatch : new RegExp(opts.tcMatch, "i");
+        const scoped = active.filter((a) => re.test(a.name));
+        if (scoped.length) active = scoped;
+      }
       const nameById = {};
       for (const a of active) if (a.linkName != null) nameById[a.linkId] = a.linkName;
       for (const a of active) {
@@ -2521,7 +2528,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
           log(`${tc.name}: switch at ${at} on ${sync.activeIface} — stopping ramp; ` +
               `stabilising ${result.stabilizeSec}s before hourLog`);
         }
-      }, { endAfterSwitchMs: tc.endOnSwitch ? stabilizeMs : undefined });
+      }, { endAfterSwitchMs: tc.endOnSwitch ? stabilizeMs : undefined, tcMatch: tc.monitorTcMatch || undefined });
       const scheduleP = isDynamicPL
         ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null, sync, tc.plPlan || null)
         : isLatencyRamp
