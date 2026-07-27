@@ -1007,6 +1007,7 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
   let deadline = Date.now() + durationMs;
   const switches = [];
   const prevLink = {};  // tcName -> last link_id seen
+  let tcMatchMissWarned = false;
   let file = await newestHourlogFile(conn);
   log(`monitoring hourlog ${file ?? "(none yet)"} for ${Math.round(durationMs / 1000)}s (watching dom_link per TC)`);
 
@@ -1022,11 +1023,17 @@ async function monitorLinkSwitches(conn, durationMs, onSwitch, opts = {}) {
       const record = lastCompleteRecord(tail);
       let active = record ? activeTcs(record) : [];
       // opts.tcMatch: watch only the traffic class under test (e.g. ^FileT for
-      // 0x54) so an unrelated class's reshuffle doesn't end the case early.
+      // 0x54) so an unrelated class's reshuffle doesn't end the case early. The
+      // ToS→class map is grid-specific — when the hint matches NO class on this
+      // grid, warn once and watch all classes rather than going blind.
       if (opts.tcMatch) {
         const re = opts.tcMatch instanceof RegExp ? opts.tcMatch : new RegExp(opts.tcMatch, "i");
         const scoped = active.filter((a) => re.test(a.name));
         if (scoped.length) active = scoped;
+        else if (active.length && !tcMatchMissWarned) {
+          tcMatchMissWarned = true;
+          log(`WARN: tc match ${opts.tcMatch} matches no class on this grid (saw: ${active.slice(0, 6).map((a) => a.name).join(", ")}…) — watching ALL classes; fix the grid's --tcmap`);
+        }
       }
       const nameById = {};
       for (const a of active) if (a.linkName != null) nameById[a.linkId] = a.linkName;

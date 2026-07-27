@@ -95,16 +95,26 @@ const PL_TCS = [
             minGap: 10, maxGap: 30, minDur: 5, maxDur: 15 } },
 ];
 
-// DMTS traffic class that carries each ToS's iperf traffic — the class to monitor
-// for the active link and to target impairment at. Matched (case-insensitive) as a
-// regex against TC_Name; anchors keep FileT distinct from Short-fileT. Unknown ToS
-// falls back to the busiest-rate TC (our traffic) in readTcActiveLink.
-//   0x54 = file-T (FileT-*), 0x64 = shortfile-t (Short-fileT_*), 0x74 = streaming.
-const TOS_TC_MATCH = {
+// DEFAULT ToS → DMTS traffic-class hint (regex vs TC_Name, case-insensitive).
+// The ToS→class mapping is GRID-SPECIFIC QoS config — this default matches the
+// current Dallas grid (0x54=FileT-*, 0x64=Short-fileT_*, 0x74=Streaming_*) and is
+// only a hint: override per grid via --tcmap / params.tosTcMap, and at runtime the
+// engine falls back to the class actually carrying the traffic (busiest-rate TC)
+// whenever the hint matches nothing in the hourLog. ^FileT anchored so 0x54
+// doesn't match Short-fileT.
+const DEFAULT_TOS_TC_MATCH = {
   "0x54": "^FileT",
   "0x64": "Short-?fileT",
   "0x74": "Streaming",
 };
+
+/** Effective ToS→class map for this run: grid default + per-run overrides. */
+function tosTcMap(params) {
+  const o = (params && params.tosTcMap && typeof params.tosTcMap === "object") ? params.tosTcMap : {};
+  const norm = {};
+  for (const [k, v] of Object.entries(o)) if (v) norm[String(k).toLowerCase()] = String(v);
+  return { ...DEFAULT_TOS_TC_MATCH, ...norm };
+}
 
 const HOLD_SEC = 180;        // 3-minute hold / stabilize / clean pre-hold (SLA mode)
 const STEP_MS = 50;          // latency ramp step (SLA mode)
@@ -216,8 +226,9 @@ function buildTc(c, opts = {}) {
   const iptvFields = iptv
     ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true,
         hourlogOnly: true, stabilizeAfterSwitchMs,
-        // which DMTS traffic class this ToS rides — monitor its link + target it
-        monitorTcMatch: TOS_TC_MATCH[String(c.tos).toLowerCase()] || null }
+        // which DMTS traffic class this ToS rides on THIS grid (hint; engine
+        // falls back to the busiest-rate class when it matches nothing)
+        monitorTcMatch: (opts.tcMap || DEFAULT_TOS_TC_MATCH)[String(c.tos).toLowerCase()] || null }
     : {};
   if (c.suite === "latency") {
     let rampPlan = null;
@@ -984,7 +995,7 @@ async function runRegression(cfg, params, opts = {}) {
       if (opts.limit && ranThisRun >= opts.limit) { log(`reached --limit ${opts.limit} — stopping (smoke run)`); break; }
 
       state.currentIndex = c.n;
-      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec });
+      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec, tcMap: tosTcMap(params) });
       const durationMs = (params.forceCaseSec ? parseInt(params.forceCaseSec, 10) : caseWindowSec(c, params)) * 1000;
       engine.setStatus({ caseIndex: c.n, currentCase: c.id,
         currentSuite: c.suite, currentTc: c.testcase, currentDir: c.dirLabel, currentTos: c.tos,
@@ -1144,6 +1155,15 @@ async function main() {
   const sipArg = args.find((a) => a.startsWith("--serverip=")); // overlay data-plane target IP
   if (sipArg) params.iptvServerIp = sipArg.slice("--serverip=".length);
   if (args.includes("--calibrate")) params.calibrateLinks = true; // build netem→DMTS link map at start
+  // Grid-specific ToS→traffic-class overrides: --tcmap=0x54:^FileT,0x64:Short-?fileT
+  const tcmapArg = args.find((a) => a.startsWith("--tcmap="));
+  if (tcmapArg) {
+    params.tosTcMap = {};
+    for (const pair of tcmapArg.slice("--tcmap=".length).split(",")) {
+      const i = pair.indexOf(":");
+      if (i > 0) params.tosTcMap[pair.slice(0, i).trim().toLowerCase()] = pair.slice(i + 1).trim();
+    }
+  }
   const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
   const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
   const onlyArg = args.find((a) => a.startsWith("--only=")); // run only these case ids (smoke)
@@ -1170,7 +1190,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  runRegression, buildMatrix, caseWindowSec, buildTc,
+  runRegression, buildMatrix, caseWindowSec, buildTc, tosTcMap,
   loadState, saveState, clearState, stateSummary,
   initialConfig, finalConfig, statusText,
   buildPageBody, iptvRow, ensurePage, appendCase,

@@ -322,6 +322,14 @@ const server = http.createServer(async (req, res) => {
         if (Number.isFinite(s) && s > 0) p.iptvLossCeiling = s;
       }
       if (body.iptvInterval && String(body.iptvInterval).trim()) p.iptvInterval = String(body.iptvInterval).trim();
+      if (body.tosTcMap && String(body.tosTcMap).trim()) {
+        // grid-specific ToS→traffic-class overrides, lines/commas of "tos:regex"
+        p.tosTcMap = {};
+        for (const pair of String(body.tosTcMap).split(/[\n,]+/)) {
+          const i = pair.indexOf(":");
+          if (i > 0) p.tosTcMap[pair.slice(0, i).trim().toLowerCase()] = pair.slice(i + 1).trim();
+        }
+      }
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
@@ -512,6 +520,8 @@ After a switch:
       <input name="iptvStabilizeSec" value="60" placeholder="60"><div class="errmsg"></div></div>
     <div><label>Loss ceiling % (push to, if no switch)</label>
       <input name="iptvLossCeiling" value="10" placeholder="10"><div class="errmsg"></div></div>
+    <div><label>ToS &rarr; traffic class (grid-specific; one per line, tos:regex)</label>
+      <textarea name="tosTcMap" rows="3" placeholder="0x54:^FileT&#10;0x64:Short-?fileT&#10;0x74:Streaming"></textarea><div class="errmsg"></div></div>
     <div class="full" style="font-size:11px; color:var(--mut);"><b>IPTV mode</b> runs the orbit profile above for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>); on switch only the DMTS hourLog is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix. See the collapsible profile sections above for the full progression.</div>
   </div></fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
