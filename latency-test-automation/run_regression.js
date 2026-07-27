@@ -909,6 +909,15 @@ async function runRegression(cfg, params, opts = {}) {
       c.ceilingPct = lossCap;
     }
   }
+  // Optional extended latency ramps (--latext) for latency-INSENSITIVE traffic
+  // classes (file-T / shortfile-T / streaming): keep stepping past the orbit
+  // ceiling — LEO →400, MEO →600, GEO →2000 ms — one step/min, still end-on-switch.
+  if (params && params.iptvLatExtend) {
+    const EXT = { TC2: [200, 300, 400], TC3: [300, 450, 600], TC4: [1500, 2000] };
+    for (const c of matrix) if (c.suite === "latency" && c.steps && c.steps.length && EXT[c.testcase]) {
+      c.steps = [...c.steps, ...EXT[c.testcase].filter((v) => v > c.steps[c.steps.length - 1])];
+    }
+  }
 
   if (!state) {
     state = {
@@ -1168,6 +1177,7 @@ async function main() {
   const sipArg = args.find((a) => a.startsWith("--serverip=")); // overlay data-plane target IP
   if (sipArg) params.iptvServerIp = sipArg.slice("--serverip=".length);
   if (args.includes("--calibrate")) params.calibrateLinks = true; // build netem→DMTS link map at start
+  if (args.includes("--latext")) params.iptvLatExtend = true; // extend latency ramps (latency-insensitive classes)
   // Grid-specific ToS→traffic-class overrides: --tcmap=0x54:^FileT,0x64:Short-?fileT
   const tcmapArg = args.find((a) => a.startsWith("--tcmap="));
   if (tcmapArg) {
