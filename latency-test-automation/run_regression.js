@@ -70,14 +70,17 @@ const TOS_LIST = ["0x04", "0x24", "0x38"];
 const LATENCY_TCS = [
   { tc: "TC1", label: "Baseline", baseline: true, active: 0, standby: 0, ceiling: 0,
     iptv: { label: "Baseline" } },
+  // Non-active link carries a BELIEVABLE MEO-like latency (130/160 ms) instead of
+  // 0 — a clean 0ms standby vs an impaired active is unrealistic, and DMTS has no
+  // credible alternative to weigh. Active ramps per orbit; standby stays fixed.
   { tc: "TC2", label: "LEO", active: 30, standby: 0, ceiling: 130,
-    iptv: { label: "LEO Latency", standby: 0,
+    iptv: { label: "LEO Latency", standby: 130,
             steps: { upstream: [30, 50, 75, 100, 120], downstream: [30, 50, 75, 100, 120] } } },
   { tc: "TC3", label: "MEO", active: 150, standby: 0, ceiling: 400,
-    iptv: { label: "MEO Latency", standby: 0,
+    iptv: { label: "MEO Latency", standby: 160,
             steps: { upstream: [150, 165, 180], downstream: [150, 165, 180] } } },
   { tc: "TC4", label: "GEO", active: 600, standby: 0, ceiling: 1500,
-    iptv: { label: "GEO Latency", standby: 0,
+    iptv: { label: "GEO Latency", standby: 160,
             steps: { upstream: [600, 800, 1000], downstream: [600, 800, 1000] } } },
 ];
 

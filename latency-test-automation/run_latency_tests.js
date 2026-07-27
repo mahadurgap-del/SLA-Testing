@@ -1535,11 +1535,19 @@ async function calibrateNetemLinkMap(cfg, monCreds, { signatureMs = 400, settleS
       const before = await linkStats95PById(mon);
       try { await applyToLink(cfg, b.ports, { delayMs: signatureMs }, null); }
       catch (e) { log(`calib: apply to ${b.bridge} failed (${e.message})`); continue; }
-      await sleep(settleSec * 1000);
-      const after = await linkStats95PById(mon);
+      // Idle DMTS refreshes hourLog records slowly (~1-3 min), so a fixed short
+      // settle reads the SAME pre-apply record and sees +0ms. Poll until some
+      // link's latency95P clearly rises (early-exit) or a 4-min budget expires.
+      let bestId = null, bestDelta = 0, after = {};
+      const budget = Date.now() + Math.max(settleSec, 240) * 1000;
+      while (Date.now() < budget && !isAborted()) {
+        await sleep(10000);
+        try { after = await linkStats95PById(mon); } catch { continue; }
+        bestId = null; bestDelta = 0;
+        for (const id of Object.keys(after)) { const d = ((after[id] && after[id].lat) || 0) - ((before[id] && before[id].lat) || 0); if (d > bestDelta) { bestDelta = d; bestId = id; } }
+        if (bestDelta > signatureMs * 0.5) break;
+      }
       try { await clearLink(cfg, b.ports); } catch { /* ignore */ }
-      let bestId = null, bestDelta = 0;
-      for (const id of Object.keys(after)) { const d = ((after[id] && after[id].lat) || 0) - ((before[id] && before[id].lat) || 0); if (d > bestDelta) { bestDelta = d; bestId = id; } }
       const key = bestId != null ? normLinkName(after[bestId] && after[bestId].name) : null;
       if (key && bestDelta > signatureMs * 0.5) {
         // key by physical link NAME (direction-independent), not the per-direction link_id
@@ -1548,7 +1556,8 @@ async function calibrateNetemLinkMap(cfg, monCreds, { signatureMs = 400, settleS
       } else {
         log(`calib: bridge ${b.bridge} → no link responded clearly (max +${Math.round(bestDelta)}ms) — skipped`);
       }
-      await sleep(8000); // let DMTS 95P settle back before the next bridge
+      // wait for the signature to drain before probing the next bridge
+      await sleep(20000);
     }
   } finally { mon.end(); }
   return map;
@@ -1909,7 +1918,7 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
   note(label(det), `delay ${hi}ms (active link)`);
   if (lo > 0) {
     // standby = the next link group on a DIFFERENT bridge
-    const standby = det.groups.find((g) => g.bridge !== det.bridge);
+    const standby = det.groups.find((g) => g.ports.join("+") !== det.ports.join("+"));
     if (standby) {
       await applyToLink(cfg, standby.ports, { delayMs: lo }, impairedIfaces);
       note(label(standby), `delay ${lo}ms (standby link)`);
@@ -1971,7 +1980,7 @@ async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
   const det = await impairTargetPorts(cfg);
   const activePorts = det.ports;
   sync.activeIface = label(det);
-  const standby = det.groups.find((g) => g.bridge !== det.bridge);
+  const standby = det.groups.find((g) => g.ports.join("+") !== det.ports.join("+"));
 
   let current = hi;
   await applyToLink(cfg, activePorts, { delayMs: current }, impairedIfaces);
