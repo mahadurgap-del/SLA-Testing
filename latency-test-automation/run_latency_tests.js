@@ -3514,6 +3514,7 @@ module.exports = {
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
   resetLabBetweenCases, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
   parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
+  collectHourlogSnapshot,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
   runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,

@@ -980,6 +980,36 @@ async function runRegression(cfg, params, opts = {}) {
     } catch (e) { log(`WARN: link calibration failed (${e.message}) — impairment falls back to pps`); }
   }
 
+  // ---- continuous hourLog archive (spoke + hub) ----
+  // The DMTS rolling hourLog only RETAINS ~60 minutes (12 × 5-min buckets), so a
+  // single end-of-run grab cannot cover a multi-hour run. Snapshot both sides
+  // every ~45 min (plus a final one at run end) into _hourlog_archive/; pooled,
+  // the snapshots form one gap-free timeline that any case window can be sliced
+  // from by its recorded window (summary.json start/end + hourlogContent*).
+  const archiveDir = path.join(BASE_DIR, "_hourlog_archive");
+  const ARCHIVE_EVERY_MS = 45 * 60 * 1000;
+  let archiveStop = false, archiveN = 0;
+  const archiveOnce = async (tag) => {
+    for (const [side, creds] of [["spoke", cfg.spoke], ["hub", cfg.hub]]) {
+      if (!creds) continue;
+      try {
+        const dir = path.join(archiveDir, side);
+        fs.mkdirSync(dir, { recursive: true });
+        const f = await engine.collectHourlogSnapshot(creds, dir, `archive${tag}`);
+        if (f) log(`hourLog archive: ${side} ${path.basename(f)}`);
+      } catch (e) { log(`WARN: hourLog archive ${side} failed: ${(e.message || "").split("\n")[0]}`); }
+    }
+  };
+  const archiveLoop = (async () => {
+    await archiveOnce(`_${String(++archiveN).padStart(2, "0")}`); // baseline at run start
+    while (!archiveStop && !engine.isAborted()) {
+      const until = Date.now() + ARCHIVE_EVERY_MS;
+      while (Date.now() < until && !archiveStop && !engine.isAborted()) await engine.sleep(5000);
+      if (archiveStop || engine.isAborted()) break;
+      await archiveOnce(`_${String(++archiveN).padStart(2, "0")}`);
+    }
+  })();
+
   // ---- browser (screenshots only; optional) ----
   let browser = null, page = null;
   try { ({ browser, page } = await engine.openNetemUi(cfg)); }
@@ -1105,6 +1135,11 @@ async function runRegression(cfg, params, opts = {}) {
       log(`CASE ${c.n}/${total} ${c.id} DONE — ${statusText(r)}${caseRec.uploaded ? " — uploaded" : ""}`);
     }
   } finally {
+    // final archive snapshot (covers the tail since the last periodic one), then
+    // stop the loop
+    try { await archiveOnce("_final"); } catch { /* ignore */ }
+    archiveStop = true;
+    try { await archiveLoop; } catch { /* ignore */ }
     if (browser) { try { await browser.close(); } catch { /* ignore */ } }
     if (engine.activeImpairments && engine.activeImpairments.size) {
       for (const iface of [...engine.activeImpairments]) {
