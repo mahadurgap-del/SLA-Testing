@@ -911,7 +911,9 @@ async function runRegression(cfg, params, opts = {}) {
 
   engine.clearAbort();
   engine.resetRunLogs();
-  engine.setStatus({ phase: "running", caseCount: total, caseIndex: completed.size, mode: "regression" });
+  engine.setStatus({ phase: "running", caseCount: total, caseIndex: completed.size,
+    completedCount: completed.size, runStartedAt: state.startedAt || new Date().toISOString(),
+    tosList: state.tosList || null, iptvMode: !!state.iptvMode, mode: "regression" });
 
   // ---- infrastructure once ----
   await engine.preflight(cfg);
@@ -952,11 +954,14 @@ async function runRegression(cfg, params, opts = {}) {
       if (opts.limit && ranThisRun >= opts.limit) { log(`reached --limit ${opts.limit} — stopping (smoke run)`); break; }
 
       state.currentIndex = c.n;
-      engine.setStatus({ caseIndex: c.n, currentCase: c.id });
-      log(`########## CASE ${c.n}/${total} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
-
       const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec });
       const durationMs = (params.forceCaseSec ? parseInt(params.forceCaseSec, 10) : caseWindowSec(c, params)) * 1000;
+      engine.setStatus({ caseIndex: c.n, currentCase: c.id,
+        currentSuite: c.suite, currentTc: c.testcase, currentDir: c.dirLabel, currentTos: c.tos,
+        caseStartedAt: new Date().toISOString(), currentWindowSec: Math.round(durationMs / 1000),
+        switchObserved: false, completedCount: (state.completed || []).length });
+      log(`########## CASE ${c.n}/${total} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
+
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
@@ -1048,7 +1053,7 @@ async function runRegression(cfg, params, opts = {}) {
 
       saveState(state);
       uiResults.push({ name: c.id, result: r.result || "OBSERVED" });
-      engine.setStatus({ results: uiResults.slice() });
+      engine.setStatus({ results: uiResults.slice(), completedCount: (state.completed || []).length });
       ranThisRun++;
       log(`CASE ${c.n}/${total} ${c.id} DONE — ${statusText(r)}${caseRec.uploaded ? " — uploaded" : ""}`);
     }

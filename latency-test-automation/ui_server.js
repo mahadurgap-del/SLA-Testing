@@ -419,6 +419,37 @@ const PAGE = (d, profileNames) => `<!doctype html>
   #resumeBanner { display:none; border:2px solid #f59e0b; border-radius:8px; padding:14px; margin-bottom:14px; background:#fffbeb; }
   #resumeBanner b { font-size:14px; }
   .badge.obs { background:#e0e7ff; color:#3730a3; }
+  /* --- regression profile: collapsible sections --- */
+  .profile details { border:1px solid var(--bd,#e5e7eb); border-radius:8px; margin:8px 0; background:var(--card,#fff); overflow:hidden; }
+  .profile summary { cursor:pointer; padding:10px 12px; font-weight:600; list-style:none; display:flex; align-items:center; gap:8px; }
+  .profile summary::-webkit-details-marker { display:none; }
+  .profile summary::before { content:"\\25B8"; color:var(--mut,#6b7280); transition:transform .15s; }
+  .profile details[open] summary::before { transform:rotate(90deg); }
+  .profile .body { padding:0 14px 12px 14px; }
+  .profile pre { font:12.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace; background:#0f172a08; border-radius:6px; padding:10px 12px; margin:6px 0; white-space:pre-wrap; }
+  .profile .chk { color:#166534; font-weight:700; }
+  .profile .arrow { color:#2563eb; }
+  /* --- progress bar --- */
+  .pbar { height:12px; border-radius:99px; background:#e5e7eb; overflow:hidden; margin:6px 0; }
+  .pbar > i { display:block; height:100%; background:linear-gradient(90deg,#2563eb,#22c55e); width:0%; transition:width .4s ease; }
+  .summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-top:8px; }
+  .summary-grid > div { background:#0f172a06; border-radius:8px; padding:8px 10px; }
+  .summary-grid .k { font-size:11px; color:var(--mut,#6b7280); text-transform:uppercase; letter-spacing:.04em; }
+  .summary-grid .v { font-size:16px; font-weight:700; margin-top:2px; }
+  /* --- current test case card --- */
+  .tcard { border:2px solid #2563eb; border-radius:10px; padding:12px 14px; background:#eff6ff; margin-top:4px; }
+  .tcard.idle { border-color:#e5e7eb; background:#f9fafb; }
+  .tcard .row2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; margin-top:8px; }
+  .tcard .k { font-size:11px; color:var(--mut,#6b7280); text-transform:uppercase; letter-spacing:.04em; }
+  .tcard .v { font-size:15px; font-weight:700; }
+  /* --- testcase flow checklist --- */
+  .flow { display:flex; flex-wrap:wrap; gap:14px; margin-top:6px; }
+  .flow .grp { min-width:150px; }
+  .flow .grp h4 { margin:0 0 4px; font-size:12px; color:var(--mut,#6b7280); text-transform:uppercase; letter-spacing:.04em; }
+  .flow .step { padding:3px 8px; border-radius:6px; font-size:13px; display:flex; align-items:center; gap:6px; }
+  .flow .step.done { color:#166534; }
+  .flow .step.cur { background:#2563eb; color:#fff; font-weight:700; }
+  .flow .step.todo { color:#9ca3af; }
 </style></head><body>
 <h1>SLA Impairment Test Control Panel</h1>
 <div id="resumeBanner"></div>
@@ -427,7 +458,28 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <fieldset id="runtype"><legend>Run type</legend>
     <label><input type="radio" name="runtype" value="custom" style="width:auto" checked> <b>Custom Run</b> — configure and run a single traffic combination (existing behaviour)</label>
     <label><input type="radio" name="runtype" value="regression" style="width:auto"> <b>SLA Full Regression (6&#215;7 Matrix)</b> — one-click 42-case suite</label>
-    <p id="regNote">Regression mode runs the test cases automatically per the profile. You provide only the connection targets (Client / Server / Spoke / Hub / Netem VM) and the ToS below &mdash; runtime, latency &amp; packet-loss progression, log collection and reports are all fixed by the profile. Results are observations only (no PASS/FAIL); the run resumes from where it left off if interrupted. <b>Confluence is optional</b>: leave &ldquo;Upload results to Confluence&rdquo; checked to publish each case to a shared page, or uncheck it to run local-only &mdash; DMTS hourLogs and per-case reports are always saved under <code>SLA_Regression/</code> regardless.</p>
+    <p id="regNote" style="margin:8px 0 2px;">One-click SLA suite &mdash; you supply only the connection targets and ToS below; runtime, impairment progression, log collection and reports are fixed by the profile.</p>
+    <div class="profile reg-only">
+      <details open><summary>Regression Profile</summary><div class="body"><pre><span class="chk">&#10003;</span> 7 SLA scenarios (4 latency + 3 packet-loss)
+<span class="chk">&#10003;</span> Upstream + Downstream, per ToS
+<span class="chk">&#10003;</span> Confluence upload (optional)
+<span class="chk">&#10003;</span> Resume interrupted runs
+<span class="chk">&#10003;</span> Observation only (no PASS/FAIL)</pre></div></details>
+      <details><summary>Latency Profile</summary><div class="body"><pre>LEO : 30 <span class="arrow">&rarr;</span> 50 <span class="arrow">&rarr;</span> 75 <span class="arrow">&rarr;</span> 100 <span class="arrow">&rarr;</span> 120 ms
+MEO : 150 <span class="arrow">&rarr;</span> 165 <span class="arrow">&rarr;</span> 180 ms
+GEO : 600 <span class="arrow">&rarr;</span> 800 <span class="arrow">&rarr;</span> 1000 ms</pre><div style="font-size:11px;color:var(--mut)">One step per minute on the active link; standby link kept clean.</div></div></details>
+      <details><summary>Packet Loss Profile</summary><div class="body"><pre>Constant : 0 <span class="arrow">&rarr;</span> 2 <span class="arrow">&rarr;</span> 4 <span class="arrow">&rarr;</span> 6 <span class="arrow">&rarr;</span> 8 <span class="arrow">&rarr;</span> 10 %
+Periodic : 0 <span class="arrow">&rarr;</span> 4 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 6 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 10 %
+Random   : 5 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 7 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 8 <span class="arrow">&rarr;</span> 10 %</pre><div style="font-size:11px;color:var(--mut)">Starts at 0%%, escalates +2%%/min to a 10%% ceiling (override with Loss ceiling / --lossmax).</div></div></details>
+      <details><summary>Case Completion</summary><div class="body"><pre><span class="chk">&#10003;</span> Ends on first link switch
+        OR
+<span class="chk">&#10003;</span> Runs the full 5 minutes
+
+After a switch:
+   Wait 60 s (stabilise)  <span class="arrow">&darr;</span>
+   Collect DMTS hourLog   <span class="arrow">&darr;</span>
+   Reset netem &amp; continue next testcase</pre></div></details>
+    </div>
   </fieldset>
 
   <fieldset class="reg-only"><legend>Regression options</legend><div class="grid">
@@ -453,7 +505,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <input name="iptvPktLen" value="1200" placeholder="1200"><div class="errmsg"></div></div>
     <div><label>Stabilise after switch (s)</label>
       <input name="iptvStabilizeSec" value="60" placeholder="60"><div class="errmsg"></div></div>
-    <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode runs the SLA orbit test logic for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>). Latency ramps one step per minute by orbit profile &mdash; <b>LEO</b> 30&rarr;50&rarr;75&rarr;100&rarr;120, <b>MEO</b> 150&rarr;165&rarr;180, <b>GEO</b> 600&rarr;800&rarr;1000 ms (standby link clean). Packet loss starts at <b>0%</b> and increases +2%/min (0&rarr;2&rarr;4&rarr;6&rarr;8&rarr;10) as constant, escalating periodic, and escalating random. Each case ends on the first link switch or runs the full <b>5 minutes</b>; on switch, traffic is left to <b>stabilise</b> (field above) on the new link <b>before</b> the DMTS <b>hourLog</b> is collected (Spoke=upstream, Hub=downstream) &mdash; never immediately at the switch. The latency/PL value and time of the switch and the final active link are recorded. Unchecked + blank ToS = the original 42-case SLA matrix.</div>
+    <div class="full" style="font-size:11px; color:var(--mut);"><b>IPTV mode</b> runs the orbit profile above for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>); on switch only the DMTS hourLog is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix. See the collapsible profile sections above for the full progression.</div>
   </div></fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
@@ -598,6 +650,30 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <b>Debug mode:</b> paused after <span id="pausestage"></span>
     <button type="button" id="continueBtn" style="margin-left:14px;">Continue</button>
   </div>
+  <div class="panel reg-only" id="regProgress">
+    <h2>Regression Progress</h2>
+    <div class="pbar"><i id="p-bar"></i></div>
+    <div id="p-pct" style="font-weight:700; font-size:15px;">0%</div>
+    <div class="summary-grid">
+      <div><div class="k">Completed</div><div class="v" id="p-completed">0 / 0</div></div>
+      <div><div class="k">Est. duration</div><div class="v" id="p-est">—</div></div>
+      <div><div class="k">Runtime</div><div class="v" id="p-runtime">—</div></div>
+      <div><div class="k">Remaining</div><div class="v" id="p-remaining">—</div></div>
+    </div>
+    <div class="tcard idle" id="p-tcard" style="margin-top:12px;">
+      <div style="font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;">Current test case</div>
+      <div class="v" id="p-tc-title" style="font-size:17px;">Idle</div>
+      <div class="row2">
+        <div><div class="k">ToS</div><div class="v" id="p-tc-tos">—</div></div>
+        <div><div class="k">Direction</div><div class="v" id="p-tc-dir">—</div></div>
+        <div><div class="k">Impairment</div><div class="v" id="p-tc-imp">—</div></div>
+        <div><div class="k">Active link</div><div class="v" id="p-tc-link">—</div></div>
+        <div><div class="k">Elapsed</div><div class="v" id="p-tc-elapsed">—</div></div>
+      </div>
+      <div id="p-tc-note" style="margin-top:8px;color:var(--mut);font-size:12px;">—</div>
+    </div>
+    <div class="flow" id="p-flow" style="margin-top:12px;"></div>
+  </div>
   <div class="panel">
     <h2>Live progress</h2>
     <div class="stat">
@@ -625,6 +701,9 @@ const PAGE = (d, profileNames) => `<!doctype html>
 const $ = (id) => document.getElementById(id);
 const form = $("f"), startBtn = $("start");
 let caseStartedAt = null, phase = "idle", pendingBody = null;
+let runStartedAt = null, lastStatus = null;
+const EST_SEC_PER_CASE = 330; // ~5.5 min average (5-min window + reset/collect)
+const fmtDur = (sec) => { sec = Math.max(0, Math.round(sec)); const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), sc = sec % 60; return h ? (h + "h " + m + "m") : (m + "m " + sc + "s"); };
 
 /* ---------- helpers ---------- */
 function formBody() {
@@ -663,9 +742,72 @@ setInterval(() => {
   if (phase === "running" && caseStartedAt) {
     const sec = Math.max(0, Math.floor((Date.now() - new Date(caseStartedAt)) / 1000));
     $("s-elapsed").textContent = Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+    if ($("p-tc-elapsed")) $("p-tc-elapsed").textContent = fmtDur(sec);
+  }
+  if (phase === "running" && runStartedAt && lastStatus) {
+    const runSec = (Date.now() - new Date(runStartedAt)) / 1000;
+    const total = lastStatus.caseCount || 0;
+    const done = lastStatus.completedCount != null ? lastStatus.completedCount : (lastStatus.caseIndex || 0);
+    if ($("p-runtime")) $("p-runtime").textContent = fmtDur(runSec);
+    if ($("p-remaining")) $("p-remaining").textContent = total ? fmtDur(Math.max(0, total - done) * EST_SEC_PER_CASE) : "—";
   }
 }, 1000);
+// Canonical per-block testcase order + display labels for the flow checklist.
+const FLOW = {
+  latency: [["TC1", "Baseline"], ["TC2", "LEO"], ["TC3", "MEO"], ["TC4", "GEO"]],
+  "packet-loss": [["PL_TC1", "Constant"], ["PL_TC2", "Periodic"], ["PL_TC3", "Random"]],
+};
+const FLOW_ORDER = [...FLOW.latency.map((x) => ["latency", x[0]]), ...FLOW["packet-loss"].map((x) => ["packet-loss", x[0]])];
+function renderFlow(s) {
+  const el = $("p-flow"); if (!el) return;
+  const curIdx = FLOW_ORDER.findIndex(([su, tc]) => su === s.currentSuite && tc === s.currentTc);
+  const plNum = { PL_TC1: "TC5", PL_TC2: "TC6", PL_TC3: "TC7" };
+  const group = (title, suite) => {
+    const steps = FLOW[suite].map(([tc, label]) => {
+      const gi = FLOW_ORDER.findIndex(([su, t]) => su === suite && t === tc);
+      const cls = curIdx < 0 ? "todo" : gi < curIdx ? "done" : gi === curIdx ? "cur" : "todo";
+      const num = suite === "packet-loss" ? plNum[tc] : tc;
+      const mark = cls === "done" ? "\\u2713" : cls === "cur" ? "\\u25B6" : "\\u25CB";
+      return '<div class="step ' + cls + '">' + mark + " " + num + " " + label + "</div>";
+    }).join("");
+    return '<div class="grp"><h4>' + title + "</h4>" + steps + "</div>";
+  };
+  el.innerHTML = group("Latency", "latency") + group("Packet Loss", "packet-loss");
+}
+function renderRegression(running, s) {
+  if (!$("regProgress")) return;
+  runStartedAt = s.runStartedAt || runStartedAt;
+  const total = s.caseCount || 0;
+  const done = s.completedCount != null ? s.completedCount : (s.caseIndex || 0);
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  $("p-bar").style.width = pct + "%";
+  $("p-pct").textContent = pct + "%";
+  $("p-completed").textContent = done + " / " + total;
+  $("p-est").textContent = total ? fmtDur(total * EST_SEC_PER_CASE) : "—";
+  // current test-case card
+  const card = $("p-tcard");
+  const active = running && s.currentCase;
+  card.className = "tcard" + (active ? "" : " idle");
+  if (active) {
+    const suiteLabel = s.currentSuite === "packet-loss" ? "Packet Loss" : "Latency";
+    $("p-tc-title").textContent = suiteLabel + " " + (s.currentTc || "") + "  ·  case " + s.caseIndex + "/" + total;
+    $("p-tc-tos").textContent = s.currentTos || "—";
+    $("p-tc-dir").textContent = s.currentDir || "—";
+    $("p-tc-imp").textContent = s.netem || "—";
+    $("p-tc-link").textContent = s.lastSwitch ? s.lastSwitch.toLink : "—";
+    $("p-tc-note").textContent = s.switchObserved
+      ? "Link switched — stabilising, then collecting DMTS hourLog…"
+      : "Waiting for link switch (or full window)…";
+  } else {
+    $("p-tc-title").textContent = phase === "done" ? "Run complete" : "Idle";
+    ["p-tc-tos", "p-tc-dir", "p-tc-imp", "p-tc-link", "p-tc-elapsed"].forEach((id) => { if ($(id)) $(id).textContent = "—"; });
+    $("p-tc-note").textContent = "—";
+  }
+  renderFlow(s);
+}
 function render(running, s) {
+  lastStatus = s;
+  renderRegression(running, s);
   phase = s.phase; caseStartedAt = s.caseStartedAt;
   $("s-phase").innerHTML = s.phase + (running ? ' <span class="badge run">RUNNING</span>' : "");
   $("s-case").textContent = s.currentCase ? s.currentCase + " (" + s.caseIndex + "/" + s.caseCount + ")" : "—";
@@ -905,6 +1047,13 @@ async function refreshRegressionState() {
   try { out = await (await fetch("/api/regression/state")).json(); } catch { return; }
   const s = out && out.state;
   const banner = $("resumeBanner");
+  // reflect a resumable saved run in the progress panel (so it isn't stuck at 0%)
+  if (s && s.exists && !out.running && $("regProgress")) {
+    const pct = s.total ? Math.round((s.completedCount / s.total) * 100) : 0;
+    $("p-bar").style.width = pct + "%"; $("p-pct").textContent = pct + "%";
+    $("p-completed").textContent = (s.completedCount || 0) + " / " + (s.total || 0);
+    $("p-est").textContent = s.total ? fmtDur(s.total * EST_SEC_PER_CASE) : "—";
+  }
   if (!s || !s.exists || s.done || out.running) { banner.style.display = "none"; return; }
   const rf = s.resumeFrom;
   banner.innerHTML =
