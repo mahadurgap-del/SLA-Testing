@@ -1459,14 +1459,21 @@ async function detectActiveLink(cfg, sampleSeconds = 3) {
   }
 }
 
-/** Per-link latency95P keyed by DMTS link_id, from the newest hourLog record. */
-async function linkLatency95PById(conn) {
+/** Direction-independent link key: DMTS link_id is numbered per-direction, so we
+ *  key the netem map by the physical link NAME prefix (e.g. "over3~Dallas"),
+ *  which is stable across UP/DN and across the short/long name forms. */
+function normLinkName(name) {
+  return String(name || "").split("~").slice(0, 2).join("~").trim() || null;
+}
+
+/** Per-link { latency95P, name } keyed by DMTS link_id, newest hourLog record. */
+async function linkStats95PById(conn) {
   const file = await newestHourlogFile(conn);
   if (!file) return {};
   const { stdout } = await sshExec(conn, `tail -c 262144 '${file}'`);
   const rec = lastCompleteRecord(stdout);
   const out = {};
-  if (rec) for (const ch of channelsOf(rec)) if (ch && ch.link_id != null) out[ch.link_id] = ch.latency95P ?? 0;
+  if (rec) for (const ch of channelsOf(rec)) if (ch && ch.link_id != null) out[ch.link_id] = { lat: ch.latency95P ?? 0, name: ch.link_name || null };
   return out;
 }
 
@@ -1511,17 +1518,19 @@ async function calibrateNetemLinkMap(cfg, monCreds, { signatureMs = 400, settleS
   log(`calibrating netem→DMTS link map (${bridges.length} bridges, ${signatureMs}ms signature)…`);
   try {
     for (const b of bridges) {
-      const before = await linkLatency95PById(mon);
+      const before = await linkStats95PById(mon);
       try { await applyToLink(cfg, b.ports, { delayMs: signatureMs }, null); }
       catch (e) { log(`calib: apply to ${b.bridge} failed (${e.message})`); continue; }
       await sleep(settleSec * 1000);
-      const after = await linkLatency95PById(mon);
+      const after = await linkStats95PById(mon);
       try { await clearLink(cfg, b.ports); } catch { /* ignore */ }
       let bestId = null, bestDelta = 0;
-      for (const id of Object.keys(after)) { const d = (after[id] || 0) - (before[id] || 0); if (d > bestDelta) { bestDelta = d; bestId = id; } }
-      if (bestId != null && bestDelta > signatureMs * 0.5) {
-        map[bestId] = b.ports;
-        log(`calib: bridge ${b.bridge} (${b.ports.join("+")}) → DMTS link ${bestId} (+${Math.round(bestDelta)}ms)`);
+      for (const id of Object.keys(after)) { const d = ((after[id] && after[id].lat) || 0) - ((before[id] && before[id].lat) || 0); if (d > bestDelta) { bestDelta = d; bestId = id; } }
+      const key = bestId != null ? normLinkName(after[bestId] && after[bestId].name) : null;
+      if (key && bestDelta > signatureMs * 0.5) {
+        // key by physical link NAME (direction-independent), not the per-direction link_id
+        map[key] = b.ports;
+        log(`calib: bridge ${b.bridge} (${b.ports.join("+")}) → link ${key} (link_id ${bestId}, +${Math.round(bestDelta)}ms)`);
       } else {
         log(`calib: bridge ${b.bridge} → no link responded clearly (max +${Math.round(bestDelta)}ms) — skipped`);
       }
@@ -1545,13 +1554,14 @@ async function impairTargetPorts(cfg) {
       const conn = await sshConnect(cfg._monCreds);
       try {
         const tl = await readTcActiveLink(conn, cfg._monitorTcMatch);
-        if (tl && map[tl.linkId]) {
-          if (det.ports.join("+") !== map[tl.linkId].join("+")) {
-            log(`impair target: traffic on DMTS link ${tl.linkId} (${tl.linkName || "?"}) → ports ${map[tl.linkId].join("+")} (pps would have picked ${det.bridge})`);
+        const key = tl ? normLinkName(tl.linkName) : null;
+        if (key && map[key]) {
+          if (det.ports.join("+") !== map[key].join("+")) {
+            log(`impair target: traffic on link ${key} → ports ${map[key].join("+")} (pps would have picked ${det.bridge})`);
           }
-          return { ...det, ports: map[tl.linkId], bridge: `link${tl.linkId}${tl.linkName ? ` (${tl.linkName})` : ""}`, linkId: tl.linkId, source: "dmts" };
+          return { ...det, ports: map[key], bridge: `${key}`, linkId: tl.linkId, source: "dmts" };
         }
-        if (tl) log(`WARN: traffic TC ${tl.name} on link ${tl.linkId} (${tl.linkName || "?"}) not in calibrated map — using pps ${det.bridge}`);
+        if (tl) log(`WARN: traffic TC ${tl.name} on link ${key || tl.linkId} not in calibrated map — using pps ${det.bridge}`);
       } finally { conn.end(); }
     } catch (e) { log(`WARN: TC-link target failed (${e.message}) — using pps`); }
   }
