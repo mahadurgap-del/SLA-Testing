@@ -1525,8 +1525,9 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     // (sync.switched, set by the monitor) or the max — all on the initially
     // active link.
     const det = await detectActiveLink(cfg);
-    let pct = s.rampStepPct;
+    let pct = s.initialPct != null ? s.initialPct : s.rampStepPct;
     await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
+    sync.currentMs = pct;
     note(label(det), `initial loss ${pct}%`);
     log(`packet-loss: hold ${s.stabilizeSec}s at ${pct}% before ramping — observing for a switch`);
     const holdEnd = Math.min(deadline, Date.now() + s.stabilizeSec * 1000);
@@ -1537,6 +1538,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       try {
         await applyToLink(cfg, det.ports, { lossPct: next }, impairedIfaces);
         pct = next;
+        sync.currentMs = pct;
         note(label(det), `ramp loss ${pct}%`);
       } catch (e) {
         log(`WARN: ramp step to ${next}% failed (${e.message}) — retrying next interval`);
@@ -1580,6 +1582,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       try {
         const det = await detectActiveLink(cfg);
         await applyToLink(cfg, det.ports, { lossPct: rpct }, impairedIfaces);
+        sync.currentMs = rpct;
         note(label(det), `random loss ${rpct}%`);
         await sleepWithin(deadline, randInt(s.randomMinDurSec, s.randomMaxDurSec) * 1000, () => s.endOnSwitch && sync.switched);
         await clearLink(cfg, det.ports);
@@ -1602,6 +1605,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       try {
         const det = await detectActiveLink(cfg);
         await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
+        sync.currentMs = pct;
         note(label(det), `periodic loss ${pct}% (on ${onSec}s)`);
         await sleepWithin(deadline, onSec * 1000, () => s.endOnSwitch && sync.switched);
         await clearLink(cfg, det.ports);
@@ -2220,22 +2224,26 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   try {
     const switchMonitor = await sshConnect(monCreds);
     try {
+      // Post-switch stabilisation window: after the first switch, keep monitoring
+      // for this long so traffic settles on the new link, THEN collect the hourLog
+      // once at case end (collectFinalEvidence) — never immediately at the switch.
+      const stabilizeMs = tc.stabilizeAfterSwitchMs ?? tc.switchTailMs ?? 60000;
       const monitorP = monitorLinkSwitches(switchMonitor, durationMs, async (sw, isFirst) => {
         await shot(`03_switch_${result.switches.length}`);
-        if (isFirst) {
-          // stop the ramp and record the latency that triggered the switch
-          if (!sync.switched) {
-            sync.switched = true;
-            result.switchLatencyMs = sync.currentMs;
-            result.switchAt = sw.wallClock ?? sw.time;
-            if (sync.currentMs != null) {
-              log(`${tc.name}: switch at ${sync.currentMs}ms on ${sync.activeIface} — stopping ramp`);
-            }
-          }
-          const snapTar = await collectHourlogSnapshot(monCreds, monDir, `${tc.name}_switch`);
-          if (snapTar) result.artifacts[monSide].push(snapTar);
+        if (isFirst && !sync.switched) {
+          // stop the ramp and record the value + time that triggered the switch;
+          // do NOT collect the hourLog here — wait for the link to stabilise first.
+          sync.switched = true;
+          result.switchLatencyMs = sync.currentMs;
+          result.switchAt = sw.wallClock ?? sw.time;
+          result.stabilizeSec = Math.round(stabilizeMs / 1000);
+          const at = tc.mode === "packet-loss"
+            ? (sync.currentMs != null ? `${sync.currentMs}% loss` : "loss")
+            : (sync.currentMs != null ? `${sync.currentMs}ms` : "latency");
+          log(`${tc.name}: switch at ${at} on ${sync.activeIface} — stopping ramp; ` +
+              `stabilising ${result.stabilizeSec}s before hourLog`);
         }
-      }, { endAfterSwitchMs: tc.endOnSwitch ? (tc.switchTailMs ?? 12000) : undefined });
+      }, { endAfterSwitchMs: tc.endOnSwitch ? stabilizeMs : undefined });
       const scheduleP = isDynamicPL
         ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null, sync, tc.plPlan || null)
         : isLatencyRamp

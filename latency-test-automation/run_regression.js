@@ -59,29 +59,39 @@ const TOS_LIST = ["0x04", "0x24", "0x38"];
 // Confluence page. buildMatrix() resolves one or the other per mode.
 //   IPTV latency: TC2 steps the active (LEO) link through an explicit per-
 //   direction sequence; TC3/TC4 HOLD fixed active/standby and observe.
+// Latency suite. IPTV/orbit spec follows the SLA Test Execution Criteria:
+// configure latency by orbit profile and ramp one step per minute through the
+// orbit's progression (standby link clean), monitoring for a switch to the
+// alternate link. On switch, traffic is left to stabilise before the hourLog is
+// collected; if no switch, the case runs the full 5-minute window.
+//   LEO 30–120ms:  30 → 50 → 75 → 100 → 120
+//   MEO 150–180ms: 150 → 165 → 180
+//   GEO 600–1000ms: 600 → 800 → 1000
 const LATENCY_TCS = [
   { tc: "TC1", label: "Baseline", baseline: true, active: 0, standby: 0, ceiling: 0,
     iptv: { label: "Baseline" } },
   { tc: "TC2", label: "LEO", active: 30, standby: 0, ceiling: 130,
     iptv: { label: "LEO Latency", standby: 0,
-            steps: { upstream: [40, 75, 100, 135, 170, 200, 250, 300, 350, 400],
-                     downstream: [25, 40, 75, 110, 135, 175, 215, 260, 320, 400] } } },
-  { tc: "TC3", label: "LEO vs MEO", active: 30, standby: 150, ceiling: 400,
-    iptv: { label: "LEO vs MEO", hold: true, active: 30, standby: 200 } },
-  { tc: "TC4", label: "MEO vs GEO", active: 150, standby: 600, ceiling: 1500,
-    iptv: { label: "MEO vs GEO", hold: true, active: 198, standby: 500 } },
+            steps: { upstream: [30, 50, 75, 100, 120], downstream: [30, 50, 75, 100, 120] } } },
+  { tc: "TC3", label: "MEO", active: 150, standby: 0, ceiling: 400,
+    iptv: { label: "MEO Latency", standby: 0,
+            steps: { upstream: [150, 165, 180], downstream: [150, 165, 180] } } },
+  { tc: "TC4", label: "GEO", active: 600, standby: 0, ceiling: 1500,
+    iptv: { label: "GEO Latency", standby: 0,
+            steps: { upstream: [600, 800, 1000], downstream: [600, 800, 1000] } } },
 ];
 
-// Packet-loss suite. IPTV spec (per the page): constant +2%/60s from the start
-// (no 3-min hold); periodic = escalating on/off loss; random = escalating random
-// loss to a threshold. All end on the first switch.
+// Packet-loss suite. IPTV/orbit spec follows the criteria: start at 0% loss and
+// increase gradually (+2% every 60s, e.g. 0 → 2 → 4 → 6 → 8 → 10). Monitor for a
+// switch; on switch let traffic stabilise before collecting the hourLog, else run
+// the full 5-minute window. Ceiling is 10% by default (override with --lossmax).
 const PL_TCS = [
   { tc: "PL_TC1", label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 20,
-    iptv: { label: "Constant Loss", plType: "constant", initialPct: 2, stepPct: 2, ceilingPct: 30, holdSec: 0 } },
+    iptv: { label: "Constant Loss", plType: "constant", initialPct: 0, stepPct: 2, ceilingPct: 10 } },
   { tc: "PL_TC2", label: "Burst Loss", plType: "burst",
-    iptv: { label: "Periodic Loss", plType: "periodic", initialPct: 2, stepPct: 2, ceilingPct: 30, onSec: 20, offSec: 20 } },
+    iptv: { label: "Periodic Loss", plType: "periodic", initialPct: 0, stepPct: 2, ceilingPct: 10, onSec: 20, offSec: 20 } },
   { tc: "PL_TC3", label: "Random Loss", plType: "random",
-    iptv: { label: "Random Loss", plType: "random", escalate: true, initialPct: 2, stepPct: 2, ceilingPct: 30,
+    iptv: { label: "Random Loss", plType: "random", escalate: true, initialPct: 0, stepPct: 2, ceilingPct: 10,
             minGap: 10, maxGap: 30, minDur: 5, maxDur: 15 } },
 ];
 
@@ -144,11 +154,25 @@ function buildMatrix(tosList, iptv) {
  *  so these are the ceilings used only when NO switch occurs. */
 function caseWindowSec(c, params) {
   const iptv = params && params.iptvMode;
+  const FULL = 300; // criteria: full 5-minute observation window when no switch
   let sec;
-  if (c.suite === "latency") {
-    if (c.baseline) sec = 300;
+  if (iptv) {
+    // IPTV/orbit mode: one step per minute, whole case ends on switch (after a
+    // stabilisation tail) or runs the full 5 minutes. A progression long enough
+    // to need >5 min (e.g. a raised --lossmax) extends the window to reach it.
+    if (c.suite === "latency") {
+      const nSteps = (c.steps && c.steps.length) ? c.steps.length : 0;
+      sec = Math.max(nSteps * STEP_INTERVAL_SEC, FULL);
+    } else {
+      const top = (c.ceilingPct != null ? c.ceilingPct : 10);
+      const init = (c.initialPct != null ? c.initialPct : 0);
+      const nSteps = Math.ceil((top - init) / (c.stepPct || 2)) + 1;
+      sec = Math.max(nSteps * STEP_INTERVAL_SEC, FULL);
+    }
+  } else if (c.suite === "latency") {
+    if (c.baseline) sec = FULL;
     else if (c.steps && c.steps.length) sec = c.steps.length * STEP_INTERVAL_SEC + TAIL_SEC; // explicit sequence
-    else if (c.hold) sec = 300;                                                              // fixed-hold observe
+    else if (c.hold) sec = FULL;                                                             // fixed-hold observe
     else {                                                                                   // SLA uniform ramp
       const steps = Math.ceil((c.ceiling - c.active) / STEP_MS);
       sec = HOLD_SEC + steps * STEP_INTERVAL_SEC + TAIL_SEC;
@@ -157,15 +181,6 @@ function caseWindowSec(c, params) {
     const hold = c.holdSec != null ? c.holdSec : HOLD_SEC;
     const steps = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct);
     sec = hold + steps * STEP_INTERVAL_SEC + TAIL_SEC;
-    if (iptv) sec = Math.min(sec, 480);
-  } else if (c.plType === "periodic") {
-    const cycles = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct) + 1;
-    sec = cycles * ((c.onSec || 20) + (c.offSec || 20)) + TAIL_SEC;
-    if (iptv) sec = Math.min(sec, 480);
-  } else if (c.plType === "random" && iptv && c.escalate) {
-    const events = Math.ceil((c.ceilingPct - c.initialPct) / c.stepPct) + 1;
-    sec = events * ((c.maxGap || 30) + (c.maxDur || 15)) + TAIL_SEC;
-    sec = Math.min(sec, 480);
   } else {
     sec = HOLD_SEC + 120; // SLA burst / random
   }
@@ -182,8 +197,14 @@ function caseWindowSec(c, params) {
  */
 function buildTc(c, opts = {}) {
   const iptv = !!opts.iptv;
+  // Criteria: after a switch, let traffic stabilise on the new link BEFORE
+  // collecting the DMTS hourLog (do not collect immediately). This is the
+  // stabilisation tail the monitor keeps running post-switch; the hourLog is
+  // then collected once at case end. Default 60s, override with --stabilize.
+  const stabilizeAfterSwitchMs = (opts.stabilizeSec != null ? opts.stabilizeSec : 60) * 1000;
   const iptvFields = iptv
-    ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true, hourlogOnly: true }
+    ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true,
+        hourlogOnly: true, stabilizeAfterSwitchMs }
     : {};
   if (c.suite === "latency") {
     let rampPlan = null;
@@ -209,8 +230,11 @@ function buildTc(c, opts = {}) {
   const none = { delayMs: 0, lossPct: 0 };
   let base;
   if (c.plType === "constant") {
-    base = { rampStepPct: c.stepPct, rampIntervalSec: STEP_INTERVAL_SEC,
-             stabilizeSec: c.holdSec != null ? c.holdSec : HOLD_SEC, rampMaxPct: c.ceilingPct };
+    // IPTV/orbit mode: start at initialPct (0%) and observe one interval before
+    // ramping (+stepPct/60s). SLA mode keeps its 3-min stabilise hold.
+    base = { initialPct: c.initialPct, rampStepPct: c.stepPct, rampIntervalSec: STEP_INTERVAL_SEC,
+             stabilizeSec: iptv ? (c.holdSec != null ? c.holdSec : STEP_INTERVAL_SEC) : HOLD_SEC,
+             rampMaxPct: c.ceilingPct };
   } else if (c.plType === "periodic") {
     base = { initialPct: c.initialPct, stepPct: c.stepPct, ceilingPct: c.ceilingPct,
              onSec: c.onSec || 20, offSec: c.offSec || 20 };
@@ -236,10 +260,16 @@ function buildTc(c, opts = {}) {
  * Human-readable config strings for the summary table.
  * ========================================================================= */
 
+/** Orbit name (LEO/MEO/GEO) for a latency case, from its test label. */
+function orbitLabel(c) {
+  const w = (c.testLabel || "").trim().split(/\s+/)[0];
+  return /^(LEO|MEO|GEO)$/i.test(w) ? w.toUpperCase() : "Active";
+}
+
 function initialConfig(c) {
   if (c.suite === "latency") {
     if (c.baseline) return "Active 0 ms / Standby 0 ms (baseline)";
-    if (c.steps && c.steps.length) return `Active LEO ramp [${c.steps.join(", ")}] ms / Standby ${c.standby} ms`;
+    if (c.steps && c.steps.length) return `Active ${orbitLabel(c)} ramp [${c.steps.join(", ")}] ms / Standby ${c.standby} ms`;
     if (c.hold) return `Active ${c.active} ms / Standby ${c.standby} ms (fixed hold)`;
     return `Active ${c.active} ms / Standby ${c.standby} ms`;
   }
@@ -433,8 +463,8 @@ function testConfigurationTable(c) {
       return tbl(row("Active Link Delay", "0 ms") + row("Standby Link Delay", "0 ms") +
         row("Hold Time", "5 min (observe)") + row("Increment", "none") + row("Maximum Delay", "0 ms"));
     }
-    if (c.steps && c.steps.length) { // explicit LEO ramp sequence
-      return tbl(row("Active Link", "LEO (ramped)") +
+    if (c.steps && c.steps.length) { // explicit orbit ramp sequence
+      return tbl(row("Active Link", `${orbitLabel(c)} (ramped)`) +
         row("Latency Sequence", `${c.steps.join(", ")} ms`) +
         row("Standby Link Delay", `${c.standby} ms`) +
         row("Step Interval", "60 s per step (ends on switch)") +
@@ -691,13 +721,19 @@ function resultsCell(c, r) {
     const when = r.switchAt || sw.time;
     let why = "";
     if (c.suite === "latency" && r.switchLatencyMs != null) why = ` when active-link latency reached ${r.switchLatencyMs} ms`;
-    else if (c.suite === "packet-loss") why = ` when induced packet loss reached the switch threshold`;
+    else if (c.suite === "packet-loss") why = r.switchLatencyMs != null
+      ? ` when induced packet loss reached ${r.switchLatencyMs}%`
+      : ` when induced packet loss reached the switch threshold`;
     bits.push(`Traffic switched from ${e(sw.fromLink)} to ${e(sw.toLink)} at ${e(when)}${why}.`);
     if (sw.fromLinkLatency95P != null || sw.fromLinkPacketLoss95P != null) {
       bits.push(`At switch: from-link latency95P ${e(sw.fromLinkLatency95P)} ms, packetLoss95P ${e(sw.fromLinkPacketLoss95P)}%.`);
     }
+    // Criteria: hourLog captured only after traffic stabilised on the new link.
+    if (r.stabilizeSec) bits.push(`Traffic allowed to stabilise ${r.stabilizeSec}s on the new link before the DMTS hourLog was captured.`);
+    bits.push(`Final active link: ${e(finalActiveLink(r))}.`);
   } else {
     bits.push(`No load balancing observed. Traffic remained on the same link throughout the ${nMin}-minute test.`);
+    bits.push(`Final active link: ${e(finalActiveLink(r))}.`);
   }
   bits.push(`Final configuration: ${e(finalConfig(c, r))}.`);
   if (r.errors && r.errors.length) bits.push(`Errors: ${e(r.errors.join(" | "))}.`);
@@ -919,7 +955,7 @@ async function runRegression(cfg, params, opts = {}) {
       engine.setStatus({ caseIndex: c.n, currentCase: c.id });
       log(`########## CASE ${c.n}/${total} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
 
-      const tc = buildTc(c, { iptv: state.iptvMode });
+      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec });
       const durationMs = (params.forceCaseSec ? parseInt(params.forceCaseSec, 10) : caseWindowSec(c, params)) * 1000;
       const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
@@ -1060,6 +1096,8 @@ async function main() {
   if (lossArg) params.iptvLossCeiling = parseInt(lossArg.slice("--lossmax=".length), 10);
   const winArg = args.find((a) => a.startsWith("--win="));   // force exact per-case window (s)
   if (winArg) params.forceCaseSec = parseInt(winArg.slice("--win=".length), 10);
+  const stabArg = args.find((a) => a.startsWith("--stabilize=")); // post-switch stabilise before hourLog (s)
+  if (stabArg) params.iptvStabilizeSec = parseInt(stabArg.slice("--stabilize=".length), 10);
   const limitArg = args.find((a) => a.startsWith("--limit=")); // run only N cases (smoke)
   const limit = limitArg ? parseInt(limitArg.slice("--limit=".length), 10) : undefined;
   const onlyArg = args.find((a) => a.startsWith("--only=")); // run only these case ids (smoke)

@@ -310,6 +310,10 @@ const server = http.createServer(async (req, res) => {
       if (body.iptvBwUp && String(body.iptvBwUp).trim()) p.iptvBwUp = String(body.iptvBwUp).trim();
       if (body.iptvBwDown && String(body.iptvBwDown).trim()) p.iptvBwDown = String(body.iptvBwDown).trim();
       if (body.iptvPktLen && String(body.iptvPktLen).trim()) p.iptvPktLen = String(body.iptvPktLen).trim();
+      if (body.iptvStabilizeSec != null && String(body.iptvStabilizeSec).trim()) {
+        const s = parseInt(String(body.iptvStabilizeSec).trim(), 10);
+        if (Number.isFinite(s) && s >= 0) p.iptvStabilizeSec = s;
+      }
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
@@ -442,7 +446,9 @@ const PAGE = (d, profileNames) => `<!doctype html>
       <input name="iptvBwDown" value="6M" placeholder="6M"><div class="errmsg"></div></div>
     <div><label>Packet size (-l bytes)</label>
       <input name="iptvPktLen" value="1200" placeholder="1200"><div class="errmsg"></div></div>
-    <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode runs the IPTV-page test logic for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>). Latency TC2 steps the active LEO link through the page sequences (up 40&hellip;250, down 25&hellip;135); TC3/TC4 hold LEO-vs-MEO / MEO-vs-GEO fixed; packet-loss is constant +2%/min, escalating periodic, and escalating random. Each case <b>ends on the first link switch</b>, detected from the netem overlay interfaces; on switch only the DMTS <b>hourLog</b> is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix.</div>
+    <div><label>Stabilise after switch (s)</label>
+      <input name="iptvStabilizeSec" value="60" placeholder="60"><div class="errmsg"></div></div>
+    <div class="full" style="font-size:11px; color:var(--mut);">IPTV mode runs the SLA orbit test logic for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>). Latency ramps one step per minute by orbit profile &mdash; <b>LEO</b> 30&rarr;50&rarr;75&rarr;100&rarr;120, <b>MEO</b> 150&rarr;165&rarr;180, <b>GEO</b> 600&rarr;800&rarr;1000 ms (standby link clean). Packet loss starts at <b>0%</b> and increases +2%/min (0&rarr;2&rarr;4&rarr;6&rarr;8&rarr;10) as constant, escalating periodic, and escalating random. Each case ends on the first link switch or runs the full <b>5 minutes</b>; on switch, traffic is left to <b>stabilise</b> (field above) on the new link <b>before</b> the DMTS <b>hourLog</b> is collected (Spoke=upstream, Hub=downstream) &mdash; never immediately at the switch. The latency/PL value and time of the switch and the final active link are recorded. Unchecked + blank ToS = the original 42-case SLA matrix.</div>
   </div></fieldset>
   <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
