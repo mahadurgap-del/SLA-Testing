@@ -1206,10 +1206,14 @@ async function runRegression(cfg, params, opts = {}) {
     } catch (e) { log(`WARN: link calibration failed (${e.message}) — impairment falls back to pps`); }
   }
 
-  // ---- browser (screenshots only; optional) ----
-  let browser = null, page = null;
-  try { ({ browser, page } = await engine.openNetemUi(cfg)); }
-  catch (e) { console.log(`WARN: netem UI page unavailable for screenshots (${(e.message || "").split("\n")[0]}) — continuing`); }
+  // ---- NO netem web UI ----
+  // Netem is driven exclusively over SSH (`tc qdisc` on the netem VM) and traffic
+  // exclusively over SSH (iperf3), as forced above. The netem web UI is never
+  // opened or contacted: it was only ever used for screenshots, it is not the
+  // system under test, and depending on it made runs fail when it was down.
+  // page = null makes the screenshot helper a no-op.
+  const browser = null, page = null;
+  log("netem control: SSH (tc qdisc on the netem VM) — the netem web UI is not used");
 
   const uiResults = [];
   let ranThisRun = 0; // for opts.limit (smoke tests)

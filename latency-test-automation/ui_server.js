@@ -373,7 +373,6 @@ const server = http.createServer(async (req, res) => {
           if (i > 0) p.tosTcMap[pair.slice(0, i).trim().toLowerCase()] = pair.slice(i + 1).trim();
         }
       }
-      if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
       // ---- regression configuration: everything must be supplied, nothing assumed ----
@@ -822,8 +821,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
         <option${d.trafficType === "TCP" ? " selected" : ""}>TCP</option></select><div class="errmsg"></div></div>
       <div class="custom-only"><label>Client port</label><input name="clientPort" value="${esc(d.clientPort)}" placeholder="auto"><div class="errmsg"></div></div>
       <div class="custom-only"><label>Server port</label><input name="serverPort" value="${esc(d.serverPort)}"><div class="errmsg"></div></div>
-      <div><label>netem UI URL <span style="font-weight:400;color:#6b7280">(optional, screenshots)</span></label>
-        <input name="netemUiUrl" value="${esc(d.netemUiUrl)}" placeholder="http://netem-host:8080"><div class="errmsg"></div></div>
+      <div class="full hint">Netem is controlled over <b>SSH</b> (<code>tc qdisc</code> on the netem VM) and traffic is generated over <b>SSH</b> (<code>iperf3</code>). The netem web UI is not used and is not required.</div>
     </div>
   </fieldset>
 

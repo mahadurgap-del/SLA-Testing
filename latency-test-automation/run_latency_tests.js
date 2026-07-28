@@ -726,9 +726,15 @@ async function preflight(cfg) {
       throw new Error(`${name} unreachable at ${url}: ${e.message}`);
     }
   };
-  // Netem UI is screenshot-only; netem is CONTROLLED over SSH (checked below), so
-  // a down UI must NOT block the run. Skip screenshots when it's unreachable.
-  if (cfg.netemUiUrl) {
+  // The netem web UI is only ever needed when a driver is explicitly set to
+  // "netem-ui". With the SSH drivers (the default, and forced for regression runs)
+  // netem is controlled by `tc qdisc` over SSH and traffic by iperf3 over SSH, so
+  // the web UI is not contacted at all — never probe it, never depend on it.
+  const uiInUse = cfg.impairmentDriver === "netem-ui" || cfg.trafficDriver === "netem-ui";
+  if (!uiInUse) {
+    cfg.netemUiUrl = null;   // also makes screenshot helpers no-op
+    log("netem control: SSH (tc qdisc) — netem web UI not used, skipping its check");
+  } else if (cfg.netemUiUrl) {
     const up = await httpCheck("Netem UI", cfg.netemUiUrl, { optional: true });
     if (!up) cfg.netemUiUrl = null;
   }
@@ -2495,7 +2501,11 @@ async function openNetemUi(cfg) {
   return { browser, page };
 }
 
+/** DEPRECATED web-UI path. Netem must be driven over SSH (`tc qdisc`); this is
+ *  only reachable when impairmentDriver is explicitly "netem-ui". It fails loudly
+ *  rather than silently doing nothing if a regression run ever lands here. */
 async function configureNetemViaUi(page, tc) {
+  if (!page) throw new Error("configureNetemViaUi called without a netem UI page — netem must be applied over SSH (impairmentDriver=ssh-tc)");
   log(`configuring netem: link1=${describeLink(tc.link1)}, link2=${describeLink(tc.link2)}`);
   await withRetry(async () => {
     // ---- TODO(1): replace with the real controls of netem-ui ----
@@ -2511,6 +2521,7 @@ async function configureNetemViaUi(page, tc) {
 }
 
 async function startTrafficViaUi(page, cfg, traffic) {
+  if (!page) throw new Error("startTrafficViaUi called without a UI page — traffic must be generated over SSH (trafficDriver=ssh)");
   log(`starting traffic: type=${traffic.type}, ToS=${traffic.tos}` +
       (traffic.bandwidth ? `, bw=${traffic.bandwidth}` : "") +
       (cfg.clientIp ? `, client=${cfg.clientIp}` : "") +
