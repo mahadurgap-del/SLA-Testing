@@ -1139,7 +1139,7 @@ async function runRegression(cfg, params, opts = {}) {
     tosList: state.tosList || null, iptvMode: !!state.iptvMode, mode: "regression" });
 
   // Results folder: an operator-supplied label keeps each run separate.
-  const runLabel = String((params && params.runLabel) || "").trim().replace(/[^w.-]+/g, "_");
+  const runLabel = String((params && params.runLabel) || "").trim().replace(/[^\w.-]+/g, "_");
   const runDir = runLabel ? path.join(BASE_DIR, runLabel) : BASE_DIR;
   fs.mkdirSync(runDir, { recursive: true });
   if (runLabel) log(`results folder: ${runDir}`);

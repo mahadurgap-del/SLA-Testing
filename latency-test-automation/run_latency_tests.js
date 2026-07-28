@@ -4017,7 +4017,7 @@ module.exports = {
   parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
   collectHourlogSnapshot, collectDayLog,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
-  runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule,
+  runPacketLossSchedule, applyLatencyViaTc, runLatencyRampSchedule, runLatencyPairSchedule,
   offsetStr, trafficMovement, artifactChecklist, buildCaseSection,
   // internals reused by the regression orchestrator (run_regression.js)
   runTestCase, collectRunMetadata, openNetemUi, activeImpairments, sleep, log,
