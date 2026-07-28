@@ -85,7 +85,7 @@ const REGRESSION_FIELDS = [
   "regDirection", "caseMaxSec", "iptvStabilizeSec", "tosTcMap",
   "latLeo", "latMeo", "latGeo",
   "plStartPct", "plStepPct", "iptvLossCeiling", "plOnSec", "plOffSec", "plRandomSpec",
-  "iptvResetSettleSec", "latLeoFixed", "latMeoFixed", "latGeoFixed", "latProgression",
+  "iptvResetSettleSec", "runLabel", "latLeoFixed", "latMeoFixed", "latGeoFixed", "latProgression",
   "plMaxPct", "plHoldSec", "plMinGapSec", "plMaxGapSec", "plMinDurSec", "plMaxDurSec",
 ];
 
@@ -346,6 +346,7 @@ const server = http.createServer(async (req, res) => {
       { const t = str(body.plTargetLink).toUpperCase();
         p.plTargetLink = (t === "A" || t === "B") ? t : "active"; }
       if (str(body.regDirection)) p.regDirection = str(body.regDirection);
+      if (str(body.runLabel)) p.runLabel = str(body.runLabel);
       if (str(body.iptvResetSettleSec)) {
         const s = parseInt(str(body.iptvResetSettleSec), 10);
         if (Number.isFinite(s) && s >= 0) p.iptvResetSettleSec = s;
@@ -672,6 +673,9 @@ const PAGE = (d, profileNames) => `<!doctype html>
           <option value="B"${d.plTargetLink === "B" ? " selected" : ""}>Pin to Link B</option>
         </select><div class="errmsg"></div>
         <div class="hint" style="margin:3px 0 0;">Loss must hit the traffic's own link to trigger a switch; the other link stays clean. Latency cases always set both links explicitly.</div></div>
+      <div><label>Results folder name <span style="font-weight:400;color:#6b7280">(optional)</span></label>
+        <input name="runLabel" value="${esc(d.runLabel)}" placeholder="e.g. smoke_tc2_pl1"><div class="errmsg"></div>
+        <div class="hint" style="margin:3px 0 0;">Saved under SLA_Regression/&lt;name&gt;/ — blank uses the root.</div></div>
       <div><label>Reset settle time (s)</label>
         <input name="iptvResetSettleSec" value="${esc(d.iptvResetSettleSec)}" placeholder="3"><div class="errmsg"></div></div>
     </div>

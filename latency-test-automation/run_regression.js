@@ -1137,6 +1137,12 @@ async function runRegression(cfg, params, opts = {}) {
     completedCount: completed.size, runStartedAt: state.startedAt || new Date().toISOString(),
     tosList: state.tosList || null, iptvMode: !!state.iptvMode, mode: "regression" });
 
+  // Results folder: an operator-supplied label keeps each run separate.
+  const runLabel = String((params && params.runLabel) || "").trim().replace(/[^w.-]+/g, "_");
+  const runDir = runLabel ? path.join(BASE_DIR, runLabel) : BASE_DIR;
+  fs.mkdirSync(runDir, { recursive: true });
+  if (runLabel) log(`results folder: ${runDir}`);
+
   // ---- STAGE 1: pre-flight validation (fail fast; nothing runs on a bad lab) ----
   engine.setStatus({ stage: "Pre-flight Validation", operation: "Starting validation", preflight: [] });
   const pfSteps = [];
@@ -1222,7 +1228,7 @@ async function runRegression(cfg, params, opts = {}) {
         switchObserved: false, completedCount: (state.completed || []).length });
       log(`########## CASE ${c.n}/${total} — ${c.id} (${c.suiteLabel} ${c.testcase}) ##########`);
 
-      const caseDir = path.join(BASE_DIR, `${c.dirShort}_${c.tos}`, c.suite);
+      const caseDir = path.join(runDir, `${c.dirShort}_${c.tos}`, c.suite);
       fs.mkdirSync(caseDir, { recursive: true });
 
       // CLEAN SLATE: mandatory reset gate before every case so no case inherits
@@ -1341,7 +1347,7 @@ async function runRegression(cfg, params, opts = {}) {
     for (const [side, creds] of [["spoke", cfg.spoke], ["hub", cfg.hub]]) {
       if (!creds) continue;
       try {
-        const files = await engine.collectDayLog(creds, path.join(BASE_DIR, "_daylog", side), state.runId || "run", { sinceMs });
+        const files = await engine.collectDayLog(creds, path.join(runDir, "_daylog", side), state.runId || "run", { sinceMs });
         log(`day log (${side}): ${files.map((f) => path.basename(f)).join(", ")}`);
       } catch (e) { log(`WARN: day log ${side} failed: ${(e.message || "").split("\n")[0]}`); }
     }
@@ -1395,6 +1401,8 @@ async function main() {
   const sipArg = args.find((a) => a.startsWith("--serverip=")); // overlay data-plane target IP
   if (sipArg) params.iptvServerIp = sipArg.slice("--serverip=".length);
   if (args.includes("--calibrate")) params.calibrateLinks = true; // build netem→DMTS link map at start
+  const rlArg = args.find((a) => a.startsWith("--runlabel="));
+  if (rlArg) params.runLabel = rlArg.slice("--runlabel=".length);
   if (args.includes("--latext")) params.iptvLatExtend = true; // extend latency ramps (latency-insensitive classes)
   // Grid-specific ToS→traffic-class overrides: --tcmap=0x54:^FileT,0x64:Short-?fileT
   const tcmapArg = args.find((a) => a.startsWith("--tcmap="));
