@@ -523,7 +523,6 @@ const PAGE = (d, profileNames) => `<!doctype html>
   /* --- clean configuration layout --- */
   form#f { display:flex; flex-direction:column; }
   fieldset#runtype { order:0; }
-  fieldset.sec-profile { order:1; }
   fieldset.sec-ssh { order:2; }
   fieldset.sec-link { order:3; }
   fieldset.sec-traffic { order:4; }
@@ -600,6 +599,15 @@ const PAGE = (d, profileNames) => `<!doctype html>
   fieldset.sec-traffic { order:5; }
   fieldset.sec-latency { order:6; }
   fieldset.sec-pl { order:7; }
+  /* run controls sit at the BOTTOM of the form, with breathing room.
+     (Without an explicit order they default to 0 and jump to the top.) */
+  #globalerr { order:28; margin:4px 0 0; }
+  .btnrow { order:29; display:flex; gap:12px; align-items:stretch; margin:14px 0 26px; }
+  .btnrow #start { flex:1 1 auto; padding:13px 20px; font-size:14px; font-weight:700; }
+  .btnrow #stop { flex:0 0 140px; padding:13px 20px; font-size:14px; font-weight:600; }
+  /* saved configurations: a utility, not configuration — keep it last and small */
+  fieldset.sec-profile { order:30; }
+  fieldset.sec-profile .grid { grid-template-columns:2fr auto auto auto !important; align-items:end; gap:10px; }
   /* --- live status: alerts, checklist, activity log --- */
   .panel.alert-err { border:2px solid #dc2626; background:#fef2f2; }
   .statusdot { font-size:15px; }
@@ -776,7 +784,8 @@ const PAGE = (d, profileNames) => `<!doctype html>
         <tr><td>PL_TC3</td><td>Random Loss</td><td>Random gap + duration, escalating each event</td></tr>
       </tbody></table>
   </fieldset>
-  <fieldset class="sec-profile"><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
+  <fieldset class="sec-profile"><legend>Saved Configurations <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#6b7280">(optional)</span></legend>
+    <p class="hint">Save the settings above under a name, or load a previously saved set.</p><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
       <option value="">— select —</option>
       ${profileNames.map((n) => `<option>${esc(n)}</option>`).join("")}
@@ -912,8 +921,10 @@ const PAGE = (d, profileNames) => `<!doctype html>
   </div></fieldset>
 
   <div class="errmsg" id="globalerr"></div>
-  <button id="start" type="submit">Start Test</button>
-  <button id="stop" type="button" class="red" disabled>Stop</button>
+  <div class="btnrow">
+    <button id="start" type="submit">Start Run</button>
+    <button id="stop" type="button" class="red" disabled>Stop</button>
+  </div>
 </form>
 
 <div>
