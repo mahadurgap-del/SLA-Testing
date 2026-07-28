@@ -123,14 +123,31 @@ function parseLatList(v) {
   return list.length ? list : null;
 }
 
-/** Per-class latency progressions for this run — every value operator-supplied. */
+/**
+ * Per-class latency values for this run — every value operator-supplied.
+ *
+ * Two modes, both driven by configuration alone (no code change needed):
+ *   • DEFAULT (progression off): each class is a single FIXED value
+ *     (params.latLeoFixed / latMeoFixed / latGeoFixed, e.g. 130 / 200 / 1000).
+ *     A one-value list means Link B applies it once and holds it.
+ *   • PROGRESSION on (params.latProgression): each class is a list
+ *     (params.latLeo / latMeo / latGeo, e.g. "30,50,75,100,120,130"), so the
+ *     higher class in each comparison steps one value per interval.
+ * Progression falls back to the fixed value when a list is not supplied.
+ */
 function orbitLists(params) {
   const p = params || {};
+  const prog = !!p.latProgression;
+  const pick = (listVal, fixedVal) => {
+    const fixed = parseLatList(fixedVal);
+    if (!prog) return fixed;
+    return parseLatList(listVal) || fixed;
+  };
   return {
     zero: [0],
-    leo: parseLatList(p.latLeo),
-    meo: parseLatList(p.latMeo),
-    geo: parseLatList(p.latGeo),
+    leo: pick(p.latLeo, p.latLeoFixed),
+    meo: pick(p.latMeo, p.latMeoFixed),
+    geo: pick(p.latGeo, p.latGeoFixed),
   };
 }
 
@@ -184,20 +201,69 @@ const STEP_MS = 50;          // latency ramp step (SLA mode)
 const STEP_INTERVAL_SEC = 60; // one step per minute
 const TAIL_SEC = 60;         // continue monitoring after ceiling reached
 
-/** Build the ordered case list, resolving each case for the run mode.
- *  tosList: default = full 6×7=42 matrix; a single ToS → 2×7=14. iptv: use the
- *  IPTV spec (explicit steps / fixed holds / periodic+escalating loss). */
+/** Every selectable test case id, in execution order (UI checkbox list). */
+const ALL_CASE_IDS = [...LATENCY_TCS.map((t) => t.tc), ...PL_TCS.map((t) => t.tc)];
+
+/** Which directions to execute, from the operator's selection. "both" runs
+ *  every selected case upstream first, then the same set downstream. */
+function selectedDirections(params) {
+  const raw = String((params && params.regDirection) || "both").toLowerCase();
+  if (raw === "upstream") return DIRECTIONS.filter((d) => d.key === "upstream");
+  if (raw === "downstream") return DIRECTIONS.filter((d) => d.key === "downstream");
+  return DIRECTIONS; // both — upstream block first, then downstream
+}
+
+/** Operator-supplied packet-loss shape. Any field left blank keeps the
+ *  scenario's own value, so nothing has to be hardcoded here. */
+function plConfig(params) {
+  const p = params || {};
+  const num = (v) => {
+    const s = String(v ?? "").trim();
+    if (!s) return null;
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    startPct: num(p.plStartPct),
+    stepPct: num(p.plStepPct),
+    maxPct: num(p.plMaxPct != null && String(p.plMaxPct).trim() ? p.plMaxPct : p.iptvLossCeiling),
+    holdSec: num(p.plHoldSec),
+    onSec: num(p.plOnSec),
+    offSec: num(p.plOffSec),
+    minGap: num(p.plMinGapSec),
+    maxGap: num(p.plMaxGapSec),
+    minDur: num(p.plMinDurSec),
+    maxDur: num(p.plMaxDurSec),
+  };
+}
+
+/** Which test cases to execute (checkbox selection); empty selection = all. */
+function selectedCaseIds(params) {
+  let sel = params && params.selectedCases;
+  if (typeof sel === "string") sel = sel.split(/[,\s]+/).filter(Boolean);
+  if (!Array.isArray(sel) || !sel.length) return new Set(ALL_CASE_IDS);
+  const want = new Set(sel.map((s) => String(s).trim().toUpperCase()));
+  const keep = ALL_CASE_IDS.filter((id) => want.has(id.toUpperCase()));
+  return new Set(keep.length ? keep : ALL_CASE_IDS);
+}
+
+/** Build the ordered case list from the operator's selection: for each ToS, for
+ *  each selected direction, the selected latency cases then the selected
+ *  packet-loss cases. Everything is configuration-driven. */
 function buildMatrix(tosList, iptv, params) {
   const list = (Array.isArray(tosList) && tosList.length) ? tosList : (typeof tosList === "string" && tosList.trim() ? [tosList.trim()] : []);
   if (!list.length) throw new Error("buildMatrix: no ToS configured");
   const orbits = orbitLists(params);
+  const wanted = selectedCaseIds(params);
+  const dirs = selectedDirections(params);
+  const pl = plConfig(params);
   const cases = [];
   let n = 0;
-  // ToS-outer so each ToS block holds its upstream+downstream, latency+PL cases
-  // together (matches "for each ToS, run upstream/downstream").
+  // ToS-outer so each ToS block holds its selected directions and cases together
   for (const tos of list) {
-    for (const dir of DIRECTIONS) {
+    for (const dir of dirs) {
       for (const t of LATENCY_TCS) {
+        if (!wanted.has(t.tc)) continue;   // only operator-selected cases
         n++;
         const base = {
           n, id: `${dir.short}_${tos}_${t.tc}`,
@@ -224,17 +290,29 @@ function buildMatrix(tosList, iptv, params) {
         }
       }
       for (const t of PL_TCS) {
+        if (!wanted.has(t.tc)) continue;   // only operator-selected cases
         n++;
         const spec = iptv ? (t.iptv || {}) : t;
+        // Operator-supplied loss shape overrides the scenario defaults, so no
+        // packet-loss value is baked into the code.
+        const o = pl;
         cases.push({
           n, id: `${dir.short}_${tos}_${t.tc}`,
           direction: dir.key, dirShort: dir.short, dirLabel: dir.label, tos,
           suite: "packet-loss", suiteLabel: "Packet Loss",
           testcase: t.tc, testLabel: (iptv && t.iptv && t.iptv.label) || t.label,
           plType: spec.plType || t.plType,
-          initialPct: spec.initialPct, stepPct: spec.stepPct, ceilingPct: spec.ceilingPct,
-          onSec: spec.onSec, offSec: spec.offSec, escalate: !!spec.escalate, holdSec: spec.holdSec,
-          minGap: spec.minGap, maxGap: spec.maxGap, minDur: spec.minDur, maxDur: spec.maxDur,
+          initialPct: o.startPct != null ? o.startPct : spec.initialPct,
+          stepPct: o.stepPct != null ? o.stepPct : spec.stepPct,
+          ceilingPct: o.maxPct != null ? o.maxPct : spec.ceilingPct,
+          onSec: o.onSec != null ? o.onSec : spec.onSec,
+          offSec: o.offSec != null ? o.offSec : spec.offSec,
+          escalate: !!spec.escalate,
+          holdSec: o.holdSec != null ? o.holdSec : spec.holdSec,
+          minGap: o.minGap != null ? o.minGap : spec.minGap,
+          maxGap: o.maxGap != null ? o.maxGap : spec.maxGap,
+          minDur: o.minDur != null ? o.minDur : spec.minDur,
+          maxDur: o.maxDur != null ? o.maxDur : spec.maxDur,
         });
       }
     }
@@ -298,6 +376,8 @@ function buildTc(c, opts = {}) {
   const iptvFields = iptv
     ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true,
         hourlogOnly: true, stabilizeAfterSwitchMs,
+        // traffic validation gate: prove flow + ToS + DMTS classification first
+        tosHex: c.tos, validateTraffic: opts.validateTraffic !== false,
         // which DMTS traffic class this ToS rides on THIS grid (hint; engine
         // falls back to the busiest-rate class when it matches nothing)
         monitorTcMatch: (opts.tcMap || DEFAULT_TOS_TC_MATCH)[String(c.tos).toLowerCase()] || null }
@@ -1133,7 +1213,7 @@ async function runRegression(cfg, params, opts = {}) {
       if (opts.limit && ranThisRun >= opts.limit) { log(`reached --limit ${opts.limit} — stopping (smoke run)`); break; }
 
       state.currentIndex = c.n;
-      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec, tcMap: tosTcMap(params) });
+      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec, tcMap: tosTcMap(params), validateTraffic: params.validateTraffic !== false });
       const durationMs = (params.forceCaseSec ? parseInt(params.forceCaseSec, 10) : caseWindowSec(c, params)) * 1000;
       engine.setStatus({ caseIndex: c.n, currentCase: c.id,
         currentSuite: c.suite, currentTc: c.testcase, currentDir: c.dirLabel, currentTos: c.tos,
@@ -1352,6 +1432,7 @@ if (require.main === module) {
 module.exports = {
   runRegression, buildMatrix, caseWindowSec, buildTc, tosTcMap,
   parseLatList, orbitLists, requiredOrbitClasses, splitIfaces, LATENCY_TCS, PL_TCS,
+  ALL_CASE_IDS, selectedCaseIds, selectedDirections, plConfig,
   loadState, saveState, clearState, stateSummary,
   initialConfig, finalConfig, statusText,
   buildPageBody, iptvRow, ensurePage, appendCase,

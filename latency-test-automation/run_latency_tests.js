@@ -1389,7 +1389,8 @@ function parsePacketCounters(text) {
     const [name, rest] = line.split(":", 2);
     const f = rest.trim().split(/\s+/);
     if (f.length >= 10) {
-      out[name.trim()] = { rxPkts: parseInt(f[1], 10), txPkts: parseInt(f[9], 10) };
+      out[name.trim()] = { rxBytes: parseInt(f[0], 10), rxPkts: parseInt(f[1], 10),
+                           txBytes: parseInt(f[8], 10), txPkts: parseInt(f[9], 10) };
     }
   }
   return out;
@@ -1958,6 +1959,127 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
  * `sync` is shared with the monitor: it reads sync.switched to stop, and the
  * monitor reads sync.currentMs to record the latency at the switch.
  */
+/**
+ * Traffic validation gate — runs AFTER traffic starts and BEFORE any impairment
+ * is applied. Confirms the test is actually exercising the path, so a "no switch"
+ * result can never be an artefact of absent or misclassified traffic.
+ *
+ * Checks: iperf process alive on client (and server) · bytes transmitted ·
+ * bytes received · the configured ToS is visible in the traffic · DMTS reports a
+ * traffic class carrying load · the hourLog is still updating.
+ *
+ * @returns {ok, checks:[{name,status,detail}], failures:[{name,detail}]}
+ */
+async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles, onStep = () => {} } = {}) {
+  const checks = [], failures = [];
+  const step = async (name, fn) => {
+    onStep(name, "run", "");
+    try {
+      const detail = await fn();
+      checks.push({ name, status: "ok", detail: detail || "" });
+      onStep(name, "ok", detail || "");
+    } catch (e) {
+      const detail = (e.message || String(e)).split("\n")[0];
+      checks.push({ name, status: "fail", detail });
+      failures.push({ name, detail });
+      onStep(name, "fail", detail);
+    }
+  };
+
+  // 1. iperf alive on both traffic hosts
+  for (const [label, creds] of [["client", cfg.clientSsh], ["server", cfg.serverSsh]]) {
+    if (!creds) continue;
+    await step(`iperf3 running on ${label}`, async () => {
+      const conn = await sshConnect(creds);
+      try {
+        const { stdout } = await sshExec(conn, "pgrep -c iperf3 || echo 0");
+        const n = parseInt(String(stdout).trim(), 10) || 0;
+        if (n < 1) throw new Error(`iperf3 is not running on the ${label} — traffic generation failed or terminated`);
+        return `${n} process(es)`;
+      } finally { conn.end(); }
+    });
+  }
+
+  // 2. transmitted + received throughput (interface counters on both ends)
+  const bpsOn = async (creds, iface) => {
+    const conn = await sshConnect(creds);
+    try {
+      const read = async () => {
+        const { stdout } = await sshExec(conn, "cat /proc/net/dev");
+        const c = parsePacketCounters(stdout);
+        return c;
+      };
+      const a = await read();
+      await sleep(4000);
+      const b = await read();
+      let bestTx = 0, bestRx = 0, bestIf = null;
+      for (const [name, cb] of Object.entries(b)) {
+        if (iface && name !== iface) continue;
+        const ca = a[name] || { rxBytes: 0, txBytes: 0 };
+        const tx = ((cb.txBytes || 0) - (ca.txBytes || 0)) / 4;
+        const rx = ((cb.rxBytes || 0) - (ca.rxBytes || 0)) / 4;
+        if (tx + rx > bestTx + bestRx) { bestTx = tx; bestRx = rx; bestIf = name; }
+      }
+      return { tx: bestTx, rx: bestRx, iface: bestIf };
+    } finally { conn.end(); }
+  };
+  const MIN_BPS = 20000; // ~20 KB/s — well under any real test load
+  if (cfg.clientSsh) {
+    await step("Bandwidth transmitted", async () => {
+      const r = await bpsOn(cfg.clientSsh, cfg.clientIface || null);
+      if (r.tx < MIN_BPS) throw new Error(`no meaningful transmit on the client (${Math.round(r.tx)} B/s) — traffic is not being generated`);
+      return `${(r.tx / 125000).toFixed(1)} Mbps out${r.iface ? ` on ${r.iface}` : ""}`;
+    });
+  }
+  if (cfg.serverSsh) {
+    await step("Bandwidth received", async () => {
+      const r = await bpsOn(cfg.serverSsh, cfg.serverIface || null);
+      if (r.rx < MIN_BPS) throw new Error(`no meaningful receive on the server (${Math.round(r.rx)} B/s) — no UDP packets are arriving`);
+      return `${(r.rx / 125000).toFixed(1)} Mbps in${r.iface ? ` on ${r.iface}` : ""}`;
+    });
+  }
+
+  // 3. the configured ToS is actually on the wire (server-side capture)
+  if (tosHex && cfg.serverSsh) {
+    await step(`ToS ${tosHex} visible in traffic`, async () => {
+      const conn = await sshConnect(cfg.serverSsh);
+      try {
+        const dec = parseInt(String(tosHex).replace(/^0x/i, ""), 16);
+        if (!Number.isFinite(dec)) throw new Error(`cannot parse ToS ${tosHex}`);
+        // tcpdump is optional on the host; treat absence as "not verifiable"
+        const has = await sshExec(conn, "command -v tcpdump || echo MISSING");
+        if (/MISSING/.test(has.stdout)) return "skipped — tcpdump not installed on the server";
+        const r = await sudoExec(conn, cfg.serverSsh,
+          `timeout 6 tcpdump -n -c 3 "ip and (ip[1] & 0xfc) == ${dec & 0xfc}" 2>/dev/null | wc -l`,
+          { timeoutMs: 20000 });
+        const n = parseInt(String(r.stdout).replace(/[^\d]/g, " ").trim().split(/\s+/).pop(), 10) || 0;
+        if (n < 1) throw new Error(`no packets seen with ToS ${tosHex} — the ToS value does not match the traffic`);
+        return `${n} packet(s) matched`;
+      } finally { conn.end(); }
+    });
+  }
+
+  // 4. DMTS classifies the traffic + hourLog is updating
+  if (monCreds) {
+    await step("DMTS traffic class detected", async () => {
+      const conn = await sshConnect(monCreds);
+      try {
+        const tl = await readTcActiveLink(conn, tcMatch);
+        if (!tl) throw new Error("DMTS did not classify any active traffic class — check the ToS→class mapping");
+        return `${tl.name} on ${tl.linkName || "link " + tl.linkId}`;
+      } finally { conn.end(); }
+    });
+    await step("hourLog updating", async () => {
+      const before = await getHourlogRecordTime(monCreds);
+      const cov = await waitForHourlogCoverage(monCreds, before, 1000, { maxWaitMs: 90000 });
+      if (!cov.covered) throw new Error("the DMTS hourLog is not advancing — DMTS may have stopped");
+      return "advancing";
+    });
+  }
+
+  return { ok: failures.length === 0, checks, failures };
+}
+
 /**
  * Full pre-flight validation for a regression run. Runs BEFORE any test case and
  * fails fast: the first failed check aborts with a precise reason so nothing runs
@@ -2789,6 +2911,39 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     fs.writeFileSync(result.observationsFile, observationsText(result));
     log(`${tc.name} FAILED EARLY: ${e.message}`);
     return result;
+  }
+
+  // ---- traffic validation gate: prove the path is exercised BEFORE impairing ----
+  // A "no switch" result is only meaningful if traffic was really flowing and
+  // DMTS classified it, so a failure here aborts the case instead of producing a
+  // misleading observation.
+  if (tc.validateTraffic !== false) {
+    const tvSteps = [];
+    setStatus({ stage: "Traffic Validation", operation: "Verifying traffic is flowing", trafficChecks: [] });
+    const tv = await validateTrafficFlowing(cfg, {
+      tosHex: tc.tosHex || null,
+      monCreds, tcMatch: tc.monitorTcMatch || undefined, handles: sshHandles,
+      onStep: (name, status, detail) => {
+        const i = tvSteps.findIndex((s) => s.name === name);
+        const rec = { name, status, detail };
+        if (i >= 0) tvSteps[i] = rec; else tvSteps.push(rec);
+        setStatus({ trafficChecks: tvSteps.slice(), operation: status === "run" ? name : `${name}: ${status === "ok" ? "OK" : detail}` });
+      },
+    });
+    result.trafficChecks = tv.checks;
+    if (!tv.ok) {
+      const first = tv.failures[0];
+      const msg = `Traffic validation failed — ${first.name}: ${first.detail}`;
+      result.errors.push(msg);
+      log(`ERROR: ${tc.name}: ${msg}`);
+      // clean teardown: stop traffic, leave netem untouched (none applied yet)
+      try { await stopTraffic(); } catch (e) { log(`WARN: stop traffic: ${e.message}`); }
+      setStatus({ errorDetail: { stage: "Traffic Validation", testcase: tc.name,
+        operation: first.name, reason: first.detail,
+        suggestion: "Confirm iperf is generating traffic on the configured server IP/port, that the ToS matches the DMTS class mapping, and that DMTS is running before retrying." } });
+      throw new Error(msg);
+    }
+    log(`${tc.name}: traffic validation passed (${tv.checks.length} checks)`);
   }
 
   await stageGate(cfg, `${tc.name}: traffic validated`);
@@ -3812,7 +3967,7 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  resetLabBetweenCases, resolveLinkGroups, plTargetPorts, validateRegressionPreflight, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
+  resetLabBetweenCases, resolveLinkGroups, plTargetPorts, validateRegressionPreflight, validateTrafficFlowing, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
   parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
   collectHourlogSnapshot, collectDayLog,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,

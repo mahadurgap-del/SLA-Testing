@@ -85,7 +85,8 @@ const REGRESSION_FIELDS = [
   "regDirection", "caseMaxSec", "iptvStabilizeSec", "tosTcMap",
   "latLeo", "latMeo", "latGeo",
   "plStartPct", "plStepPct", "iptvLossCeiling", "plOnSec", "plOffSec", "plRandomSpec",
-  "iptvResetSettleSec",
+  "iptvResetSettleSec", "latLeoFixed", "latMeoFixed", "latGeoFixed", "latProgression",
+  "plMaxPct", "plHoldSec", "plMinGapSec", "plMaxGapSec", "plMinDurSec", "plMaxDurSec",
 ];
 
 function formDefaults() {
@@ -348,10 +349,18 @@ const server = http.createServer(async (req, res) => {
         const s = parseInt(str(body.iptvResetSettleSec), 10);
         if (Number.isFinite(s) && s >= 0) p.iptvResetSettleSec = s;
       }
-      // ---- Latency progressions per orbit class ----
-      for (const f of ["latLeo", "latMeo", "latGeo"]) if (str(body[f])) p[f] = str(body[f]);
-      // ---- Packet-loss shape ----
-      for (const f of ["plStartPct", "plStepPct", "plOnSec", "plOffSec", "plRandomSpec"]) {
+      // ---- Test case selection ----
+      let sel = body.selectedCases;
+      if (typeof sel === "string") sel = sel.split(/[,\s]+/).filter(Boolean);
+      if (Array.isArray(sel)) p.selectedCases = sel.map((s) => String(s).trim()).filter(Boolean);
+      // ---- Latency: fixed values + optional progression ----
+      p.latProgression = !!body.latProgression;
+      for (const f of ["latLeoFixed", "latMeoFixed", "latGeoFixed", "latLeo", "latMeo", "latGeo"]) {
+        if (str(body[f])) p[f] = str(body[f]);
+      }
+      // ---- Packet-loss shape (all operator-supplied) ----
+      for (const f of ["plStartPct", "plStepPct", "plMaxPct", "plHoldSec", "plOnSec", "plOffSec",
+                       "plMinGapSec", "plMaxGapSec", "plMinDurSec", "plMaxDurSec"]) {
         if (str(body[f])) p[f] = str(body[f]);
       }
       if (body.tosTcMap && String(body.tosTcMap).trim()) {
@@ -376,19 +385,28 @@ const server = http.createServer(async (req, res) => {
       need("iptvPktLen", p.iptvPktLen, "required — packet length in bytes");
       need("iptvBwUp", p.iptvBwUp || p.iptvBw, "required — upstream bandwidth per flow, e.g. 3M");
       need("iptvBwDown", p.iptvBwDown || p.iptvBw, "required — downstream bandwidth per flow, e.g. 6M");
-      need("iptvLossCeiling", p.iptvLossCeiling, "required — packet-loss ceiling %");
+      need("plStepPct", p.plStepPct, "required — loss increment %");
+      need("plMaxPct", p.plMaxPct || p.iptvLossCeiling, "required — maximum loss %");
+      if (!Array.isArray(p.selectedCases) || !p.selectedCases.length) {
+        check.ok = false; check.errors._global = "Select at least one test case to run";
+      }
       // Link A / Link B must not overlap
       const laSet = new Set(String(p.linkA || "").split(/[,\s]+/).filter(Boolean));
       const lbArr = String(p.linkB || "").split(/[,\s]+/).filter(Boolean);
       const dupIf = lbArr.filter((x) => laSet.has(x));
       if (dupIf.length) { check.ok = false; check.errors.linkB = `also listed in Link A: ${dupIf.join(", ")}`; }
       // latency progressions for the orbit classes the scenarios use
-      const clsField = { leo: "latLeo", meo: "latMeo", geo: "latGeo" };
+      // only the classes the SELECTED cases actually use must be configured
+      const clsFixed = { leo: "latLeoFixed", meo: "latMeoFixed", geo: "latGeoFixed" };
+      const clsList = { leo: "latLeo", meo: "latMeo", geo: "latGeo" };
+      const selSet = new Set((p.selectedCases || []).map((s) => String(s).toUpperCase()));
+      const usesCls = { leo: selSet.has("TC2") || selSet.has("TC3"), meo: selSet.has("TC3") || selSet.has("TC4"), geo: selSet.has("TC4") };
       for (const cls of regression.requiredOrbitClasses()) {
-        const f = clsField[cls];
-        if (!regression.parseLatList(p[f])) {
+        if (!usesCls[cls]) continue;
+        const fx = clsFixed[cls];
+        if (!regression.parseLatList(p[fx]) && !(p.latProgression && regression.parseLatList(p[clsList[cls]]))) {
           check.ok = false;
-          check.errors[f] = `required — ${cls.toUpperCase()} values, e.g. "150,165,180" or "150-180"`;
+          check.errors[fx] = `required — ${cls.toUpperCase()} latency in ms (e.g. ${cls === "leo" ? "130" : cls === "meo" ? "200" : "1000"})`;
         }
       }
       // SSH credentials for every node the regression touches
@@ -492,11 +510,11 @@ const PAGE = (d, profileNames) => `<!doctype html>
   pre.cmds { background:#f1f5f9; padding:8px 10px; border-radius:6px; font-size:12px; overflow-x:auto; text-align:left; }
   #runtype { border:2px solid #1d4ed8; background:#eff6ff; }
   #runtype label { display:inline; color:#1a1a2e; font-size:13px; margin-right:20px; white-space:normal; }
-  body[data-runtype="regression"] .custom-only { display:none; }
   #regNote { display:none; font-size:12px; color:var(--mut); margin:6px 0 0; }
   body[data-runtype="regression"] #regNote { display:block; }
-  .reg-only { display:none; }
-  body[data-runtype="regression"] .reg-only { display:block; }
+  .reg-only { display:block; }        /* single mode: always shown */
+  .custom-only { display:none; }      /* legacy duplicate config: retired */
+  fieldset.custom-only { display:none; }
   #resumeBanner { display:none; border:2px solid #f59e0b; border-radius:8px; padding:14px; margin-bottom:14px; background:#fffbeb; }
   #resumeBanner b { font-size:14px; }
   .badge.obs { background:#e0e7ff; color:#3730a3; }
@@ -560,6 +578,26 @@ const PAGE = (d, profileNames) => `<!doctype html>
   .tcard .row2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; margin-top:8px; }
   .tcard .k { font-size:11px; color:var(--mut,#6b7280); text-transform:uppercase; letter-spacing:.04em; }
   .tcard .v { font-size:15px; font-weight:700; }
+  /* --- test case selection --- */
+  .casegrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:10px; }
+  .casebox { display:flex; gap:9px; align-items:flex-start; padding:10px 12px; border:1px solid #e5e7eb;
+    border-radius:8px; background:#fafafa; cursor:pointer; font-size:12.5px; font-weight:500;
+    transition:border-color .12s, background .12s; margin:0; }
+  .casebox:hover { border-color:#c7d2fe; background:#f8faff; }
+  .casebox:has(input:checked) { border-color:#2563eb; background:#eff6ff; }
+  .casebox input { margin-top:2px; }
+  .casebox .cnote { color:#6b7280; font-weight:400; font-size:11px; }
+  .plan { padding:9px 12px; border-radius:8px; background:#eff6ff; border:1px solid #bfdbfe;
+    font-size:12.5px; color:#1e40af; }
+  .plan.warn { background:#fffbeb; border-color:#fde68a; color:#92400e; }
+  label.toggle { display:flex; gap:9px; align-items:flex-start; font-weight:500; font-size:12.5px;
+    padding:10px 12px; border:1px solid #e5e7eb; border-radius:8px; background:#fafafa; cursor:pointer; }
+  fieldset.sec-cases { order:2; }
+  fieldset.sec-ssh { order:3; }
+  fieldset.sec-link { order:4; }
+  fieldset.sec-traffic { order:5; }
+  fieldset.sec-latency { order:6; }
+  fieldset.sec-pl { order:7; }
   /* --- live status: alerts, checklist, activity log --- */
   .panel.alert-err { border:2px solid #dc2626; background:#fef2f2; }
   .statusdot { font-size:15px; }
@@ -588,10 +626,34 @@ const PAGE = (d, profileNames) => `<!doctype html>
 <div id="resumeBanner"></div>
 <div class="cols">
 <form id="f">
-  <fieldset id="runtype"><legend>Run type</legend>
-    <label><input type="radio" name="runtype" value="custom" style="width:auto" checked> <b>Custom Run</b> — configure and run a single traffic combination (existing behaviour)</label>
-    <label><input type="radio" name="runtype" value="regression" style="width:auto"> <b>SLA Full Regression (6&#215;7 Matrix)</b> — one-click 42-case suite</label>
-    <p id="regNote" style="margin:8px 0 2px;">Runs 7 scenarios (4 latency + 3 packet-loss) &times; upstream/downstream per ToS. Every value below is supplied by you &mdash; nothing is assumed about the topology. Observations only (no PASS/FAIL); interrupted runs resume.</p>
+  <!-- ============ TEST CASE SELECTION ============ -->
+  <fieldset id="runtype" class="sec-cases"><legend>Test Case Selection</legend>
+    <p class="hint">Pick exactly what to execute. Selected cases run for <b>every ToS value</b>; with <b>Both</b> directions the whole selected set runs upstream first, then downstream.</p>
+    <div class="casegrid">
+      ${[["TC1", "Baseline", "both links 0 ms"],
+         ["TC2", "Clean vs LEO", "0 ms vs LEO"],
+         ["TC3", "LEO vs MEO", "LEO fixed vs MEO"],
+         ["TC4", "MEO vs GEO", "MEO fixed vs GEO"],
+         ["PL_TC1", "Constant Loss", "steady, escalating"],
+         ["PL_TC2", "Periodic Loss", "on/off cycles"],
+         ["PL_TC3", "Random Loss", "random gap + duration"]]
+        .map(([id, name, note]) => `
+      <label class="casebox"><input type="checkbox" name="selectedCases" value="${id}" style="width:auto" checked>
+        <span><b>${id}</b> &mdash; ${name}<br><span class="cnote">${note}</span></span></label>`).join("")}
+    </div>
+    <div class="grid3" style="margin-top:14px;">
+      <div><label>Direction</label>
+        <select name="regDirection">
+          <option value="both"${d.regDirection === "both" || !d.regDirection ? " selected" : ""}>Both — upstream, then downstream</option>
+          <option value="upstream"${d.regDirection === "upstream" ? " selected" : ""}>Upstream only</option>
+          <option value="downstream"${d.regDirection === "downstream" ? " selected" : ""}>Downstream only</option>
+        </select><div class="errmsg"></div></div>
+      <div><label>ToS value(s) <span class="req">*</span></label>
+        <input name="regressionTos" value="${esc(d.regressionTos)}" placeholder="0x04 or 0x04,0x24,0x38,0x74"><div class="errmsg"></div>
+        <div class="hint" style="margin:3px 0 0;">All selected cases run for each value.</div></div>
+      <div><label>&nbsp;</label>
+        <div id="planSummary" class="plan">&mdash;</div></div>
+    </div>
   </fieldset>
 
   <!-- ============ LINK CONFIGURATION ============ -->
@@ -615,9 +677,6 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <!-- ============ TRAFFIC CONFIGURATION ============ -->
   <fieldset class="reg-only sec-traffic"><legend>Traffic Configuration</legend>
     <div class="grid3">
-      <div><label>ToS / DSCP <span class="req">*</span></label>
-        <input name="regressionTos" value="${esc(d.regressionTos)}" placeholder="e.g. 0x04"><div class="errmsg"></div>
-        <div class="hint">Used for the whole run. Comma-separate to sweep several.</div></div>
       <div><label>Server traffic IP <span class="req">*</span></label>
         <input name="iptvServerIp" value="${esc(d.iptvServerIp)}" placeholder="data-plane IP"><div class="errmsg"></div></div>
       <div><label>Server port <span class="req">*</span></label>
@@ -632,13 +691,7 @@ const PAGE = (d, profileNames) => `<!doctype html>
         <input name="iptvBwUp" value="${esc(d.iptvBwUp)}" placeholder="e.g. 3M"><div class="errmsg"></div></div>
       <div><label>Downstream bandwidth / flow <span class="req">*</span></label>
         <input name="iptvBwDown" value="${esc(d.iptvBwDown)}" placeholder="e.g. 6M"><div class="errmsg"></div></div>
-      <div><label>Direction</label>
-        <select name="regDirection">
-          <option value="both"${d.regDirection === "both" || !d.regDirection ? " selected" : ""}>Upstream + Downstream</option>
-          <option value="upstream"${d.regDirection === "upstream" ? " selected" : ""}>Upstream only</option>
-          <option value="downstream"${d.regDirection === "downstream" ? " selected" : ""}>Downstream only</option>
-        </select><div class="errmsg"></div></div>
-      <div><label>Observation window / case (s)</label>
+      <div><label>Test duration / case (s)</label>
         <input name="caseMaxSec" value="${esc(d.caseMaxSec)}" placeholder="300"><div class="errmsg"></div></div>
       <div><label>Stabilise after switch (s)</label>
         <input name="iptvStabilizeSec" value="${esc(d.iptvStabilizeSec)}" placeholder="60"><div class="errmsg"></div></div>
@@ -650,21 +703,37 @@ const PAGE = (d, profileNames) => `<!doctype html>
 
   <!-- ============ LATENCY CONFIGURATION ============ -->
   <fieldset class="reg-only sec-latency"><legend>Latency Configuration</legend>
-    <p class="hint">Values per orbit class &mdash; comma-separated list (<code>30,50,75,100,120,130</code>) or a range (<code>30-130</code>). Link A holds the class's <b>last</b> value fixed; Link B steps the progression one value per minute.</p>
+    <p class="hint">Fixed latency per orbit class, held for the whole test case. Enable progression below to step the <i>higher</i> class of each comparison instead.</p>
     <div class="grid3">
       <div><label>LEO latency (ms) <span class="req">*</span></label>
-        <input name="latLeo" value="${esc(d.latLeo)}" placeholder="30,50,75,100,120,130"><div class="errmsg"></div></div>
+        <input name="latLeoFixed" value="${esc(d.latLeoFixed)}" placeholder="e.g. 130"><div class="errmsg"></div></div>
       <div><label>MEO latency (ms) <span class="req">*</span></label>
-        <input name="latMeo" value="${esc(d.latMeo)}" placeholder="150,165,180"><div class="errmsg"></div></div>
+        <input name="latMeoFixed" value="${esc(d.latMeoFixed)}" placeholder="e.g. 200"><div class="errmsg"></div></div>
       <div><label>GEO latency (ms) <span class="req">*</span></label>
-        <input name="latGeo" value="${esc(d.latGeo)}" placeholder="600,800,1000"><div class="errmsg"></div></div>
+        <input name="latGeoFixed" value="${esc(d.latGeoFixed)}" placeholder="e.g. 1000"><div class="errmsg"></div></div>
     </div>
-    <table class="scenario"><thead><tr><th>Case</th><th>Scenario</th><th>Link A (fixed)</th><th>Link B (progression)</th></tr></thead>
+
+    <label class="toggle" style="margin-top:14px;">
+      <input type="checkbox" name="latProgression" id="latProgChk" style="width:auto"${d.latProgression ? " checked" : ""}>
+      <span><b>Enable latency progression</b> &mdash; step the higher class through a list instead of holding one value</span></label>
+    <div id="progFields" style="display:${d.latProgression ? "block" : "none"};margin-top:10px;">
+      <div class="grid3">
+        <div><label>LEO progression (ms)</label>
+          <input name="latLeo" value="${esc(d.latLeo)}" placeholder="30,50,75,100,120,130"><div class="errmsg"></div></div>
+        <div><label>MEO progression (ms)</label>
+          <input name="latMeo" value="${esc(d.latMeo)}" placeholder="150,165,180"><div class="errmsg"></div></div>
+        <div><label>GEO progression (ms)</label>
+          <input name="latGeo" value="${esc(d.latGeo)}" placeholder="600,800,1000"><div class="errmsg"></div></div>
+      </div>
+      <div class="hint" style="margin:8px 0 0;">Comma-separated list or a range (<code>30-130</code>). One value applied per minute; a class left blank falls back to its fixed value.</div>
+    </div>
+
+    <table class="scenario"><thead><tr><th>Case</th><th>Link A</th><th>Link B &mdash; fixed mode</th><th>Link B &mdash; progression mode</th></tr></thead>
       <tbody>
-        <tr><td>TC1</td><td>Baseline</td><td>0 ms</td><td>0 ms</td></tr>
-        <tr><td>TC2</td><td>Clean vs LEO</td><td>0 ms</td><td>LEO values</td></tr>
-        <tr><td>TC3</td><td>LEO vs MEO</td><td>LEO (last)</td><td>MEO values</td></tr>
-        <tr><td>TC4</td><td>MEO vs GEO</td><td>MEO (last)</td><td>GEO values</td></tr>
+        <tr><td>TC1</td><td>0 ms</td><td>0 ms</td><td>0 ms</td></tr>
+        <tr><td>TC2</td><td>0 ms</td><td>LEO (fixed)</td><td>LEO list, stepped</td></tr>
+        <tr><td>TC3</td><td>LEO</td><td>MEO (fixed)</td><td>MEO list, stepped</td></tr>
+        <tr><td>TC4</td><td>MEO</td><td>GEO (fixed)</td><td>GEO list, stepped</td></tr>
       </tbody></table>
   </fieldset>
 
@@ -673,17 +742,25 @@ const PAGE = (d, profileNames) => `<!doctype html>
     <p class="hint">Applied to the target link chosen above; the other link stays clean. Loss escalates by the step until the ceiling or a switch.</p>
     <div class="grid3">
       <div><label>Start loss (%)</label>
-        <input name="plStartPct" value="${esc(d.plStartPct)}" placeholder="0"><div class="errmsg"></div></div>
-      <div><label>Step (%)</label>
-        <input name="plStepPct" value="${esc(d.plStepPct)}" placeholder="2"><div class="errmsg"></div></div>
-      <div><label>Ceiling (%) <span class="req">*</span></label>
-        <input name="iptvLossCeiling" value="${esc(d.iptvLossCeiling)}" placeholder="10"><div class="errmsg"></div></div>
+        <input name="plStartPct" value="${esc(d.plStartPct)}" placeholder="e.g. 0"><div class="errmsg"></div></div>
+      <div><label>Loss increment (%) <span class="req">*</span></label>
+        <input name="plStepPct" value="${esc(d.plStepPct)}" placeholder="e.g. 2"><div class="errmsg"></div></div>
+      <div><label>Maximum loss (%) <span class="req">*</span></label>
+        <input name="plMaxPct" value="${esc(d.plMaxPct)}" placeholder="e.g. 10"><div class="errmsg"></div></div>
+      <div><label>Hold time (s)</label>
+        <input name="plHoldSec" value="${esc(d.plHoldSec)}" placeholder="seconds at each level"><div class="errmsg"></div></div>
       <div><label>Periodic ON (s)</label>
-        <input name="plOnSec" value="${esc(d.plOnSec)}" placeholder="20"><div class="errmsg"></div></div>
+        <input name="plOnSec" value="${esc(d.plOnSec)}" placeholder="e.g. 20"><div class="errmsg"></div></div>
       <div><label>Periodic OFF (s)</label>
-        <input name="plOffSec" value="${esc(d.plOffSec)}" placeholder="20"><div class="errmsg"></div></div>
-      <div><label>Random gap / duration (s)</label>
-        <input name="plRandomSpec" value="${esc(d.plRandomSpec)}" placeholder="gap 10-30, dur 5-15"><div class="errmsg"></div></div>
+        <input name="plOffSec" value="${esc(d.plOffSec)}" placeholder="e.g. 20"><div class="errmsg"></div></div>
+      <div><label>Random interval min (s)</label>
+        <input name="plMinGapSec" value="${esc(d.plMinGapSec)}" placeholder="e.g. 10"><div class="errmsg"></div></div>
+      <div><label>Random interval max (s)</label>
+        <input name="plMaxGapSec" value="${esc(d.plMaxGapSec)}" placeholder="e.g. 30"><div class="errmsg"></div></div>
+      <div><label>Random duration min (s)</label>
+        <input name="plMinDurSec" value="${esc(d.plMinDurSec)}" placeholder="e.g. 5"><div class="errmsg"></div></div>
+      <div><label>Random duration max (s)</label>
+        <input name="plMaxDurSec" value="${esc(d.plMaxDurSec)}" placeholder="e.g. 15"><div class="errmsg"></div></div>
     </div>
     <table class="scenario"><thead><tr><th>Case</th><th>Scenario</th><th>Behaviour</th></tr></thead>
       <tbody>
@@ -691,7 +768,6 @@ const PAGE = (d, profileNames) => `<!doctype html>
         <tr><td>PL_TC2</td><td>Periodic Loss</td><td>ON/OFF cycles, escalating each cycle</td></tr>
         <tr><td>PL_TC3</td><td>Random Loss</td><td>Random gap + duration, escalating each event</td></tr>
       </tbody></table>
-    <label style="margin-top:10px;display:block;"><input type="checkbox" name="iptvMode" style="width:auto"${d.iptvMode === false ? "" : " checked"}> Use scenario mode (uncheck only for the legacy SLA matrix)</label>
   </fieldset>
   <fieldset class="sec-profile"><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
@@ -940,7 +1016,10 @@ function formBody() {
   const fd = new FormData(form);
   const body = Object.fromEntries(fd.entries());
   body.confluence = fd.has("confluence");
-  body.iptvMode = fd.has("iptvMode");
+  body.iptvMode = true;                       // single execution mode
+  body.latProgression = fd.has("latProgression");
+  // multi-value checkbox group: every selected test case
+  body.selectedCases = fd.getAll("selectedCases");
   body.headless = !fd.has("headed");
   delete body.headed;
   if (!$("advanced").checked) { body.serverCmd = ""; body.clientCmd = ""; }
@@ -1335,27 +1414,55 @@ $("confirmGo").addEventListener("click", async () => {
 });
 
 /* ---------- SLA Full Regression (6x7 Matrix) ---------- */
-function runType() {
-  const el = form.querySelector('[name="runtype"]:checked');
-  return el ? el.value : "custom";
-}
+/* single execution mode — no run-type toggle */
+function runType() { return "regression"; }
 function applyRunType() {
-  document.body.dataset.runtype = runType();
-  startBtn.textContent = runType() === "regression" ? "Start Full Regression" : "Start Test";
-  if (runType() === "regression") refreshRegressionState();
+  document.body.dataset.runtype = "regression";
+  startBtn.textContent = "Start Run";
+  refreshRegressionState();
 }
-document.querySelectorAll('[name="runtype"]').forEach((el) => el.addEventListener("change", applyRunType));
+
+/** Selected case ids, direction and ToS list → the execution plan. */
+function selectedPlan() {
+  const cases = [...form.querySelectorAll('[name="selectedCases"]:checked')].map((c) => c.value);
+  const dirEl = form.querySelector('[name="regDirection"]');
+  const dir = dirEl ? dirEl.value : "both";
+  const tosArr = (form.querySelector('[name="regressionTos"]').value || "").trim()
+    .split(/[,\\s]+/).filter(Boolean);
+  const nDir = dir === "both" ? 2 : 1;
+  return { cases, dir, tosArr, total: cases.length * nDir * (tosArr.length || 0) };
+}
+
+/** Live "N cases will run" summary under the selection. */
+function updatePlanSummary() {
+  const el = $("planSummary"); if (!el) return;
+  const p = selectedPlan();
+  if (!p.cases.length) { el.textContent = "No test cases selected"; el.className = "plan warn"; return; }
+  if (!p.tosArr.length) { el.textContent = "Enter at least one ToS value"; el.className = "plan warn"; return; }
+  const dirTxt = p.dir === "both" ? "up + down" : p.dir;
+  el.innerHTML = "<b>" + p.total + "</b> test case" + (p.total === 1 ? "" : "s") +
+    " &mdash; " + p.cases.length + " selected \\u00d7 " + p.tosArr.length + " ToS \\u00d7 " + dirTxt;
+  el.className = "plan";
+}
+["selectedCases", "regDirection", "regressionTos"].forEach((n) =>
+  form.querySelectorAll('[name="' + n + '"]').forEach((el) => {
+    el.addEventListener("change", updatePlanSummary);
+    el.addEventListener("input", updatePlanSummary);
+  }));
+// latency progression fields show only when the option is enabled
+const latChk = $("latProgChk");
+if (latChk) latChk.addEventListener("change", () => {
+  $("progFields").style.display = latChk.checked ? "block" : "none";
+});
 
 async function startRegression(resume) {
   clearErrors();
-  const iptv = form.querySelector('[name="iptvMode"]').checked;
-  const tos = (form.querySelector('[name="regressionTos"]').value || "").trim();
-  const tosArr = tos.split(/[,\\s]+/).filter(Boolean);
-  const nTos = tosArr.length || 3;
-  const scope = iptv
-    ? nTos + " ToS (" + (tosArr.join(", ") || "0x04, 0x24, 0x38") + ") \\u00d7 14 = " + (nTos * 14) +
-      " cases, each ending on the first link switch"
-    : "Full SLA matrix: 42 cases (2 directions \\u00d7 3 ToS \\u00d7 7)";
+  const plan = selectedPlan();
+  if (!plan.cases.length) { showErrors({ _global: "Select at least one test case" }); return; }
+  if (!plan.tosArr.length) { showErrors({ regressionTos: "required — at least one ToS value" }); return; }
+  const scope = plan.total + " test cases — " + plan.cases.join(", ") +
+    " \\u00d7 ToS " + plan.tosArr.join(", ") +
+    " \\u00d7 " + (plan.dir === "both" ? "upstream then downstream" : plan.dir);
   const confOn = form.querySelector('[name="confluence"]') && form.querySelector('[name="confluence"]').checked;
   if (!resume && !confirm(
     "Start the SLA regression?\\n\\n" +
@@ -1412,12 +1519,9 @@ async function refreshRegressionState() {
 (async () => {
   try {
     const out = await (await fetch("/api/regression/state")).json();
-    if (out && out.state && out.state.exists && !out.state.done && !out.running) {
-      const r = form.querySelector('[name="runtype"][value="regression"]');
-      if (r) { r.checked = true; }
-    }
   } catch {}
   applyRunType();
+  updatePlanSummary();   // show the execution plan straight away
 })();
 </script>
 </body></html>`;
