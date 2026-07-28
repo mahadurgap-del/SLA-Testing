@@ -1280,18 +1280,24 @@ async function runRegression(cfg, params, opts = {}) {
       };
 
       const caseMeta = { ...baseMeta, direction: c.direction, trafficType: traffic.type, tos: traffic.tos };
-      let r;
+      let r, fatalRun = null;
       try {
         engine.setStatus({ stage: "Test Execution", operation: `${c.testcase} — ${c.testLabel} (${c.dirLabel})` });
         r = await engine.runTestCase(cfg, browser, page, tc, traffic, caseDir, durationMs);
       } catch (e) {
-        // continuous validation: surface WHY the case failed, with a next step
-        engine.setStatus({ errorDetail: { stage: "Test Execution", testcase: c.id,
-          operation: engine.getStatus ? (engine.getStatus().operation || "-") : "-",
-          reason: e.message,
-          suggestion: "Impairment was cleared and traffic stopped. Verify netem SSH connectivity and the Link A/Link B interface configuration before retrying." } });
+        // e.fatalRun (e.g. traffic not running) = a lab condition that makes every
+        // remaining case meaningless. Record this case, then STOP the run — the
+        // engine has already raised the alarm with the reason and next step.
+        if (e.fatalRun) fatalRun = e;
+        else {
+          // continuous validation: surface WHY the case failed, with a next step
+          engine.setStatus({ errorDetail: { stage: "Test Execution", testcase: c.id,
+            operation: engine.getStatus ? (engine.getStatus().operation || "-") : "-",
+            reason: e.message,
+            suggestion: "Impairment was cleared and traffic stopped. Verify netem SSH connectivity and the Link A/Link B interface configuration before retrying." } });
+        }
         log(`ERROR: case ${c.id} failed: ${e.message}`);
-        r = {
+        r = e.caseResult || {
           tc: c.n, name: c.id, mode: c.suite, link1: tc.link1, link2: tc.link2,
           trafficType: traffic.type, tos: traffic.tos, direction: c.direction,
           startTime: null, endTime: null, switches: [], switchObserved: false,
@@ -1337,6 +1343,16 @@ async function runRegression(cfg, params, opts = {}) {
       engine.setStatus({ results: uiResults.slice(), completedCount: (state.completed || []).length });
       ranThisRun++;
       log(`CASE ${c.n}/${total} ${c.id} DONE — ${statusText(r)}${caseRec.uploaded ? " — uploaded" : ""}`);
+
+      // Run-stopping lab condition (e.g. traffic not running): this case's
+      // evidence is saved, the alarm is already showing — stop here instead of
+      // running the remaining cases under the same broken condition.
+      if (fatalRun) {
+        engine.setStatus({ phase: "error", stage: "Stopped", alarm: true });
+        log(`=== RUN STOPPED after ${c.id}: ${fatalRun.message} ===`);
+        log(`    ${total - (state.completed || []).length} case(s) not run. Fix the lab, then start again.`);
+        break;
+      }
     }
   } finally {
     // ---- DMTS DAY log (spoke + hub), one grab covering the whole run ----

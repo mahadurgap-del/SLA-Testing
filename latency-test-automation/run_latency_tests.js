@@ -2961,17 +2961,35 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   try {
     result.trafficVerifiedBps = await verifyTrafficFlowing(cfg, sshHandles);
   } catch (e) {
+    // TRAFFIC IS NOT FLOWING — a run-stopping condition. Impairment is pointless
+    // and every later case would fail the same way, so raise the alarm (visual +
+    // audible in the panel) and abort the whole run rather than marching on.
     result.errors.push(e.message);
     await shot("99_traffic_not_flowing");
     try { await stopTraffic(); } catch (e2) { result.errors.push(`stop traffic: ${e2.message}`); }
-    // still collect DMTS evidence so a failed case can be analyzed
+    // still collect DMTS evidence so the failed case can be analysed
     log(`${tc.name} failed traffic verification — collecting logs for evidence anyway`);
     await collectFinalEvidence();
     result.endTime = new Date().toISOString();
     result.observationsFile = path.join(tcDir, "observations.txt");
     fs.writeFileSync(result.observationsFile, observationsText(result));
-    log(`${tc.name} FAILED EARLY: ${e.message}`);
-    return result;
+    log(`ALARM: ${tc.name} — traffic is NOT running: ${e.message}`);
+    setStatus({
+      alarm: true,
+      errorDetail: {
+        stage: "Traffic Validation", testcase: tc.name,
+        operation: "Traffic generation check",
+        reason: e.message,
+        suggestion: "No traffic is reaching the netem links, so no impairment test is valid. " +
+          "Check that the Server traffic IP is the server's DATA-plane address and is reachable " +
+          "from the client (ping it), that iperf3 is listening on the configured port, and that " +
+          "the overlay path between spoke and hub is up. The run was stopped — fix this, then start again.",
+      },
+    });
+    const err = new Error(`traffic is not running — ${e.message}`);
+    err.fatalRun = true;   // orchestrator: stop the run, do not continue to the next case
+    err.caseResult = result;
+    throw err;
   }
 
   // ---- traffic validation gate: prove the path is exercised BEFORE impairing ----
@@ -2999,10 +3017,13 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       log(`ERROR: ${tc.name}: ${msg}`);
       // clean teardown: stop traffic, leave netem untouched (none applied yet)
       try { await stopTraffic(); } catch (e) { log(`WARN: stop traffic: ${e.message}`); }
-      setStatus({ errorDetail: { stage: "Traffic Validation", testcase: tc.name,
+      setStatus({ alarm: true, errorDetail: { stage: "Traffic Validation", testcase: tc.name,
         operation: first.name, reason: first.detail,
-        suggestion: "Confirm iperf is generating traffic on the configured server IP/port, that the ToS matches the DMTS class mapping, and that DMTS is running before retrying." } });
-      throw new Error(msg);
+        suggestion: "Confirm iperf is generating traffic on the configured server IP/port, that the ToS matches the DMTS class mapping, and that DMTS is running before retrying. The run was stopped." } });
+      const err = new Error(msg);
+      err.fatalRun = true;   // stop the run — do not continue to the next case
+      err.caseResult = result;
+      throw err;
     }
     log(`${tc.name}: traffic validation passed (${tv.checks.length} checks)`);
   }
