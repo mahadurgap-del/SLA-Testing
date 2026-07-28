@@ -52,37 +52,97 @@ const DIRECTIONS = [
   { key: "upstream", short: "UP", label: "Upstream" },
   { key: "downstream", short: "DN", label: "Downstream" },
 ];
-const TOS_LIST = ["0x04", "0x24", "0x38"];
+// No ToS default: the operator supplies the value(s) in the UI / --tos.
 
 // Latency suite. Each entry carries BOTH the original SLA-matrix spec (active/
 // standby/ceiling uniform ramp) and an `iptv` spec modelled on the IPTV Testing
 // Confluence page. buildMatrix() resolves one or the other per mode.
 //   IPTV latency: TC2 steps the active (LEO) link through an explicit per-
 //   direction sequence; TC3/TC4 HOLD fixed active/standby and observe.
-// Latency suite. IPTV/orbit spec follows the SLA Test Execution Criteria:
-// configure latency by orbit profile and ramp one step per minute through the
-// orbit's progression (standby link clean), monitoring for a switch to the
-// alternate link. On switch, traffic is left to stabilise before the hourLog is
-// collected; if no switch, the case runs the full 5-minute window.
-//   LEO 30–120ms:  30 → 50 → 75 → 100 → 120
-//   MEO 150–180ms: 150 → 165 → 180
-//   GEO 600–1000ms: 600 → 800 → 1000
+// Latency suite — SATELLITE-CLASS TRANSITIONS. Each scenario configures an
+// explicit latency value on EACH of the two netem links; the test never assumes
+// which physical link is "active" or "standby" (the two link groups come from
+// the operator's netem interface configuration, in a deterministic order).
+//   TC1  0 ms      vs 0 ms     (baseline, no impairment)
+//   TC2  0 ms      vs LEO      (clean/terrestrial vs LEO)
+//   TC3  LEO       vs MEO
+//   TC4  MEO       vs GEO
+// The per-class values are operator-supplied (UI / --leo --meo --geo) and accept
+// either a single value ("30") or a range ("30-120", ramped one step per minute).
+// Link A holds a FIXED value; Link B walks a PROGRESSION (one value per
+// interval). A class's fixed value (when it sits on Link A) is the LAST value of
+// its progression — the class's representative worst case.
 const LATENCY_TCS = [
-  { tc: "TC1", label: "Baseline", baseline: true, active: 0, standby: 0, ceiling: 0,
-    iptv: { label: "Baseline" } },
-  // Non-active link carries a BELIEVABLE MEO-like latency (130/160 ms) instead of
-  // 0 — a clean 0ms standby vs an impaired active is unrealistic, and DMTS has no
-  // credible alternative to weigh. Active ramps per orbit; standby stays fixed.
-  { tc: "TC2", label: "LEO", active: 30, standby: 0, ceiling: 130,
-    iptv: { label: "LEO Latency", standby: 130,
-            steps: { upstream: [30, 50, 75, 100, 120], downstream: [30, 50, 75, 100, 120] } } },
-  { tc: "TC3", label: "MEO", active: 150, standby: 0, ceiling: 400,
-    iptv: { label: "MEO Latency", standby: 160,
-            steps: { upstream: [150, 165, 180], downstream: [150, 165, 180] } } },
-  { tc: "TC4", label: "GEO", active: 600, standby: 0, ceiling: 1500,
-    iptv: { label: "GEO Latency", standby: 160,
-            steps: { upstream: [600, 800, 1000], downstream: [600, 800, 1000] } } },
+  { tc: "TC1", label: "Baseline", baseline: true, linkA: "zero", linkB: "zero" },
+  { tc: "TC2", label: "Clean vs LEO", linkA: "zero", linkB: "leo" },
+  { tc: "TC3", label: "LEO vs MEO", linkA: "leo", linkB: "meo" },
+  { tc: "TC4", label: "MEO vs GEO", linkA: "meo", linkB: "geo" },
 ];
+
+/** Actionable next step for a failed pre-flight check (shown in the UI). */
+function preflightSuggestion(name) {
+  const n = String(name).toLowerCase();
+  if (n.includes("ssh connection")) return "Verify the host address, username and password/key for this node, and that SSH is reachable from this machine.";
+  if (n.includes("iperf3")) return "Install iperf3 on this host (e.g. apt install iperf3) and ensure it is on PATH.";
+  if (n.includes("tc + sudo")) return "Ensure the netem user can run 'sudo tc' (passwordless sudo or a correct password).";
+  if (n.includes("interfaces")) return "Check the Link A / Link B interface names against 'ip link show' on the netem VM.";
+  if (n.includes("distinct")) return "Give Link A and Link B different interfaces — a link cannot appear in both groups.";
+  if (n.includes("hourlog")) return "Confirm DMTS is running on this node and that /var/log/dmts/hourLog is readable by the SSH user.";
+  return "Review the configuration for this component and retry.";
+}
+
+/** Split a comma/space separated interface list into an array. */
+function splitIfaces(v) {
+  if (Array.isArray(v)) return v.map((s) => String(s).trim()).filter(Boolean);
+  return String(v ?? "").split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Parse an operator latency progression into a list of ms values. Accepts a
+ * comma/space list ("30,50,75,100,120,130") or a range ("30-130", expanded into
+ * evenly spaced steps). Returns null when nothing is configured, so callers
+ * surface a validation error rather than inventing a value.
+ */
+function parseLatList(v) {
+  if (Array.isArray(v)) {
+    const l = v.map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n) && n >= 0);
+    return l.length ? l : null;
+  }
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const range = s.match(/^(\d+)\s*[-–]\s*(\d+)$/);
+  if (range) {
+    const from = parseInt(range[1], 10), to = parseInt(range[2], 10);
+    if (!(to > from)) return [from];
+    const n = Math.min(8, Math.max(2, Math.round((to - from) / 50) + 1));
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(Math.round(from + ((to - from) * i) / (n - 1)));
+    return out;
+  }
+  const list = s.split(/[,\s]+/).map((x) => parseInt(x, 10)).filter((n) => Number.isFinite(n) && n >= 0);
+  return list.length ? list : null;
+}
+
+/** Per-class latency progressions for this run — every value operator-supplied. */
+function orbitLists(params) {
+  const p = params || {};
+  return {
+    zero: [0],
+    leo: parseLatList(p.latLeo),
+    meo: parseLatList(p.latMeo),
+    geo: parseLatList(p.latGeo),
+  };
+}
+
+/** Orbit classes a latency run needs configured (drives validation messages). */
+function requiredOrbitClasses() {
+  const need = new Set();
+  for (const t of LATENCY_TCS) {
+    if (t.linkA && t.linkA !== "zero") need.add(t.linkA);
+    if (t.linkB && t.linkB !== "zero") need.add(t.linkB);
+  }
+  return [...need];
+}
 
 // Packet-loss suite. IPTV/orbit spec follows the criteria: start at 0% loss and
 // increase gradually (+2% every 60s, e.g. 0 → 2 → 4 → 6 → 8 → 10). Monitor for a
@@ -127,8 +187,10 @@ const TAIL_SEC = 60;         // continue monitoring after ceiling reached
 /** Build the ordered case list, resolving each case for the run mode.
  *  tosList: default = full 6×7=42 matrix; a single ToS → 2×7=14. iptv: use the
  *  IPTV spec (explicit steps / fixed holds / periodic+escalating loss). */
-function buildMatrix(tosList, iptv) {
-  const list = (Array.isArray(tosList) && tosList.length) ? tosList : TOS_LIST;
+function buildMatrix(tosList, iptv, params) {
+  const list = (Array.isArray(tosList) && tosList.length) ? tosList : (typeof tosList === "string" && tosList.trim() ? [tosList.trim()] : []);
+  if (!list.length) throw new Error("buildMatrix: no ToS configured");
+  const orbits = orbitLists(params);
   const cases = [];
   let n = 0;
   // ToS-outer so each ToS block holds its upstream+downstream, latency+PL cases
@@ -144,12 +206,18 @@ function buildMatrix(tosList, iptv) {
           testcase: t.tc, baseline: !!t.baseline,
         };
         if (iptv) {
-          const i = t.iptv || {};
-          const steps = i.steps ? (i.steps[dir.key] || []) : null;
-          cases.push({ ...base, testLabel: i.label || t.label,
-            steps, hold: !!i.hold,
-            active: steps && steps.length ? steps[0] : (i.active != null ? i.active : t.active),
-            standby: i.standby != null ? i.standby : t.standby, ceiling: null });
+          // Link A = FIXED (last value of its class progression, 0 for "zero");
+          // Link B = the class progression, stepped one value per interval.
+          const aCls = t.linkA, bCls = t.linkB;
+          const aList = orbits[aCls] || [0];
+          const bList = orbits[bCls] || [0];
+          const aFixed = aCls === "zero" ? 0 : aList[aList.length - 1];
+          cases.push({ ...base, testLabel: t.label,
+            linkAClass: aCls, linkBClass: bCls,
+            linkAFixed: aFixed,
+            linkBSteps: bCls === "zero" ? [0] : bList,
+            // legacy reporting fields
+            active: aFixed, standby: bList[bList.length - 1], steps: null, hold: false, ceiling: null });
         } else {
           cases.push({ ...base, testLabel: t.label,
             active: t.active, standby: t.standby, ceiling: t.ceiling, steps: null, hold: false });
@@ -185,7 +253,8 @@ function caseWindowSec(c, params) {
     // stabilisation tail) or runs the full 5 minutes. A progression long enough
     // to need >5 min (e.g. a raised --lossmax) extends the window to reach it.
     if (c.suite === "latency") {
-      const nSteps = (c.steps && c.steps.length) ? c.steps.length : 0;
+      // one interval per Link B progression value (Link A is fixed)
+      const nSteps = Math.max((c.linkBSteps || []).length, (c.steps && c.steps.length) || 0);
       sec = Math.max(nSteps * STEP_INTERVAL_SEC, FULL);
     } else {
       const top = (c.ceilingPct != null ? c.ceilingPct : 10);
@@ -234,12 +303,18 @@ function buildTc(c, opts = {}) {
         monitorTcMatch: (opts.tcMap || DEFAULT_TOS_TC_MATCH)[String(c.tos).toLowerCase()] || null }
     : {};
   if (c.suite === "latency") {
-    let rampPlan = null;
-    if (!c.baseline) {
-      if (c.steps && c.steps.length) {
-        rampPlan = { initialActiveMs: c.steps[0], standbyMs: c.standby, steps: c.steps,
-                     intervalSec: STEP_INTERVAL_SEC, stabilizeSec: 0 };
-      } else if (c.hold) {
+    // IPTV/orbit mode: explicit per-LINK latency (satellite-class transition).
+    // pairPlan drives runLatencyPairSchedule — no active/standby assumption.
+    let pairPlan = null, rampPlan = null;
+    if (iptv && !c.baseline && c.linkBSteps) {
+      pairPlan = {
+        linkA: { cls: c.linkAClass, fixedMs: c.linkAFixed },
+        linkB: { cls: c.linkBClass, steps: c.linkBSteps },
+        intervalSec: STEP_INTERVAL_SEC,
+      };
+    } else if (!c.baseline) {
+      // legacy SLA matrix (Custom-Run style active/standby ramp) — unchanged
+      if (c.hold) {
         rampPlan = { initialActiveMs: c.active, standbyMs: c.standby, hold: true, stabilizeSec: 0 };
       } else {
         rampPlan = { initialActiveMs: c.active, standbyMs: c.standby, stabilizeSec: HOLD_SEC,
@@ -251,7 +326,7 @@ function buildTc(c, opts = {}) {
       link1: { delayMs: c.active, lossPct: 0 },
       link2: { delayMs: c.standby, lossPct: 0 },
       expectSwitch: !c.baseline, baseline: c.baseline, observeOnly: true,
-      rampPlan, ...iptvFields,
+      pairPlan, rampPlan, ...iptvFields,
     };
   }
   const none = { delayMs: 0, lossPct: 0 };
@@ -293,10 +368,22 @@ function orbitLabel(c) {
   return /^(LEO|MEO|GEO)$/i.test(w) ? w.toUpperCase() : "Active";
 }
 
+/** Class name for display: "zero" → clean, else LEO/MEO/GEO. */
+function clsName(cls) { return cls === "zero" ? "clean" : String(cls || "").toUpperCase(); }
+
+/** "Link A: LEO 130 ms (fixed) / Link B: MEO 150,165,180 ms" */
+function pairLabel(c) {
+  const a = `Link A: ${clsName(c.linkAClass)} ${c.linkAFixed} ms (fixed)`;
+  const steps = c.linkBSteps || [0];
+  const b = `Link B: ${clsName(c.linkBClass)} ${steps.join(",")} ms${steps.length > 1 ? " (progression)" : ""}`;
+  return `${a} / ${b}`;
+}
+
 function initialConfig(c) {
   if (c.suite === "latency") {
-    if (c.baseline) return "Active 0 ms / Standby 0 ms (baseline)";
-    if (c.steps && c.steps.length) return `Active ${orbitLabel(c)} ramp [${c.steps.join(", ")}] ms / Standby ${c.standby} ms`;
+    // explicit per-link values on operator-defined groups (no active/standby)
+    if (c.linkBSteps) return pairLabel(c);
+    if (c.baseline) return "Link A: 0 ms / Link B: 0 ms (baseline)";
     if (c.hold) return `Active ${c.active} ms / Standby ${c.standby} ms (fixed hold)`;
     return `Active ${c.active} ms / Standby ${c.standby} ms`;
   }
@@ -312,9 +399,12 @@ function finalConfig(c, r) {
   const sw = r && r.switchObserved;
   if (c.suite === "latency") {
     if (c.baseline) return "No impairment (baseline)";
-    if (sw && r.switchLatencyMs != null) return `Active reached ${r.switchLatencyMs} ms at switch`;
+    if (sw && r.switchLatencyMs != null) return `Switch with Link B at ${r.switchLatencyMs} ms`;
     if (sw) return "Switched";
-    if (c.steps && c.steps.length) return `Active stepped to ${c.steps[c.steps.length - 1]} ms (no switch)`;
+    if (c.linkBSteps) {
+      const last = c.linkBSteps[c.linkBSteps.length - 1];
+      return `Link B reached ${last} ms (Link A ${c.linkAFixed} ms) — no switch`;
+    }
     if (c.hold) return `Held active ${c.active} ms / standby ${c.standby} ms — no switch`;
     return `Active ramped to ceiling ${c.ceiling} ms (no switch)`;
   }
@@ -782,7 +872,7 @@ function buildPageBody(state, baseMeta) {
   const rows = (state.summaryRows || []).join("");
   const meta =
     `<p><strong>Execution ID:</strong> ${e(state.runId)} &nbsp;|&nbsp; ` +
-    `<strong>ToS:</strong> ${e((state.tosList && state.tosList.join(", ")) || "0x04, 0x24, 0x38")} &nbsp;|&nbsp; ` +
+    `<strong>ToS:</strong> ${e((state.tosList && state.tosList.join(", ")) || "-")} &nbsp;|&nbsp; ` +
     `<strong>Grid:</strong> ${e(baseMeta.gridVersion)} &nbsp;|&nbsp; ` +
     `<strong>Progress:</strong> ${done}/${total} &nbsp;|&nbsp; ` +
     `<strong>Spoke / Hub:</strong> ${e(baseMeta.spokeHost)} / ${e(baseMeta.hubHost)}</p>`;
@@ -881,9 +971,21 @@ async function runRegression(cfg, params, opts = {}) {
   // Force the regression-safe drivers regardless of what the form carried.
   cfg.trafficDriver = "ssh";
   cfg.impairmentDriver = "ssh-tc";
-  if (!cfg.netemCandidates || !cfg.netemCandidates.length) {
-    cfg.netemCandidates = ["ens192", "ens193", "ens224", "ens225"];
+  // Link A / Link B interfaces are operator-supplied — nothing lab-specific is
+  // baked in. They define the two groups every scenario targets; the union is the
+  // set of ports the engine may touch (clear/apply).
+  const la = splitIfaces(params && params.linkA);
+  const lb = splitIfaces(params && params.linkB);
+  if (la.length) cfg.linkA = la;
+  if (lb.length) cfg.linkB = lb;
+  cfg.plTargetLink = String((params && params.plTargetLink) || "A").toUpperCase() === "B" ? "B" : "A";
+  if ((!cfg.netemCandidates || !cfg.netemCandidates.length) && (la.length || lb.length)) {
+    cfg.netemCandidates = [...la, ...lb];
   }
+  if (!cfg.netemCandidates || !cfg.netemCandidates.length) {
+    log("WARN: no Link A / Link B interfaces configured — the engine will auto-detect bridged NICs on the netem VM");
+  }
+  log(`link configuration — Link A: ${la.join("+") || "(auto)"} | Link B: ${lb.join("+") || "(auto)"} | packet loss targets Link ${cfg.plTargetLink}`);
 
   // ---- state: load FIRST so a resume drives mode/ToS from the SAVED run, not
   // from whatever flags this invocation happens to carry. ----
@@ -892,15 +994,17 @@ async function runRegression(cfg, params, opts = {}) {
   if (state) {
     // resume: authoritative values come from the saved state
     iptvMode = !!state.iptvMode;
-    tosList = (Array.isArray(state.tosList) && state.tosList.length) ? state.tosList : TOS_LIST.slice();
+    tosList = (Array.isArray(state.tosList) && state.tosList.length) ? state.tosList : null;
   } else {
-    // fresh run: derive from params
+    // fresh run: derive from params — the ToS is operator-supplied, never assumed
     iptvMode = !!(params && params.iptvMode);
-    tosList = params && params.regressionTosList;
+    tosList = params && (params.regressionTosList || params.tos);
     if (typeof tosList === "string") tosList = tosList.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
-    if (!Array.isArray(tosList) || !tosList.length) tosList = TOS_LIST.slice();
   }
-  let matrix = buildMatrix(tosList, iptvMode);
+  if (!Array.isArray(tosList) || !tosList.length) {
+    throw new Error("No ToS value configured — set the ToS field (e.g. 0x04, 0x24, 0x38, 0x74) before starting the regression");
+  }
+  let matrix = buildMatrix(tosList, iptvMode, params);
   // --only <ids>: run just those cases as a self-contained set (keeps each
   // case's real S.No; total reflects the subset). Used for targeted re-runs.
   if (opts.only && opts.only.size) matrix = matrix.filter((c) => opts.only.has(c.id));
@@ -952,7 +1056,29 @@ async function runRegression(cfg, params, opts = {}) {
     completedCount: completed.size, runStartedAt: state.startedAt || new Date().toISOString(),
     tosList: state.tosList || null, iptvMode: !!state.iptvMode, mode: "regression" });
 
-  // ---- infrastructure once ----
+  // ---- STAGE 1: pre-flight validation (fail fast; nothing runs on a bad lab) ----
+  engine.setStatus({ stage: "Pre-flight Validation", operation: "Starting validation", preflight: [] });
+  const pfSteps = [];
+  const pf = await engine.validateRegressionPreflight(cfg, {
+    onStep: (name, status, detail) => {
+      const i = pfSteps.findIndex((s) => s.name === name);
+      const rec = { name, status, detail };
+      if (i >= 0) pfSteps[i] = rec; else pfSteps.push(rec);
+      engine.setStatus({ preflight: pfSteps.slice(), operation: status === "run" ? name : `${name}: ${status === "ok" ? "OK" : detail}` });
+    },
+  });
+  if (!pf.ok) {
+    const first = pf.failures[0];
+    const msg = `${first.name} — ${first.detail}`;
+    engine.setStatus({ phase: "error", stage: "Pre-flight Validation", error: msg,
+      errorDetail: { stage: "Pre-flight Validation", operation: first.name, reason: first.detail,
+        suggestion: preflightSuggestion(first.name) } });
+    log(`PRE-FLIGHT FAILED: ${msg}`);
+    throw new Error(`Pre-flight validation failed: ${msg}`);
+  }
+  log(`pre-flight validation passed (${pfSteps.length} checks)`);
+  engine.setStatus({ operation: "Validation successful" });
+
   await engine.preflight(cfg);
   if (cfg.netemSsh && (cfg.netemSsh.pass || cfg.netemSsh.keyPath)) await engine.sanitizeNetem(cfg);
 
@@ -1024,26 +1150,28 @@ async function runRegression(cfg, params, opts = {}) {
       // the active link, and settles briefly. Belt-and-suspenders on top of
       // runTestCase's own teardown — a crashed/interrupted case still leaves the
       // next one a known-clean baseline.
+      // ---- STAGE 2: test initialisation ----
+      engine.setStatus({ stage: "Test Initialization", operation: `Preparing ${c.testcase}: stopping iperf, clearing netem` });
       await engine.resetLabBetweenCases(cfg, {
         settleSec: params.iptvResetSettleSec != null ? params.iptvResetSettleSec : 3,
         label: c.id,
       });
 
-      // IPTV mode traffic pattern (operator-specified), per direction:
-      //   upstream (spoke):   iperf3 -u -c 10.40.2.2 -p 5201 -b 3M -l 1200 -P 10  (30 Mbps)
-      //   downstream (hub):   iperf3 -u -c 10.40.2.2 -p 5201 -b 6M -l 1200 -P 10  (60 Mbps)
-      // 1200-byte packets to the overlay data-plane IP; -S <tos> per case.
-      // Overridable via iptvBwUp/iptvBwDown/iptvFlows/iptvPktLen/iptvServerIp/iptvPort.
+      // Traffic parameters — ALL operator-supplied (validated in preflight, so
+      // nothing lab-specific is assumed here). Bandwidth may differ per
+      // direction; a single `iptvBw` applies to both when set.
       const caseBw = state.iptvMode
-        ? (c.direction === "downstream" ? (params.iptvBwDown || "6M") : (params.iptvBwUp || "3M"))
+        ? (c.direction === "downstream"
+            ? (params.iptvBwDown || params.iptvBw)
+            : (params.iptvBwUp || params.iptvBw))
         : params.bandwidth;
-      const caseStreams = state.iptvMode ? (params.iptvFlows || "10") : params.parallelStreams;
+      const caseStreams = state.iptvMode ? params.iptvFlows : params.parallelStreams;
       const caseServerIp = state.iptvMode
-        ? (params.iptvServerIp || params.serverTrafficIp || "10.40.2.2")
+        ? (params.iptvServerIp || params.serverTrafficIp || params.serverIp)
         : (params.serverTrafficIp || params.serverIp);
-      const casePort = state.iptvMode ? (params.iptvPort || "5201") : params.serverPort;
-      const casePkt = state.iptvMode ? (params.iptvPktLen || "1200") : params.packetSize;
-      const caseInterval = state.iptvMode ? (params.iptvInterval || "10") : params.reportInterval;
+      const casePort = state.iptvMode ? params.iptvPort : params.serverPort;
+      const casePkt = state.iptvMode ? params.iptvPktLen : params.packetSize;
+      const caseInterval = state.iptvMode ? params.iptvInterval : params.reportInterval;
       // iperf -t must cover the whole case window (+buffer) so traffic never
       // stops mid-escalation; the case is actually ended by the monitor +
       // stopTraffic (on switch/stabilise or window end), not by iperf's -t.
@@ -1066,8 +1194,14 @@ async function runRegression(cfg, params, opts = {}) {
       const caseMeta = { ...baseMeta, direction: c.direction, trafficType: traffic.type, tos: traffic.tos };
       let r;
       try {
+        engine.setStatus({ stage: "Test Execution", operation: `${c.testcase} — ${c.testLabel} (${c.dirLabel})` });
         r = await engine.runTestCase(cfg, browser, page, tc, traffic, caseDir, durationMs);
       } catch (e) {
+        // continuous validation: surface WHY the case failed, with a next step
+        engine.setStatus({ errorDetail: { stage: "Test Execution", testcase: c.id,
+          operation: engine.getStatus ? (engine.getStatus().operation || "-") : "-",
+          reason: e.message,
+          suggestion: "Impairment was cleared and traffic stopped. Verify netem SSH connectivity and the Link A/Link B interface configuration before retrying." } });
         log(`ERROR: case ${c.id} failed: ${e.message}`);
         r = {
           tc: c.n, name: c.id, mode: c.suite, link1: tc.link1, link2: tc.link2,
@@ -1217,6 +1351,7 @@ if (require.main === module) {
 
 module.exports = {
   runRegression, buildMatrix, caseWindowSec, buildTc, tosTcMap,
+  parseLatList, orbitLists, requiredOrbitClasses, splitIfaces, LATENCY_TCS, PL_TCS,
   loadState, saveState, clearState, stateSummary,
   initialConfig, finalConfig, statusText,
   buildPageBody, iptvRow, ensurePage, appendCase,

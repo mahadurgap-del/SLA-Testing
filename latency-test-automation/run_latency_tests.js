@@ -460,7 +460,7 @@ function buildConfig(p) {
 /** Default parameter set from env vars (wizard/web-UI prefill). */
 function paramsFromEnv() {
   return {
-    netemUiUrl: envOr("NETEM_UI_URL", "http://172.16.226.199:8080"),
+    netemUiUrl: envOr("NETEM_UI_URL", ""),
     // traffic endpoints
     clientIp: envOr("CLIENT_IP", ""),
     serverIp: envOr("SERVER_IP", ""),
@@ -500,8 +500,8 @@ function paramsFromEnv() {
     // drive the netem web panel with Playwright
     impairmentDriver: envOr("IMPAIRMENT_DRIVER", "ssh-tc"),
     // netem VM SSH (impairment via tc + active-link detection)
-    netemHost: envOr("NETEM_HOST", "172.16.226.199"),
-    netemUser: envOr("NETEM_USER", "espace"),
+    netemHost: envOr("NETEM_HOST", ""),
+    netemUser: envOr("NETEM_USER", ""),
     netemPass: envOr("NETEM_PASS", ""),
     netemKey: envOr("NETEM_KEY", ""),
     // restrict active-link detection to the overlay link interfaces (csv, e.g.
@@ -527,18 +527,18 @@ function paramsFromEnv() {
     // interface, e.g. 10.40.2.2) — the plain server IP is the SSH/mgmt address
     serverTrafficIp: envOr("SERVER_TRAFFIC_IP", ""),
     // SSH details
-    clientUser: envOr("CLIENT_USER", "espace"),
+    clientUser: envOr("CLIENT_USER", ""),
     clientPass: envOr("CLIENT_PASS", ""),
     clientKey: envOr("CLIENT_KEY", ""),
-    serverUser: envOr("SERVER_USER", "espace"),
+    serverUser: envOr("SERVER_USER", ""),
     serverPass: envOr("SERVER_PASS", ""),
     serverKey: envOr("SERVER_KEY", ""),
-    spokeHost: envOr("SPOKE_HOST", "172.16.226.113"),
-    spokeUser: envOr("SPOKE_USER", "espace"),
+    spokeHost: envOr("SPOKE_HOST", ""),
+    spokeUser: envOr("SPOKE_USER", ""),
     spokePass: envOr("SPOKE_PASS", ""),
     spokeKey: envOr("SPOKE_KEY", ""),
     hubHost: envOr("HUB_HOST", ""),
-    hubUser: envOr("HUB_USER", "espace"),
+    hubUser: envOr("HUB_USER", ""),
     hubPass: envOr("HUB_PASS", ""),
     hubKey: envOr("HUB_KEY", ""),
     // test selection
@@ -1569,6 +1569,21 @@ async function calibrateNetemLinkMap(cfg, monCreds, { signatureMs = 400, settleS
  * actually on (from DMTS) — this is the fix for impairing the standby link. Falls
  * back to the busiest-pps link (legacy behaviour) whenever anything is missing.
  */
+/**
+ * Which link group the packet-loss schedules impair. When the operator has
+ * configured Link A / Link B, use the chosen target (cfg.plTargetLink, "A" or
+ * "B", default "A") and leave the other link clean — no active/standby guessing.
+ * Falls back to the legacy resolver only when link groups are not configured.
+ */
+async function plTargetPorts(cfg) {
+  if (cfg.linkA && cfg.linkA.length && cfg.linkB && cfg.linkB.length) {
+    const which = String(cfg.plTargetLink || "A").toUpperCase() === "B" ? "B" : "A";
+    const ports = which === "B" ? cfg.linkB : cfg.linkA;
+    return { bridge: `Link ${which}`, ports, source: "configured" };
+  }
+  return impairTargetPorts(cfg);
+}
+
 async function impairTargetPorts(cfg) {
   const det = await detectActiveLink(cfg); // pps result carries .groups for standby logic
   const map = cfg._netemLinkMap;
@@ -1793,7 +1808,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     // natural switch, then ramp +stepPct every intervalSec until a switch
     // (sync.switched, set by the monitor) or the max — all on the initially
     // active link.
-    const det = await impairTargetPorts(cfg);
+    const det = await plTargetPorts(cfg);
     let pct = s.initialPct != null ? s.initialPct : s.rampStepPct;
     await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
     sync.currentMs = pct;
@@ -1824,7 +1839,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     // leaves it unset and keeps running for the full window.
     while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       try {
-        const det = await impairTargetPorts(cfg);
+        const det = await plTargetPorts(cfg);
         await applyToLink(cfg, det.ports, { lossPct: s.burstLossPct }, impairedIfaces);
         note(label(det), `burst loss ${s.burstLossPct}%`);
         await sleepWithin(deadline, s.burstDurationSec * 1000, () => s.endOnSwitch && sync.switched);
@@ -1849,7 +1864,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
       if (!(await sleepWithin(deadline,
         randInt(s.randomMinGapSec, s.randomMaxGapSec) * 1000, () => s.endOnSwitch && sync.switched))) break;
       try {
-        const det = await impairTargetPorts(cfg);
+        const det = await plTargetPorts(cfg);
         await applyToLink(cfg, det.ports, { lossPct: rpct }, impairedIfaces);
         sync.currentMs = rpct;
         note(label(det), `random loss ${rpct}%`);
@@ -1872,7 +1887,7 @@ async function runPacketLossSchedule(cfg, plType, durationMs, impairedIfaces, on
     const step = s.stepPct != null ? s.stepPct : 2;
     while (Date.now() < deadline && !isAborted() && !(s.endOnSwitch && sync.switched)) {
       try {
-        const det = await impairTargetPorts(cfg);
+        const det = await plTargetPorts(cfg);
         await applyToLink(cfg, det.ports, { lossPct: pct }, impairedIfaces);
         sync.currentMs = pct;
         note(label(det), `periodic loss ${pct}% (on ${onSec}s)`);
@@ -1943,6 +1958,221 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
  * `sync` is shared with the monitor: it reads sync.switched to stop, and the
  * monitor reads sync.currentMs to record the latency at the switch.
  */
+/**
+ * Full pre-flight validation for a regression run. Runs BEFORE any test case and
+ * fails fast: the first failed check aborts with a precise reason so nothing runs
+ * against a half-configured lab. Every check reports through onStep so the UI can
+ * show ✓ / ⏳ / ✗ per item.
+ *
+ * Checks: SSH auth to Client/Server/Netem/Spoke/Hub · iperf3 on client+server ·
+ * tc + sudo on netem · Link A/Link B interfaces exist · DMTS hourLog directory
+ * readable and updating on both spoke and hub.
+ *
+ * @param onStep  (name, status, detail) => void   status: "run" | "ok" | "fail"
+ * @returns {ok, failures: [{name, detail}]}
+ */
+async function validateRegressionPreflight(cfg, { onStep = () => {} } = {}) {
+  const failures = [];
+  const step = async (name, fn, { fatal = true } = {}) => {
+    onStep(name, "run", "");
+    try {
+      const detail = await fn();
+      onStep(name, "ok", detail || "");
+      checkpoint(true, `preflight: ${name}`, detail || "");
+      return true;
+    } catch (e) {
+      const detail = (e.message || String(e)).split("\n")[0];
+      onStep(name, "fail", detail);
+      checkpoint(false, `preflight: ${name}`, detail);
+      failures.push({ name, detail, fatal });
+      return false;
+    }
+  };
+
+  const hosts = [
+    ["Client", cfg.clientSsh], ["Server", cfg.serverSsh],
+    ["Netem", cfg.netemSsh], ["Spoke", cfg.spoke], ["Hub", cfg.hub],
+  ];
+  const conns = {};
+
+  // ---- 1. SSH connectivity + auth for every node ----
+  for (const [label, creds] of hosts) {
+    const ok = await step(`${label} SSH connection`, async () => {
+      if (!creds || !creds.host) throw new Error(`no ${label} host configured`);
+      if (!creds.user) throw new Error(`no ${label} username configured`);
+      if (!creds.pass && !creds.keyPath) throw new Error(`no ${label} password or key configured`);
+      const conn = await sshConnect(creds);
+      conns[label] = conn;
+      const { code, stdout } = await sshExec(conn, "hostname", { timeoutMs: 15000 });
+      if (code !== 0) throw new Error(`hostname failed (rc=${code})`);
+      return `${creds.user}@${creds.host} → ${String(stdout).trim()}`;
+    });
+    if (!ok) break; // fail fast — do not probe further with a broken lab
+  }
+
+  try {
+    if (!failures.length) {
+      // ---- 2. iperf3 present on both traffic hosts ----
+      for (const label of ["Client", "Server"]) {
+        await step(`iperf3 on ${label}`, async () => {
+          const { stdout } = await sshExec(conns[label], "command -v iperf3 || echo MISSING");
+          const p = String(stdout).trim();
+          if (!p || p === "MISSING") throw new Error(`iperf3 not found on ${label} — install iperf3`);
+          const v = await sshExec(conns[label], "iperf3 --version 2>&1 | head -1");
+          return `${p} (${String(v.stdout).trim()})`;
+        });
+      }
+
+      // ---- 3. netem: tc available + sudo usable ----
+      await step("Netem tc + sudo", async () => {
+        const r = await sudoExec(conns.Netem, cfg.netemSsh, "tc -Version", { timeoutMs: 20000 });
+        if (r.code !== 0) throw new Error(`sudo tc failed on the netem VM (rc=${r.code})`);
+        return String(r.stdout).replace(/\[sudo\][^\n]*/g, "").trim().split("\n").pop();
+      });
+
+      // ---- 4. Link A / Link B interfaces exist on the netem VM ----
+      const groups = [["Link A", cfg.linkA], ["Link B", cfg.linkB]];
+      for (const [label, ports] of groups) {
+        await step(`${label} interfaces`, async () => {
+          if (!ports || !ports.length) throw new Error(`${label} has no interfaces configured`);
+          const missing = [];
+          for (const iface of ports) {
+            const { code } = await sshExec(conns.Netem, `ip link show ${iface} >/dev/null 2>&1`);
+            if (code !== 0) missing.push(iface);
+          }
+          if (missing.length) throw new Error(`interface(s) do not exist on the netem VM: ${missing.join(", ")}`);
+          return ports.join(" + ");
+        });
+      }
+      await step("Link A / Link B distinct", async () => {
+        const a = new Set(cfg.linkA || []), b = cfg.linkB || [];
+        const overlap = b.filter((x) => a.has(x));
+        if (overlap.length) throw new Error(`Link A and Link B share interface(s): ${overlap.join(", ")}`);
+        return "no overlap";
+      });
+
+      // ---- 5. DMTS hourLog reachable + updating on both sides ----
+      for (const label of ["Spoke", "Hub"]) {
+        await step(`${label} DMTS hourLog`, async () => {
+          const { code, stdout } = await sshExec(conns[label],
+            `ls -t ${HOURLOG_DIR}/*.txt 2>/dev/null | head -1; echo "---"; date +%s`);
+          if (code !== 0) throw new Error(`cannot list ${HOURLOG_DIR} on ${label}`);
+          const file = String(stdout).split("---")[0].trim();
+          if (!file) throw new Error(`no hourLog files in ${HOURLOG_DIR} on ${label} — is DMTS running?`);
+          const st = await sshExec(conns[label], `stat -c %Y "${file}"; date +%s`);
+          const [mtime, now] = String(st.stdout).trim().split(/\s+/).map((n) => parseInt(n, 10));
+          const age = Number.isFinite(mtime) && Number.isFinite(now) ? now - mtime : null;
+          if (age != null && age > 900) throw new Error(`hourLog has not been written for ${age}s on ${label} — DMTS may be stopped`);
+          return `${file.split("/").pop()} (updated ${age != null ? age + "s" : "?"} ago)`;
+        });
+      }
+    }
+  } finally {
+    for (const c of Object.values(conns)) { try { c.end(); } catch (e) { /* ignore */ } }
+  }
+
+  return { ok: failures.length === 0, failures };
+}
+
+/**
+ * Resolve the two link groups the regression operates on. Operator-configured
+ * interface lists are authoritative (cfg.linkA / cfg.linkB — "Link A" / "Link B"
+ * in the UI). Only when they are absent does this fall back to enumerating
+ * bridges on the netem VM, in a DETERMINISTIC order (sorted by bridge name).
+ * Nothing here depends on which link currently carries traffic.
+ */
+async function resolveLinkGroups(cfg) {
+  if (cfg.linkA && cfg.linkA.length && cfg.linkB && cfg.linkB.length) {
+    return {
+      a: { bridge: "Link A", ports: cfg.linkA },
+      b: { bridge: "Link B", ports: cfg.linkB },
+      source: "configured",
+    };
+  }
+  const det = await detectActiveLink(cfg);
+  const groups = [...(det.groups || [])].sort((x, y) => String(x.bridge).localeCompare(String(y.bridge)));
+  return {
+    a: groups[0] ? { bridge: `Link A (${groups[0].bridge})`, ports: groups[0].ports } : null,
+    b: groups[1] ? { bridge: `Link B (${groups[1].bridge})`, ports: groups[1].ports } : null,
+    source: "auto-enumerated",
+  };
+}
+
+/**
+ * Latency schedule for a satellite-class comparison (tc.pairPlan):
+ *   Link A → a FIXED latency, applied once and held for the window.
+ *   Link B → a PROGRESSION, one value applied per plan.intervalSec.
+ * Both go to operator-configured interface groups; no active/standby detection.
+ * Ends on the first switch (sync.switched) or the window deadline.
+ */
+async function runLatencyPairSchedule(cfg, tc, durationMs, impairedIfaces, sync) {
+  const events = [];
+  const plan = tc.pairPlan;
+  const deadline = Date.now() + durationMs;
+  const note = (link, event) => {
+    const ev = { t: new Date().toISOString(), iface: link, event };
+    events.push(ev);
+    setStatus({ netem: `${event} on ${link}` });
+    log(`impairment: ${event} on ${link}`);
+  };
+  const label = (g) => `${g.bridge} (${g.ports.join("+")})`;
+
+  const { a: gA, b: gB, source } = await resolveLinkGroups(cfg);
+  if (!gA || !gB) {
+    const msg = `${tc.name}: need TWO link groups for a latency comparison — configure Link A and Link B interfaces`;
+    log(`ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  log(`${tc.name}: link groups (${source}) — A=${gA.ports.join("+")} B=${gB.ports.join("+")}`);
+  sync.linkA = label(gA); sync.linkB = label(gB);
+
+  // ---- Link A: fixed value, applied once ----
+  const aMs = plan.linkA.fixedMs || 0;
+  if (aMs > 0) {
+    await applyToLink(cfg, gA.ports, { delayMs: aMs }, impairedIfaces);
+    note(label(gA), `fixed delay ${aMs}ms (${plan.linkA.cls})`);
+  } else {
+    note(label(gA), `clean 0ms (${plan.linkA.cls})`);
+  }
+
+  // ---- Link B: progression, one value per interval ----
+  const steps = plan.linkB.steps || [0];
+  setStatus({ currentLinkA: `${String(plan.linkA.cls).toUpperCase()} ${aMs} ms`, progressionTotal: steps.length });
+  for (let i = 0; i < steps.length && Date.now() < deadline && !isAborted() && !sync.switched; i++) {
+    const v = steps[i];
+    try {
+      if (v > 0) {
+        await applyToLink(cfg, gB.ports, { delayMs: v }, impairedIfaces);
+        note(label(gB), `${i === 0 ? "delay" : "step delay"} ${v}ms (${plan.linkB.cls} ${i + 1}/${steps.length})`);
+      } else {
+        note(label(gB), `clean 0ms (${plan.linkB.cls})`);
+      }
+      sync.currentMs = v;
+      setStatus({
+        currentLinkB: `${String(plan.linkB.cls).toUpperCase()} ${v} ms`,
+        progressionStep: i + 1,
+        operation: `Applying ${v} ms latency to Link B (${i + 1}/${steps.length})`,
+      });
+    } catch (e) {
+      // continuous validation: a failed netem apply is a hard failure
+      const msg = `Failed to apply ${v} ms latency on Link B (${gB.ports.join("+")}): ${e.message}`;
+      log(`ERROR: ${tc.name}: ${msg}`);
+      throw new Error(msg);
+    }
+    if (i < steps.length - 1) {
+      if (!(await sleepWithin(deadline, plan.intervalSec * 1000, () => sync.switched))) break;
+    }
+  }
+
+  // hold the final values for the remainder of the window
+  if (!sync.switched && Date.now() < deadline) {
+    note("pair", `holding Link A ${aMs}ms / Link B ${steps[steps.length - 1]}ms — observing until window end`);
+    setStatus({ operation: `Holding final values — monitoring for a switch` });
+    await sleepWithin(deadline, deadline - Date.now(), () => sync.switched);
+  }
+  return events;
+}
+
 async function runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync) {
   const events = [];
   // Regression profile passes an explicit per-TC plan: the INITIAL value is
@@ -2476,6 +2706,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   // End-of-test evidence: IPTV mode (tc.hourlogOnly) collects ONLY the relevant
   // side's DMTS hourLog; otherwise the full spoke+hub DMTS logs + diag packs.
   const collectFinalEvidence = async () => {
+    setStatus({ stage: "Log Collection", operation: "Verifying hourLog coverage" });
     if (tc.hourlogOnly) {
       try {
         // Confirm the hourLog CONTENT covers the test: wait until the newest
@@ -2561,11 +2792,16 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   }
 
   await stageGate(cfg, `${tc.name}: traffic validated`);
+  setStatus({ stage: "Monitoring", operation: "Traffic verified — monitoring DMTS for a link switch",
+    switchObserved: false, stabilizeUntil: null, switchFrom: null, switchTo: null });
 
   const impairedIfaces = new Set();
   // latency ramp (TC2-4 via tc) runs CONCURRENTLY with the monitor so a
   // detected switch stops the ramp; shared via `sync`
-  const isLatencyRamp = !isDynamicPL && sshTc && !tc.baseline &&
+  // satellite-class transition (explicit per-link values, no active/standby
+  // assumption) takes precedence over the legacy active-ramp schedule
+  const isLatencyPair = !isDynamicPL && sshTc && !tc.baseline && !!tc.pairPlan;
+  const isLatencyRamp = !isDynamicPL && sshTc && !tc.baseline && !tc.pairPlan &&
     Math.max(tc.link1.delayMs, tc.link2.delayMs) > 0;
   const sync = { switched: false, currentMs: null, activeIface: null, maxReached: false };
 
@@ -2592,13 +2828,19 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
             : (sync.currentMs != null ? `${sync.currentMs}ms` : "latency");
           log(`${tc.name}: switch at ${at} on ${sync.activeIface} — stopping ramp; ` +
               `stabilising ${result.stabilizeSec}s before hourLog`);
+          setStatus({ stage: "Monitoring", switchObserved: true,
+            operation: `Switch detected at ${at} — stabilising ${result.stabilizeSec}s before hourLog`,
+            stabilizeUntil: Date.now() + stabilizeMs,
+            switchFrom: sw.fromLinkName || sw.fromLink, switchTo: sw.toLinkName || sw.toLink });
         }
       }, { endAfterSwitchMs: tc.endOnSwitch ? stabilizeMs : undefined, tcMatch: tc.monitorTcMatch || undefined });
       const scheduleP = isDynamicPL
         ? runPacketLossSchedule(cfg, tc.plType, durationMs, impairedIfaces, null, sync, tc.plPlan || null)
-        : isLatencyRamp
-          ? runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
-          : Promise.resolve([]);
+        : isLatencyPair
+          ? runLatencyPairSchedule(cfg, tc, durationMs, impairedIfaces, sync)
+          : isLatencyRamp
+            ? runLatencyRampSchedule(cfg, tc, durationMs, impairedIfaces, sync)
+            : Promise.resolve([]);
       const [switches, impairments] = await Promise.all([monitorP, scheduleP]);
       result.switches = switches;
       result.impairments = [...result.impairments, ...impairments];
@@ -3570,7 +3812,7 @@ module.exports = {
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  resetLabBetweenCases, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
+  resetLabBetweenCases, resolveLinkGroups, plTargetPorts, validateRegressionPreflight, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
   parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
   collectHourlogSnapshot, collectDayLog,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,

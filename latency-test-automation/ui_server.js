@@ -77,10 +77,26 @@ function rememberDefaults(params) {
   }
 }
 
+// Regression fields the operator must supply. Blank by default on purpose —
+// nothing lab-specific is pre-filled; placeholders show the expected format.
+const REGRESSION_FIELDS = [
+  "linkA", "linkB", "plTargetLink", "regressionTos", "iptvServerIp", "iptvPort",
+  "iptvFlows", "iptvPktLen", "iptvInterval", "iptvBwUp", "iptvBwDown",
+  "regDirection", "caseMaxSec", "iptvStabilizeSec", "tosTcMap",
+  "latLeo", "latMeo", "latGeo",
+  "plStartPct", "plStepPct", "iptvLossCeiling", "plOnSec", "plOffSec", "plRandomSpec",
+  "iptvResetSettleSec",
+];
+
 function formDefaults() {
   // saved form state wins over env defaults
   const p = { ...engine.paramsFromEnv(), ...savedDefaults() };
   const d = { ...p };
+  for (const f of REGRESSION_FIELDS) if (d[f] === undefined || d[f] === null) d[f] = "";
+  // ToS is now a single-line field: normalise any previously saved multi-line
+  // list (and the legacy regressionTosList key) into a comma-separated value.
+  const tosSrc = d.regressionTos || p.regressionTosList || "";
+  d.regressionTos = String(tosSrc).split(/[,\s]+/).filter(Boolean).join(",");
   for (const f of SECRET_FIELDS) {
     d[f + "Set"] = !!p[f];
     d[f] = ""; // secrets are never rendered into the page
@@ -322,6 +338,22 @@ const server = http.createServer(async (req, res) => {
         if (Number.isFinite(s) && s > 0) p.iptvLossCeiling = s;
       }
       if (body.iptvInterval && String(body.iptvInterval).trim()) p.iptvInterval = String(body.iptvInterval).trim();
+      // ---- Link configuration (operator-defined interface groups) ----
+      const str = (v) => String(v ?? "").trim();
+      if (str(body.linkA)) p.linkA = str(body.linkA);
+      if (str(body.linkB)) p.linkB = str(body.linkB);
+      p.plTargetLink = str(body.plTargetLink).toUpperCase() === "B" ? "B" : "A";
+      if (str(body.regDirection)) p.regDirection = str(body.regDirection);
+      if (str(body.iptvResetSettleSec)) {
+        const s = parseInt(str(body.iptvResetSettleSec), 10);
+        if (Number.isFinite(s) && s >= 0) p.iptvResetSettleSec = s;
+      }
+      // ---- Latency progressions per orbit class ----
+      for (const f of ["latLeo", "latMeo", "latGeo"]) if (str(body[f])) p[f] = str(body[f]);
+      // ---- Packet-loss shape ----
+      for (const f of ["plStartPct", "plStepPct", "plOnSec", "plOffSec", "plRandomSpec"]) {
+        if (str(body[f])) p[f] = str(body[f]);
+      }
       if (body.tosTcMap && String(body.tosTcMap).trim()) {
         // grid-specific ToS→traffic-class overrides, lines/commas of "tos:regex"
         p.tosTcMap = {};
@@ -333,6 +365,42 @@ const server = http.createServer(async (req, res) => {
       if (!p.netemUiUrl && p.netemHost) p.netemUiUrl = `http://${p.netemHost}:8080`;
 
       const check = engine.validateParams(p);
+      // ---- regression configuration: everything must be supplied, nothing assumed ----
+      const need = (field, value, msg) => { if (!String(value ?? "").trim()) { check.ok = false; check.errors[field] = msg; } };
+      need("regressionTos", p.regressionTosList, "required — e.g. 0x04 (used for the whole run)");
+      need("linkA", p.linkA, "required — netem interfaces for Link A, e.g. ens192,ens193");
+      need("linkB", p.linkB, "required — netem interfaces for Link B, e.g. ens224,ens225");
+      need("iptvServerIp", p.iptvServerIp || p.serverTrafficIp, "required — server data-plane IP for traffic");
+      need("iptvPort", p.iptvPort, "required — iperf3 server port");
+      need("iptvFlows", p.iptvFlows, "required — number of parallel streams");
+      need("iptvPktLen", p.iptvPktLen, "required — packet length in bytes");
+      need("iptvBwUp", p.iptvBwUp || p.iptvBw, "required — upstream bandwidth per flow, e.g. 3M");
+      need("iptvBwDown", p.iptvBwDown || p.iptvBw, "required — downstream bandwidth per flow, e.g. 6M");
+      need("iptvLossCeiling", p.iptvLossCeiling, "required — packet-loss ceiling %");
+      // Link A / Link B must not overlap
+      const laSet = new Set(String(p.linkA || "").split(/[,\s]+/).filter(Boolean));
+      const lbArr = String(p.linkB || "").split(/[,\s]+/).filter(Boolean);
+      const dupIf = lbArr.filter((x) => laSet.has(x));
+      if (dupIf.length) { check.ok = false; check.errors.linkB = `also listed in Link A: ${dupIf.join(", ")}`; }
+      // latency progressions for the orbit classes the scenarios use
+      const clsField = { leo: "latLeo", meo: "latMeo", geo: "latGeo" };
+      for (const cls of regression.requiredOrbitClasses()) {
+        const f = clsField[cls];
+        if (!regression.parseLatList(p[f])) {
+          check.ok = false;
+          check.errors[f] = `required — ${cls.toUpperCase()} values, e.g. "150,165,180" or "150-180"`;
+        }
+      }
+      // SSH credentials for every node the regression touches
+      for (const [side, label] of [["client", "Client"], ["server", "Server"], ["netem", "Netem"], ["spoke", "Spoke"], ["hub", "Hub"]]) {
+        const hostField = side === "client" ? "clientIp" : side === "server" ? "serverIp" : side + "Host";
+        need(hostField, p[hostField], `required — ${label} IP/hostname`);
+        need(side + "User", p[side + "User"], `required — ${label} SSH username`);
+        if (!String(p[side + "Pass"] ?? "").trim() && !String(p[side + "Key"] ?? "").trim()) {
+          check.ok = false;
+          check.errors[side + "Pass"] = `required — ${label} SSH password or key path`;
+        }
+      }
       if (p.confluence) {
         if (!p.confEmail) { check.ok = false; check.errors.confEmail = "required for Confluence upload"; }
         if (!p.confToken) { check.ok = false; check.errors.confToken = "required (or set CONF_TOKEN env)"; }
@@ -432,6 +500,43 @@ const PAGE = (d, profileNames) => `<!doctype html>
   #resumeBanner { display:none; border:2px solid #f59e0b; border-radius:8px; padding:14px; margin-bottom:14px; background:#fffbeb; }
   #resumeBanner b { font-size:14px; }
   .badge.obs { background:#e0e7ff; color:#3730a3; }
+  /* --- clean configuration layout --- */
+  form#f { display:flex; flex-direction:column; }
+  fieldset#runtype { order:0; }
+  fieldset.sec-profile { order:1; }
+  fieldset.sec-ssh { order:2; }
+  fieldset.sec-link { order:3; }
+  fieldset.sec-traffic { order:4; }
+  fieldset.sec-latency { order:5; }
+  fieldset.sec-pl { order:6; }
+  fieldset.custom-only { order:7; }
+  fieldset.sec-conf { order:9; }
+  fieldset { border:1px solid #e5e7eb; border-radius:10px; padding:16px 18px 18px; margin:0 0 16px; }
+  legend { font-weight:700; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:#374151; padding:0 8px; }
+  label { display:block; font-size:12px; font-weight:600; color:#374151; margin-bottom:5px; }
+  input, select, textarea { width:100%; box-sizing:border-box; padding:8px 10px; font-size:13px;
+    border:1px solid #d1d5db; border-radius:7px; background:#fff; transition:border-color .12s, box-shadow .12s; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:#2563eb; box-shadow:0 0 0 3px #2563eb22; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px 18px; }
+  .grid3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:14px 18px; }
+  .grid4 { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:14px 18px; }
+  .hint { font-size:11.5px; color:#6b7280; margin:2px 0 14px; line-height:1.5; }
+  .hint code { background:#0f172a0d; padding:1px 5px; border-radius:4px; font-size:11px; }
+  .req { color:#dc2626; font-weight:700; }
+  .errmsg { font-size:11px; color:#dc2626; margin-top:3px; min-height:0; }
+  /* connection cards */
+  .sshgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; }
+  .sshbox { border:1px solid #e5e7eb; border-radius:9px; padding:12px 13px; background:#fafafa; }
+  .sshbox h4 { margin:0 0 10px; font-size:12px; font-weight:700; color:#111827;
+    text-transform:uppercase; letter-spacing:.04em; padding-bottom:7px; border-bottom:1px solid #e5e7eb; }
+  .sshbox label { margin-top:9px; font-size:11px; font-weight:600; }
+  .sshbox label:first-of-type { margin-top:0; }
+  /* scenario reference tables */
+  table.scenario { width:100%; border-collapse:collapse; margin-top:14px; font-size:12px; }
+  table.scenario th { text-align:left; padding:7px 10px; background:#f3f4f6; color:#374151;
+    font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid #e5e7eb; }
+  table.scenario td { padding:7px 10px; border-bottom:1px solid #f3f4f6; color:#374151; }
+  table.scenario tr:last-child td { border-bottom:none; }
   /* --- regression profile: collapsible sections --- */
   .profile details { border:1px solid var(--bd,#e5e7eb); border-radius:8px; margin:8px 0; background:var(--card,#fff); overflow:hidden; }
   .profile summary { cursor:pointer; padding:10px 12px; font-weight:600; list-style:none; display:flex; align-items:center; gap:8px; }
@@ -455,6 +560,21 @@ const PAGE = (d, profileNames) => `<!doctype html>
   .tcard .row2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:10px; margin-top:8px; }
   .tcard .k { font-size:11px; color:var(--mut,#6b7280); text-transform:uppercase; letter-spacing:.04em; }
   .tcard .v { font-size:15px; font-weight:700; }
+  /* --- live status: alerts, checklist, activity log --- */
+  .panel.alert-err { border:2px solid #dc2626; background:#fef2f2; }
+  .statusdot { font-size:15px; }
+  .tally { font-size:12px; font-weight:700; padding:2px 7px; border-radius:99px; background:#f3f4f6; }
+  .tally.ok { color:#166534; background:#dcfce7; }
+  .tally.bad { color:#991b1b; background:#fee2e2; }
+  .checklist { margin-top:6px; display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:4px 14px; }
+  .checklist .ck { font-size:12.5px; display:flex; gap:7px; align-items:baseline; }
+  .checklist .ck .ic { width:14px; flex:none; }
+  .checklist .ck.ok { color:#166534; }
+  .checklist .ck.run { color:#2563eb; font-weight:600; }
+  .checklist .ck.fail { color:#991b1b; font-weight:700; }
+  .checklist .ck .dt { color:#6b7280; font-weight:400; font-size:11.5px; }
+  .actlog { margin-top:6px; font:11.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;
+    max-height:190px; overflow-y:auto; background:#0f172a08; border-radius:7px; padding:9px 11px; color:#374151; }
   /* --- testcase flow checklist --- */
   .flow { display:flex; flex-wrap:wrap; gap:14px; margin-top:6px; }
   .flow .grp { min-width:150px; }
@@ -471,60 +591,109 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <fieldset id="runtype"><legend>Run type</legend>
     <label><input type="radio" name="runtype" value="custom" style="width:auto" checked> <b>Custom Run</b> — configure and run a single traffic combination (existing behaviour)</label>
     <label><input type="radio" name="runtype" value="regression" style="width:auto"> <b>SLA Full Regression (6&#215;7 Matrix)</b> — one-click 42-case suite</label>
-    <p id="regNote" style="margin:8px 0 2px;">One-click SLA suite &mdash; you supply only the connection targets and ToS below; runtime, impairment progression, log collection and reports are fixed by the profile.</p>
-    <div class="profile reg-only">
-      <details open><summary>Regression Profile</summary><div class="body"><pre><span class="chk">&#10003;</span> 7 SLA scenarios (4 latency + 3 packet-loss)
-<span class="chk">&#10003;</span> Upstream + Downstream, per ToS
-<span class="chk">&#10003;</span> Confluence upload (optional)
-<span class="chk">&#10003;</span> Resume interrupted runs
-<span class="chk">&#10003;</span> Observation only (no PASS/FAIL)</pre></div></details>
-      <details><summary>Latency Profile</summary><div class="body"><pre>LEO : 30 <span class="arrow">&rarr;</span> 50 <span class="arrow">&rarr;</span> 75 <span class="arrow">&rarr;</span> 100 <span class="arrow">&rarr;</span> 120 ms
-MEO : 150 <span class="arrow">&rarr;</span> 165 <span class="arrow">&rarr;</span> 180 ms
-GEO : 600 <span class="arrow">&rarr;</span> 800 <span class="arrow">&rarr;</span> 1000 ms</pre><div style="font-size:11px;color:var(--mut)">One step per minute on the active link; standby link kept clean.</div></div></details>
-      <details><summary>Packet Loss Profile</summary><div class="body"><pre>Constant : 0 <span class="arrow">&rarr;</span> 2 <span class="arrow">&rarr;</span> 4 <span class="arrow">&rarr;</span> 6 <span class="arrow">&rarr;</span> 8 <span class="arrow">&rarr;</span> 10 %
-Periodic : 0 <span class="arrow">&rarr;</span> 4 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 6 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 10 %
-Random   : 5 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 7 <span class="arrow">&rarr;</span> 0 <span class="arrow">&rarr;</span> 8 <span class="arrow">&rarr;</span> 10 %</pre><div style="font-size:11px;color:var(--mut)">Starts at 0%%, escalates +2%%/min to a 10%% ceiling (override with Loss ceiling / --lossmax).</div></div></details>
-      <details><summary>Case Completion</summary><div class="body"><pre><span class="chk">&#10003;</span> Ends on first link switch
-        OR
-<span class="chk">&#10003;</span> Runs the full 5 minutes
+    <p id="regNote" style="margin:8px 0 2px;">Runs 7 scenarios (4 latency + 3 packet-loss) &times; upstream/downstream per ToS. Every value below is supplied by you &mdash; nothing is assumed about the topology. Observations only (no PASS/FAIL); interrupted runs resume.</p>
+  </fieldset>
 
-After a switch:
-   Wait 60 s (stabilise)  <span class="arrow">&darr;</span>
-   Collect DMTS hourLog   <span class="arrow">&darr;</span>
-   Reset netem &amp; continue next testcase</pre></div></details>
+  <!-- ============ LINK CONFIGURATION ============ -->
+  <fieldset class="reg-only sec-link"><legend>Link Configuration</legend>
+    <p class="hint">Two interface groups on the netem VM. Scenarios apply values to <b>Link A</b> and <b>Link B</b> exactly as defined &mdash; no active/standby detection.</p>
+    <div class="grid2">
+      <div><label>Link A interfaces <span class="req">*</span></label>
+        <input name="linkA" value="${esc(d.linkA)}" placeholder="e.g. ens192,ens193"><div class="errmsg"></div></div>
+      <div><label>Link B interfaces <span class="req">*</span></label>
+        <input name="linkB" value="${esc(d.linkB)}" placeholder="e.g. ens224,ens225"><div class="errmsg"></div></div>
+      <div><label>Packet loss target link</label>
+        <select name="plTargetLink">
+          <option value="A"${d.plTargetLink === "B" ? "" : " selected"}>Link A (Link B stays clean)</option>
+          <option value="B"${d.plTargetLink === "B" ? " selected" : ""}>Link B (Link A stays clean)</option>
+        </select><div class="errmsg"></div></div>
+      <div><label>Reset settle time (s)</label>
+        <input name="iptvResetSettleSec" value="${esc(d.iptvResetSettleSec)}" placeholder="3"><div class="errmsg"></div></div>
     </div>
   </fieldset>
 
-  <fieldset class="reg-only"><legend>Regression options</legend><div class="grid">
-    <div><label>ToS / DSCP list — one per line or comma-separated (blank = full 0x04,0x24,0x38 SLA matrix)</label>
-      <textarea name="regressionTos" rows="5" placeholder="0x04&#10;0x24&#10;0x34&#10;0x44&#10;0x84">0x04
-0x24
-0x34
-0x44
-0x84</textarea><div class="errmsg"></div></div>
-    <div><label>&nbsp;</label>
-      <label style="display:block;"><input type="checkbox" name="iptvMode" style="width:auto" checked> IPTV mode</label></div>
-    <div><label>Server traffic IP (overlay data-plane)</label>
-      <input name="iptvServerIp" value="10.40.2.2" placeholder="10.40.2.2"><div class="errmsg"></div></div>
-    <div><label>Server port</label>
-      <input name="iptvPort" value="5201" placeholder="5201"><div class="errmsg"></div></div>
-    <div><label>Flows (-P parallel streams)</label>
-      <input name="iptvFlows" value="10" placeholder="10"><div class="errmsg"></div></div>
-    <div><label>Upstream per-flow bandwidth (spoke)</label>
-      <input name="iptvBwUp" value="3M" placeholder="3M"><div class="errmsg"></div></div>
-    <div><label>Downstream per-flow bandwidth (hub)</label>
-      <input name="iptvBwDown" value="6M" placeholder="6M"><div class="errmsg"></div></div>
-    <div><label>Packet size (-l bytes)</label>
-      <input name="iptvPktLen" value="1200" placeholder="1200"><div class="errmsg"></div></div>
-    <div><label>Stabilise after switch (s)</label>
-      <input name="iptvStabilizeSec" value="60" placeholder="60"><div class="errmsg"></div></div>
-    <div><label>Loss ceiling % (push to, if no switch)</label>
-      <input name="iptvLossCeiling" value="10" placeholder="10"><div class="errmsg"></div></div>
-    <div><label>ToS &rarr; traffic class (grid-specific; one per line, tos:regex)</label>
-      <textarea name="tosTcMap" rows="3" placeholder="0x54:^FileT&#10;0x64:Short-?fileT&#10;0x74:Streaming"></textarea><div class="errmsg"></div></div>
-    <div class="full" style="font-size:11px; color:var(--mut);"><b>IPTV mode</b> runs the orbit profile above for <b>every ToS listed</b> &times; 7 scenarios &times; upstream/downstream (e.g. 5 ToS &rarr; <b>70 cases</b>); on switch only the DMTS hourLog is collected (Spoke=upstream, Hub=downstream). Unchecked + blank ToS = the original 42-case SLA matrix. See the collapsible profile sections above for the full progression.</div>
-  </div></fieldset>
-  <fieldset><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
+  <!-- ============ TRAFFIC CONFIGURATION ============ -->
+  <fieldset class="reg-only sec-traffic"><legend>Traffic Configuration</legend>
+    <div class="grid3">
+      <div><label>ToS / DSCP <span class="req">*</span></label>
+        <input name="regressionTos" value="${esc(d.regressionTos)}" placeholder="e.g. 0x04"><div class="errmsg"></div>
+        <div class="hint">Used for the whole run. Comma-separate to sweep several.</div></div>
+      <div><label>Server traffic IP <span class="req">*</span></label>
+        <input name="iptvServerIp" value="${esc(d.iptvServerIp)}" placeholder="data-plane IP"><div class="errmsg"></div></div>
+      <div><label>Server port <span class="req">*</span></label>
+        <input name="iptvPort" value="${esc(d.iptvPort)}" placeholder="5201"><div class="errmsg"></div></div>
+      <div><label>Parallel streams (-P) <span class="req">*</span></label>
+        <input name="iptvFlows" value="${esc(d.iptvFlows)}" placeholder="10"><div class="errmsg"></div></div>
+      <div><label>Packet length (-l bytes) <span class="req">*</span></label>
+        <input name="iptvPktLen" value="${esc(d.iptvPktLen)}" placeholder="1200"><div class="errmsg"></div></div>
+      <div><label>Report interval (-i s)</label>
+        <input name="iptvInterval" value="${esc(d.iptvInterval)}" placeholder="10"><div class="errmsg"></div></div>
+      <div><label>Upstream bandwidth / flow <span class="req">*</span></label>
+        <input name="iptvBwUp" value="${esc(d.iptvBwUp)}" placeholder="e.g. 3M"><div class="errmsg"></div></div>
+      <div><label>Downstream bandwidth / flow <span class="req">*</span></label>
+        <input name="iptvBwDown" value="${esc(d.iptvBwDown)}" placeholder="e.g. 6M"><div class="errmsg"></div></div>
+      <div><label>Direction</label>
+        <select name="regDirection">
+          <option value="both"${d.regDirection === "both" || !d.regDirection ? " selected" : ""}>Upstream + Downstream</option>
+          <option value="upstream"${d.regDirection === "upstream" ? " selected" : ""}>Upstream only</option>
+          <option value="downstream"${d.regDirection === "downstream" ? " selected" : ""}>Downstream only</option>
+        </select><div class="errmsg"></div></div>
+      <div><label>Observation window / case (s)</label>
+        <input name="caseMaxSec" value="${esc(d.caseMaxSec)}" placeholder="300"><div class="errmsg"></div></div>
+      <div><label>Stabilise after switch (s)</label>
+        <input name="iptvStabilizeSec" value="${esc(d.iptvStabilizeSec)}" placeholder="60"><div class="errmsg"></div></div>
+      <div><label>ToS &rarr; DMTS class (optional)</label>
+        <input name="tosTcMap" value="${esc(d.tosTcMap)}" placeholder="0x74:Streaming"><div class="errmsg"></div>
+        <div class="hint">Grid-specific. Blank = auto-detect busiest class.</div></div>
+    </div>
+  </fieldset>
+
+  <!-- ============ LATENCY CONFIGURATION ============ -->
+  <fieldset class="reg-only sec-latency"><legend>Latency Configuration</legend>
+    <p class="hint">Values per orbit class &mdash; comma-separated list (<code>30,50,75,100,120,130</code>) or a range (<code>30-130</code>). Link A holds the class's <b>last</b> value fixed; Link B steps the progression one value per minute.</p>
+    <div class="grid3">
+      <div><label>LEO latency (ms) <span class="req">*</span></label>
+        <input name="latLeo" value="${esc(d.latLeo)}" placeholder="30,50,75,100,120,130"><div class="errmsg"></div></div>
+      <div><label>MEO latency (ms) <span class="req">*</span></label>
+        <input name="latMeo" value="${esc(d.latMeo)}" placeholder="150,165,180"><div class="errmsg"></div></div>
+      <div><label>GEO latency (ms) <span class="req">*</span></label>
+        <input name="latGeo" value="${esc(d.latGeo)}" placeholder="600,800,1000"><div class="errmsg"></div></div>
+    </div>
+    <table class="scenario"><thead><tr><th>Case</th><th>Scenario</th><th>Link A (fixed)</th><th>Link B (progression)</th></tr></thead>
+      <tbody>
+        <tr><td>TC1</td><td>Baseline</td><td>0 ms</td><td>0 ms</td></tr>
+        <tr><td>TC2</td><td>Clean vs LEO</td><td>0 ms</td><td>LEO values</td></tr>
+        <tr><td>TC3</td><td>LEO vs MEO</td><td>LEO (last)</td><td>MEO values</td></tr>
+        <tr><td>TC4</td><td>MEO vs GEO</td><td>MEO (last)</td><td>GEO values</td></tr>
+      </tbody></table>
+  </fieldset>
+
+  <!-- ============ PACKET LOSS CONFIGURATION ============ -->
+  <fieldset class="reg-only sec-pl"><legend>Packet Loss Configuration</legend>
+    <p class="hint">Applied to the target link chosen above; the other link stays clean. Loss escalates by the step until the ceiling or a switch.</p>
+    <div class="grid3">
+      <div><label>Start loss (%)</label>
+        <input name="plStartPct" value="${esc(d.plStartPct)}" placeholder="0"><div class="errmsg"></div></div>
+      <div><label>Step (%)</label>
+        <input name="plStepPct" value="${esc(d.plStepPct)}" placeholder="2"><div class="errmsg"></div></div>
+      <div><label>Ceiling (%) <span class="req">*</span></label>
+        <input name="iptvLossCeiling" value="${esc(d.iptvLossCeiling)}" placeholder="10"><div class="errmsg"></div></div>
+      <div><label>Periodic ON (s)</label>
+        <input name="plOnSec" value="${esc(d.plOnSec)}" placeholder="20"><div class="errmsg"></div></div>
+      <div><label>Periodic OFF (s)</label>
+        <input name="plOffSec" value="${esc(d.plOffSec)}" placeholder="20"><div class="errmsg"></div></div>
+      <div><label>Random gap / duration (s)</label>
+        <input name="plRandomSpec" value="${esc(d.plRandomSpec)}" placeholder="gap 10-30, dur 5-15"><div class="errmsg"></div></div>
+    </div>
+    <table class="scenario"><thead><tr><th>Case</th><th>Scenario</th><th>Behaviour</th></tr></thead>
+      <tbody>
+        <tr><td>PL_TC1</td><td>Constant Loss</td><td>Hold, then escalate by step each interval</td></tr>
+        <tr><td>PL_TC2</td><td>Periodic Loss</td><td>ON/OFF cycles, escalating each cycle</td></tr>
+        <tr><td>PL_TC3</td><td>Random Loss</td><td>Random gap + duration, escalating each event</td></tr>
+      </tbody></table>
+    <label style="margin-top:10px;display:block;"><input type="checkbox" name="iptvMode" style="width:auto"${d.iptvMode === false ? "" : " checked"}> Use scenario mode (uncheck only for the legacy SLA matrix)</label>
+  </fieldset>
+  <fieldset class="sec-profile"><legend>Connection profile</legend><div class="grid" style="grid-template-columns: 2fr 1fr 1fr 1fr;">
     <div><label>Profile</label><select id="profSel">
       <option value="">— select —</option>
       ${profileNames.map((n) => `<option>${esc(n)}</option>`).join("")}
@@ -535,27 +704,36 @@ After a switch:
     <div class="full errmsg" id="proferr"></div>
   </div></fieldset>
 
-  <fieldset><legend>1 — Traffic endpoints</legend><div class="grid4">
-    <div><label>Client IP</label><input name="clientIp" value="${esc(d.clientIp)}"><div class="errmsg"></div></div>
-    <div><label>Client port</label><input name="clientPort" value="${esc(d.clientPort)}" placeholder="auto"><div class="errmsg"></div></div>
-    <div><label>Server IP</label><input name="serverIp" value="${esc(d.serverIp)}"><div class="errmsg"></div></div>
-    <div><label>Server port</label><input name="serverPort" value="${esc(d.serverPort)}"><div class="errmsg"></div></div>
-    <div><label>Protocol</label><select name="trafficType">
-      <option${d.trafficType === "UDP" ? " selected" : ""}>UDP</option>
-      <option${d.trafficType === "TCP" ? " selected" : ""}>TCP</option></select><div class="errmsg"></div></div>
-    <div style="grid-column: 2 / -1;"><label>netem UI URL</label><input name="netemUiUrl" value="${esc(d.netemUiUrl)}"><div class="errmsg"></div></div>
-  </div></fieldset>
-
-  <fieldset><legend>2 — SSH details</legend><div class="sshgrid">
-    ${["client", "server", "spoke", "hub", "netem"].map((side) => `
-    <div class="sshbox"><h4>${side === "netem" ? "Netem VM" : side[0].toUpperCase() + side.slice(1)}${["spoke", "hub", "netem"].includes(side) ? "" : " (uses IP above)"}</h4>
-      ${["spoke", "hub", "netem"].includes(side)
-        ? `<label>IP</label><input name="${side}Host" value="${esc(d[side + "Host"])}"><div class="errmsg"></div>` : ""}
-      <label>Username</label><input name="${side}User" value="${esc(d[side + "User"])}"><div class="errmsg"></div>
-      <label>Password ${d[side + "PassSet"] ? "(saved — blank keeps it)" : ""}</label><input name="${side}Pass" type="password"><div class="errmsg"></div>
-      <label>or key path</label><input name="${side}Key" value="${esc(d[side + "Key"])}"><div class="errmsg"></div>
-    </div>`).join("")}
-  </div></fieldset>
+  <!-- ============ SSH CONNECTIONS ============ -->
+  <fieldset class="sec-ssh"><legend>SSH Connections</legend>
+    <p class="hint">Credentials for every node the regression uses — traffic generation, netem control, DMTS hourLog collection and diagnostics all use these. Provide a password <b>or</b> a key path per node.</p>
+    <div class="sshgrid">
+    ${[["client", "Client", "traffic source"], ["server", "Server", "traffic sink"],
+       ["netem", "Netem", "impairment"], ["spoke", "Spoke", "upstream DMTS"], ["hub", "Hub", "downstream DMTS"]]
+      .map(([side, label, role]) => {
+        const hostField = side === "client" ? "clientIp" : side === "server" ? "serverIp" : side + "Host";
+        return `
+    <div class="sshbox"><h4>${label} <span style="font-weight:500;text-transform:none;letter-spacing:0;color:#6b7280">· ${role}</span></h4>
+      <label>IP / Hostname <span class="req">*</span></label>
+      <input name="${hostField}" value="${esc(d[hostField])}" placeholder="e.g. 10.0.0.10"><div class="errmsg"></div>
+      <label>Username <span class="req">*</span></label>
+      <input name="${side}User" value="${esc(d[side + "User"])}" placeholder="ssh user"><div class="errmsg"></div>
+      <label>Password ${d[side + "PassSet"] ? "<span style=\"font-weight:400;color:#6b7280\">(saved — blank keeps it)</span>" : ""}</label>
+      <input name="${side}Pass" type="password" placeholder="${d[side + "PassSet"] ? "•••••• saved" : "password"}"><div class="errmsg"></div>
+      <label>or SSH key path</label>
+      <input name="${side}Key" value="${esc(d[side + "Key"])}" placeholder="/path/to/id_rsa"><div class="errmsg"></div>
+    </div>`; }).join("")}
+    </div>
+    <div class="grid3" style="margin-top:14px;">
+      <div><label>Protocol</label><select name="trafficType">
+        <option${d.trafficType === "UDP" ? " selected" : ""}>UDP</option>
+        <option${d.trafficType === "TCP" ? " selected" : ""}>TCP</option></select><div class="errmsg"></div></div>
+      <div class="custom-only"><label>Client port</label><input name="clientPort" value="${esc(d.clientPort)}" placeholder="auto"><div class="errmsg"></div></div>
+      <div class="custom-only"><label>Server port</label><input name="serverPort" value="${esc(d.serverPort)}"><div class="errmsg"></div></div>
+      <div><label>netem UI URL <span style="font-weight:400;color:#6b7280">(optional, screenshots)</span></label>
+        <input name="netemUiUrl" value="${esc(d.netemUiUrl)}" placeholder="http://netem-host:8080"><div class="errmsg"></div></div>
+    </div>
+  </fieldset>
 
   <fieldset class="custom-only"><legend>3 — Interface selection</legend><div class="grid">
     <div><label>Client interface <button type="button" class="small grey" data-discover="client">Discover</button></label>
@@ -641,7 +819,7 @@ After a switch:
     <div><label><input type="checkbox" name="debugMode" style="width:auto" ${d.debugMode ? "checked" : ""}> Debug mode — pause after each stage</label></div>
   </div></fieldset>
 
-  <fieldset><legend>Confluence</legend><div class="grid">
+  <fieldset class="sec-conf"><legend>Confluence <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#6b7280">(optional)</span></legend><div class="grid">
     <div class="full"><label><input type="checkbox" name="confluence" style="width:auto" ${d.confluence ? "checked" : ""}> Upload results to Confluence</label></div>
     <div><label>Email</label><input name="confEmail" value="${esc(d.confEmail)}"><div class="errmsg"></div></div>
     <div><label>API token ${d.confTokenSet ? "(saved — blank keeps it)" : ""}</label><input name="confToken" type="password"><div class="errmsg"></div></div>
@@ -667,29 +845,64 @@ After a switch:
     <b>Debug mode:</b> paused after <span id="pausestage"></span>
     <button type="button" id="continueBtn" style="margin-left:14px;">Continue</button>
   </div>
-  <div class="panel reg-only" id="regProgress">
-    <h2>Regression Progress</h2>
-    <div class="pbar"><i id="p-bar"></i></div>
-    <div id="p-pct" style="font-weight:700; font-size:15px;">0%</div>
+  <!-- ============ ERROR / ALERT BANNER ============ -->
+  <div class="panel alert-err reg-only" id="errBanner" style="display:none;">
+    <h2 style="color:#991b1b;">🔴 Regression Stopped</h2>
     <div class="summary-grid">
-      <div><div class="k">Completed</div><div class="v" id="p-completed">0 / 0</div></div>
-      <div><div class="k">Est. duration</div><div class="v" id="p-est">—</div></div>
-      <div><div class="k">Runtime</div><div class="v" id="p-runtime">—</div></div>
-      <div><div class="k">Remaining</div><div class="v" id="p-remaining">—</div></div>
+      <div><div class="k">Stage</div><div class="v" id="e-stage">—</div></div>
+      <div><div class="k">Test case</div><div class="v" id="e-case">—</div></div>
+      <div><div class="k">Operation</div><div class="v" id="e-op">—</div></div>
     </div>
-    <div class="tcard idle" id="p-tcard" style="margin-top:12px;">
-      <div style="font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;">Current test case</div>
+    <div style="margin-top:10px;"><div class="k">Reason</div><div id="e-reason" style="font-weight:600;color:#991b1b;">—</div></div>
+    <div style="margin-top:8px;"><div class="k">Suggested action</div><div id="e-fix" style="font-size:12.5px;">—</div></div>
+  </div>
+
+  <!-- ============ LIVE STATUS BANNER ============ -->
+  <div class="panel reg-only" id="regProgress">
+    <h2>Regression Status <span class="statusdot" id="s-dot">⚪</span> <span id="s-word" style="font-weight:600;font-size:14px;">Idle</span></h2>
+    <div class="summary-grid">
+      <div><div class="k">Current stage</div><div class="v" id="s-stage">—</div></div>
+      <div><div class="k">Overall progress</div><div class="v" id="p-completed">0 / 0</div></div>
+      <div><div class="k">Elapsed</div><div class="v" id="p-runtime">00:00:00</div></div>
+      <div><div class="k">Remaining</div><div class="v" id="p-remaining">—</div></div>
+      <div><div class="k">Est. finish</div><div class="v" id="p-finish">—</div></div>
+    </div>
+    <div style="margin-top:10px;"><div class="k">Current operation</div>
+      <div id="s-op" style="font-weight:600;font-size:13.5px;">—</div></div>
+    <div class="pbar" style="margin-top:12px;"><i id="p-bar"></i></div>
+    <div style="display:flex;justify-content:space-between;font-size:12px;margin-top:4px;">
+      <span id="p-pct" style="font-weight:700;">0%</span>
+      <span><span class="tally ok" id="t-pass">✅ 0</span> <span class="tally bad" id="t-fail">❌ 0</span> <span class="tally" id="t-skip">⏭ 0</span></span>
+    </div>
+
+    <!-- pre-flight checklist -->
+    <div id="pfBox" style="display:none;margin-top:14px;">
+      <div class="k">Pre-flight validation</div>
+      <div id="pfList" class="checklist"></div>
+    </div>
+
+    <!-- current test case -->
+    <div class="tcard idle" id="p-tcard" style="margin-top:14px;">
+      <div class="k">Current test case</div>
       <div class="v" id="p-tc-title" style="font-size:17px;">Idle</div>
       <div class="row2">
         <div><div class="k">ToS</div><div class="v" id="p-tc-tos">—</div></div>
         <div><div class="k">Direction</div><div class="v" id="p-tc-dir">—</div></div>
-        <div><div class="k">Impairment</div><div class="v" id="p-tc-imp">—</div></div>
-        <div><div class="k">Active link</div><div class="v" id="p-tc-link">—</div></div>
+        <div><div class="k">Link A</div><div class="v" id="p-linkA">—</div></div>
+        <div><div class="k">Link B</div><div class="v" id="p-linkB">—</div></div>
         <div><div class="k">Elapsed</div><div class="v" id="p-tc-elapsed">—</div></div>
       </div>
       <div id="p-tc-note" style="margin-top:8px;color:var(--mut);font-size:12px;">—</div>
+      <div id="p-stab" style="display:none;margin-top:8px;font-weight:700;color:#2563eb;"></div>
     </div>
-    <div class="flow" id="p-flow" style="margin-top:12px;"></div>
+
+    <div class="flow" id="p-flow" style="margin-top:14px;"></div>
+
+    <!-- live activity log -->
+    <div style="margin-top:14px;">
+      <div class="k">Live activity</div>
+      <div id="actLog" class="actlog">—</div>
+    </div>
   </div>
   <div class="panel">
     <h2>Live progress</h2>
@@ -765,9 +978,26 @@ setInterval(() => {
     const runSec = (Date.now() - new Date(runStartedAt)) / 1000;
     const total = lastStatus.caseCount || 0;
     const done = lastStatus.completedCount != null ? lastStatus.completedCount : (lastStatus.caseIndex || 0);
+    // ETA from measured case durations once we have data, else the estimate
+    const perCase = caseDurations.length
+      ? caseDurations.reduce((a, b) => a + b, 0) / caseDurations.length
+      : EST_SEC_PER_CASE;
+    const remainSec = Math.max(0, total - done) * perCase;
     if ($("p-runtime")) $("p-runtime").textContent = fmtDur(runSec);
-    if ($("p-remaining")) $("p-remaining").textContent = total ? fmtDur(Math.max(0, total - done) * EST_SEC_PER_CASE) : "—";
+    if ($("p-remaining")) $("p-remaining").textContent = total ? fmtDur(remainSec) : "—";
+    if ($("p-finish")) {
+      $("p-finish").textContent = total
+        ? new Date(Date.now() + remainSec * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+        : "—";
+    }
   }
+  // post-switch stabilisation countdown
+  const stab = $("p-stab");
+  if (stab && lastStatus && lastStatus.stabilizeUntil) {
+    const left = Math.ceil((lastStatus.stabilizeUntil - Date.now()) / 1000);
+    if (left > 0) { stab.style.display = "block"; stab.textContent = "Stabilising on the new link… " + left + "s"; }
+    else { stab.style.display = "none"; }
+  } else if (stab) stab.style.display = "none";
 }, 1000);
 // Canonical per-block testcase order + display labels for the flow checklist.
 const FLOW = {
@@ -791,6 +1021,62 @@ function renderFlow(s) {
   };
   el.innerHTML = group("Latency", "latency") + group("Packet Loss", "packet-loss");
 }
+/* ---------- live status helpers ---------- */
+let caseDurations = [];      // actual seconds per completed case → better ETA
+let lastCompletedCount = 0, lastCaseStart = null, errorBeeped = false;
+const actSeen = new Set();
+
+function beepAlarm() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.28, 0.56].forEach((t) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = "square"; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.09, ctx.currentTime + t);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.22);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.22);
+    });
+  } catch (e) { /* audio unavailable — visual alert still shows */ }
+}
+
+function pushActivity(msg) {
+  const el = $("actLog"); if (!el) return;
+  const stamp = new Date().toTimeString().slice(0, 8);
+  const line = "[" + stamp + "] " + msg;
+  if (actSeen.has(msg)) return;      // don't repeat the same operation every tick
+  actSeen.add(msg);
+  if (el.textContent === "—") el.textContent = "";
+  el.textContent += line + "\\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderPreflight(list) {
+  const box = $("pfBox"), out = $("pfList");
+  if (!box || !out) return;
+  if (!list || !list.length) { box.style.display = "none"; return; }
+  box.style.display = "block";
+  const ic = { ok: "✓", run: "⏳", fail: "✗" };
+  out.innerHTML = list.map((s) =>
+    '<div class="ck ' + s.status + '"><span class="ic">' + (ic[s.status] || "•") + "</span><span>" +
+    s.name.replace(/</g, "&lt;") +
+    (s.detail ? ' <span class="dt">— ' + String(s.detail).replace(/</g, "&lt;").slice(0, 70) + "</span>" : "") +
+    "</span></div>").join("");
+}
+
+function renderError(s) {
+  const b = $("errBanner"); if (!b) return;
+  const e = s.errorDetail;
+  if (!e && !s.error) { b.style.display = "none"; errorBeeped = false; return; }
+  b.style.display = "block";
+  $("e-stage").textContent = (e && e.stage) || s.stage || "—";
+  $("e-case").textContent = (e && e.testcase) || s.currentCase || "—";
+  $("e-op").textContent = (e && e.operation) || "—";
+  $("e-reason").textContent = (e && e.reason) || s.error || "—";
+  $("e-fix").textContent = (e && e.suggestion) || "Review the configuration for this component and retry.";
+  if (!errorBeeped) { errorBeeped = true; beepAlarm(); pushActivity("ERROR: " + ((e && e.reason) || s.error)); }
+}
+
 function renderRegression(running, s) {
   if (!$("regProgress")) return;
   runStartedAt = s.runStartedAt || runStartedAt;
@@ -799,9 +1085,37 @@ function renderRegression(running, s) {
   const pct = total ? Math.round((done / total) * 100) : 0;
   $("p-bar").style.width = pct + "%";
   $("p-pct").textContent = pct + "%";
-  $("p-completed").textContent = done + " / " + total;
-  $("p-est").textContent = total ? fmtDur(total * EST_SEC_PER_CASE) : "—";
-  // current test-case card
+  $("p-completed").textContent = done + " / " + total + " test cases";
+
+  // status word + dot
+  const phase = s.phase || "idle";
+  const dot = phase === "error" ? "🔴" : running ? "🔵" : phase === "done" ? "🟢" : "⚪";
+  $("s-dot").textContent = dot;
+  $("s-word").textContent = phase === "error" ? "Stopped (error)" : running ? "Running" : phase === "done" ? "Complete" : "Idle";
+  $("s-stage").textContent = s.stage || (running ? "Starting" : "—");
+  const op = s.operation || "—";
+  $("s-op").textContent = op;
+  if (running && op !== "—") pushActivity(op);
+
+  // pass/fail/skip tally from results
+  const res = s.results || [];
+  const fails = res.filter((r) => r.result === "FAIL" || r.result === "ERROR").length;
+  const skips = res.filter((r) => r.result === "SKIPPED").length;
+  $("t-pass").textContent = "✅ " + Math.max(0, res.length - fails - skips);
+  $("t-fail").textContent = "❌ " + fails;
+  $("t-skip").textContent = "⏭ " + skips;
+
+  renderPreflight(s.preflight);
+  renderError(s);
+
+  // learn actual case duration for a real ETA
+  if (done > lastCompletedCount) {
+    if (lastCaseStart) caseDurations.push((Date.now() - lastCaseStart) / 1000);
+    lastCompletedCount = done; lastCaseStart = Date.now();
+  }
+  if (!lastCaseStart && running) lastCaseStart = Date.now();
+
+  // current test case card
   const card = $("p-tcard");
   const active = running && s.currentCase;
   card.className = "tcard" + (active ? "" : " idle");
@@ -810,15 +1124,16 @@ function renderRegression(running, s) {
     $("p-tc-title").textContent = suiteLabel + " " + (s.currentTc || "") + "  ·  case " + s.caseIndex + "/" + total;
     $("p-tc-tos").textContent = s.currentTos || "—";
     $("p-tc-dir").textContent = s.currentDir || "—";
-    $("p-tc-imp").textContent = s.netem || "—";
-    $("p-tc-link").textContent = s.lastSwitch ? s.lastSwitch.toLink : "—";
+    $("p-linkA").textContent = s.currentLinkA || "—";
+    $("p-linkB").textContent = s.currentLinkB || "—";
     $("p-tc-note").textContent = s.switchObserved
-      ? "Link switched — stabilising, then collecting DMTS hourLog…"
-      : "Waiting for link switch (or full window)…";
+      ? "Switch detected" + (s.switchFrom ? " (" + s.switchFrom + " → " + s.switchTo + ")" : "") + " — stabilising before hourLog"
+      : (s.netem ? "Impairment: " + s.netem : "Waiting for a link switch…");
   } else {
-    $("p-tc-title").textContent = phase === "done" ? "Run complete" : "Idle";
-    ["p-tc-tos", "p-tc-dir", "p-tc-imp", "p-tc-link", "p-tc-elapsed"].forEach((id) => { if ($(id)) $(id).textContent = "—"; });
+    $("p-tc-title").textContent = phase === "done" ? "Run complete" : phase === "error" ? "Stopped" : "Idle";
+    ["p-tc-tos", "p-tc-dir", "p-linkA", "p-linkB", "p-tc-elapsed"].forEach((id) => { if ($(id)) $(id).textContent = "—"; });
     $("p-tc-note").textContent = "—";
+    if ($("p-stab")) $("p-stab").style.display = "none";
   }
   renderFlow(s);
 }
