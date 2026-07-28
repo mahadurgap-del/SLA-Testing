@@ -407,6 +407,14 @@ function buildConfig(p) {
     debugMode: !!p.debugMode,
     netemSsh: creds(p.netemHost, p.netemUser, p.netemPass, p.netemKey),
     netemCandidates: String(p.netemCandidates || "").split(",").map((s) => s.trim()).filter(Boolean),
+    // Operator-defined netem link groups (any interface names, any testbed).
+    // Part of the config itself so every consumer sees them without extra wiring.
+    linkA: String(p.linkA || "").split(",").map((s) => s.trim()).filter(Boolean),
+    linkB: String(p.linkB || "").split(",").map((s) => s.trim()).filter(Boolean),
+    plTargetLink: (() => {
+      const t = String(p.plTargetLink || "active").toUpperCase();
+      return (t === "A" || t === "B") ? t : "active";
+    })(),
     netemExclude: String(p.netemExclude || "").split(",").map((s) => s.trim()).filter(Boolean),
     plSchedule: {
       rampStepPct: parseInt(p.rampStepPct, 10) || 2,
@@ -1760,9 +1768,16 @@ async function resetLabBetweenCases(cfg, { settleSec = 3, label = "" } = {}) {
       finally { conn.end(); }
     } catch (e) { log(`WARN: ${tag}stop iperf on ${name} failed: ${(e.message || "").split("\n")[0]}`); }
   }
-  // 2/3/4. clear latency + loss on every overlay port -> clean 0ms/0%
-  const ports = (cfg.netemCandidates && cfg.netemCandidates.length)
-    ? cfg.netemCandidates : ["ens192", "ens193", "ens224", "ens225"];
+  // 2/3/4. clear latency + loss on every configured port -> clean 0ms/0%.
+  // Ports come from the operator's Link A / Link B groups (union), falling back to
+  // netemCandidates. No interface name is assumed, so this works on any testbed.
+  const ports = (() => {
+    const ab = [...(cfg.linkA || []), ...(cfg.linkB || [])].filter(Boolean);
+    if (ab.length) return [...new Set(ab)];
+    if (cfg.netemCandidates && cfg.netemCandidates.length) return cfg.netemCandidates;
+    return [];
+  })();
+  if (!ports.length) log(`WARN: ${tag}no netem interfaces configured — nothing to clear`);
   for (const iface of ports) {
     try { await clearNetemImpairment(cfg, iface); }
     catch (e) { log(`WARN: ${tag}netem clear ${iface} failed: ${(e.message || "").split("\n")[0]}`); }
