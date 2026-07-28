@@ -87,7 +87,8 @@ function preflightSuggestion(name) {
   if (n.includes("tc + sudo")) return "Ensure the netem user can run 'sudo tc' (passwordless sudo or a correct password).";
   if (n.includes("interfaces")) return "Check the Link A / Link B interface names against 'ip link show' on the netem VM.";
   if (n.includes("distinct")) return "Give Link A and Link B different interfaces — a link cannot appear in both groups.";
-  if (n.includes("hourlog")) return "Confirm DMTS is running on this node and that /var/log/dmts/hourLog is readable by the SSH user.";
+  if (n.includes("log directory")) return "Confirm /var/log/dmts/hourLog exists and is readable by the SSH user on this node.";
+  if (n.includes("live records")) return "Log files may exist but DMTS has stopped writing fresh records. Restart it: sudo systemctl restart dmts.service — then confirm hourLog timestamps start ticking.";
   return "Review the configuration for this component and retry.";
 }
 

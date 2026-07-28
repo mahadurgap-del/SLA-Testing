@@ -2184,18 +2184,50 @@ async function validateRegressionPreflight(cfg, { onStep = () => {} } = {}) {
       });
 
       // ---- 5. DMTS hourLog reachable + updating on both sides ----
+      // Two DISTINCT conditions, reported separately so the failure is unambiguous:
+      //   (a) does the log directory exist and hold files at all, and
+      //   (b) is DMTS generating FRESH records right now (record content-time,
+      //       not just file mtime — the content clock is what analysis uses).
+      // Historical logs being present is NOT evidence of live generation.
+      const MAX_RECORD_AGE_SEC = 900;
       for (const label of ["Spoke", "Hub"]) {
-        await step(`${label} DMTS hourLog`, async () => {
+        await step(`${label} DMTS log directory`, async () => {
           const { code, stdout } = await sshExec(conns[label],
-            `ls -t ${HOURLOG_DIR}/*.txt 2>/dev/null | head -1; echo "---"; date +%s`);
-          if (code !== 0) throw new Error(`cannot list ${HOURLOG_DIR} on ${label}`);
-          const file = String(stdout).split("---")[0].trim();
-          if (!file) throw new Error(`no hourLog files in ${HOURLOG_DIR} on ${label} — is DMTS running?`);
-          const st = await sshExec(conns[label], `stat -c %Y "${file}"; date +%s`);
-          const [mtime, now] = String(st.stdout).trim().split(/\s+/).map((n) => parseInt(n, 10));
-          const age = Number.isFinite(mtime) && Number.isFinite(now) ? now - mtime : null;
-          if (age != null && age > 900) throw new Error(`hourLog has not been written for ${age}s on ${label} — DMTS may be stopped`);
-          return `${file.split("/").pop()} (updated ${age != null ? age + "s" : "?"} ago)`;
+            `test -d ${HOURLOG_DIR} && echo DIR_OK || echo DIR_MISSING; ls ${HOURLOG_DIR}/*.txt 2>/dev/null | wc -l`);
+          if (code !== 0) throw new Error(`cannot read ${HOURLOG_DIR} on ${label}`);
+          const [dir, cntRaw] = String(stdout).trim().split(/\s+/);
+          if (dir !== "DIR_OK") throw new Error(`${HOURLOG_DIR} does not exist on ${label}`);
+          const n = parseInt(cntRaw, 10) || 0;
+          return `${HOURLOG_DIR} exists, ${n} hourLog file(s)`;
+        });
+        await step(`${label} DMTS live records`, async () => {
+          // newest record CONTENT time across the two newest hourLog buckets
+          const recMs = await (async () => {
+            const conn = conns[label];
+            const { stdout: fl } = await sshExec(conn, `ls -t ${HOURLOG_DIR}/*.txt 2>/dev/null | head -2`);
+            const files = String(fl).trim().split(/\s+/).filter(Boolean);
+            let best = null;
+            for (const f of files) {
+              const { stdout } = await sshExec(conn, `tail -c 262144 '${f}'`, { timeoutMs: 20000 });
+              for (const m of String(stdout).matchAll(/"time"\s*:\s*"([^"]+)"/g)) {
+                const t = parseDmtsTime(m[1]);
+                if (t != null && (best == null || t > best)) best = t;
+              }
+            }
+            return best;
+          })();
+          const { stdout: hostNow } = await sshExec(conns[label], "date -u +%s");
+          const nowMs = (parseInt(String(hostNow).trim(), 10) || 0) * 1000;
+          if (recMs == null) {
+            throw new Error(`hourLog holds no records on ${label} — DMTS is not writing scoring records ` +
+              `(historical logs may still exist in curLog/ubd). Restart dmts.service.`);
+          }
+          const age = Math.round((nowMs - recMs) / 1000);
+          if (age > MAX_RECORD_AGE_SEC) {
+            throw new Error(`newest hourLog RECORD is ${age}s old on ${label} — log files exist but DMTS ` +
+              `has stopped generating fresh records. Restart dmts.service.`);
+          }
+          return `newest record ${age}s old — DMTS generating live records`;
         });
       }
     }
