@@ -41,7 +41,7 @@ const engine = require("./run_latency_tests.js");
 
 const PROFILE_NAME = "SLA Full Regression (6x7 Matrix)";
 const STATE_FILE = path.join(__dirname, "run_state.json");
-const BASE_DIR = path.join(process.cwd(), "SLA_Regression");
+const BASE_DIR = path.join(__dirname, "SLA_Regression");
 const TOTAL = 42;
 
 /* ========================================================================= *
