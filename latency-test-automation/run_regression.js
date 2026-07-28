@@ -1372,6 +1372,84 @@ async function runRegression(cfg, params, opts = {}) {
  * CLI entry
  * ========================================================================= */
 
+/**
+ * Print the resolved execution plan without contacting anything: which SSH
+ * targets each role uses, the Link A / Link B port groups, the exact iperf and
+ * `tc netem` commands per case, which side's hourLog is collected, the DMTS class
+ * regex, and each case's window. Lets the configuration be reviewed when the
+ * testbed is unavailable. Invoked with --dryrun.
+ */
+function printDryRun(cfg, params) {
+  const L = (s) => console.log(s);
+  const linkA = splitIfaces(params.linkA), linkB = splitIfaces(params.linkB);
+  let tosList = params.regressionTosList || params.tos;
+  if (typeof tosList === "string") tosList = tosList.split(/[,\s]+/).filter(Boolean);
+  tosList = Array.isArray(tosList) && tosList.length ? tosList : [];
+
+  L("================= DRY RUN — resolved execution plan =================");
+  L("");
+  L("1. SSH TARGETS (role -> host, from configuration)");
+  for (const [role, c] of [["client", cfg.clientSsh], ["server", cfg.serverSsh],
+    ["netem", cfg.netemSsh], ["spoke", cfg.spoke], ["hub", cfg.hub]]) {
+    L(`   ${role.padEnd(7)} ${String(c && c.user).padEnd(10)}@${String(c && c.host).padEnd(17)} ` +
+      `auth=${c && c.pass ? "password" : (c && c.keyPath ? "key" : "NONE")}`);
+  }
+  L("");
+  L("2. LINK GROUPS (explicit — no active/standby detection)");
+  L(`   Link A = ${linkA.join(" + ") || "(not configured)"}`);
+  L(`   Link B = ${linkB.join(" + ") || "(not configured)"}`);
+  const plT = (() => { const t = String(params.plTargetLink || "active").toUpperCase(); return (t === "A" || t === "B") ? t : "active"; })();
+  L(`   packet-loss target = ${plT === "active" ? "ACTIVE link (follows the traffic)" : "Link " + plT + " (pinned)"}`);
+  L("");
+  if (!tosList.length) { L("   !! no ToS configured — nothing to plan"); return; }
+  const matrix = buildMatrix(tosList, true, params);
+  L(`3. CASES (${matrix.length})`);
+  for (const c of matrix) L(`   ${c.n}. ${c.id.padEnd(18)} window=${caseWindowSec(c, params)}s   ${initialConfig(c)}`);
+  L("");
+  const NETEM_LIMIT = 500000;
+  for (const c of matrix) {
+    const tc = buildTc(c, { iptv: true, stabilizeSec: params.iptvStabilizeSec, tcMap: tosTcMap(params) });
+    const dur = caseWindowSec(c, params) + 15;
+    const bw = c.direction === "downstream" ? (params.iptvBwDown || params.iptvBw) : (params.iptvBwUp || params.iptvBw);
+    const cmds = engine.buildTrafficCommands({ ...params, trafficDirection: c.direction, tos: c.tos,
+      bandwidth: bw, parallelStreams: params.iptvFlows,
+      serverTrafficIp: params.iptvServerIp || params.serverTrafficIp || params.serverIp,
+      serverPort: params.iptvPort, packetSize: params.iptvPktLen,
+      reportInterval: params.iptvInterval, durationSec: String(dur) });
+    const monHost = tc.monitorSide === "hub" ? (cfg.hub && cfg.hub.host) : (cfg.spoke && cfg.spoke.host);
+    L(`=========== ${c.id} ===========`);
+    L(`   iperf SERVER (${cfg.serverSsh && cfg.serverSsh.host}): ${cmds.serverCmd}`);
+    L(`   iperf CLIENT (${cfg.clientSsh && cfg.clientSsh.host}): ${cmds.clientCmd}`);
+    L(`   hourLog source: ${tc.monitorSide} -> ${monHost}:/var/log/dmts/hourLog`);
+    L(`   DMTS class match: ${tc.monitorTcMatch ? "/" + tc.monitorTcMatch + "/i" : "(none configured for this ToS -> engine follows the busiest-rate class)"}`);
+    if (tc.pairPlan) {
+      const a = tc.pairPlan.linkA, b = tc.pairPlan.linkB;
+      L(`   netem LATENCY — Link A fixed ${a.fixedMs}ms (${a.cls}), Link B steps [${b.steps.join(",")}]ms (${b.cls})`);
+      for (const i of linkA) L(`      A: ${a.fixedMs > 0 ? `tc qdisc replace dev ${i} root netem limit ${NETEM_LIMIT} delay ${a.fixedMs}ms` : `tc qdisc del dev ${i} root   (clean)`}`);
+      for (const v of b.steps) for (const i of linkB) L(`      B: ${v > 0 ? `tc qdisc replace dev ${i} root netem limit ${NETEM_LIMIT} delay ${v}ms` : `tc qdisc del dev ${i} root   (clean)`}`);
+    }
+    if (tc.plPlan) {
+      const s = tc.plPlan;
+      const tgt = plT === "active" ? "<active link ports>" : (plT === "B" ? linkB.join(",") : linkA.join(","));
+      L(`   netem PACKET LOSS — type=${tc.plType}, target=${tgt}`);
+      if (tc.plType === "constant") {
+        L(`      start ${s.initialPct}% -> +${s.rampStepPct}% every ${s.rampIntervalSec}s (hold ${s.stabilizeSec}s) -> max ${s.rampMaxPct}%`);
+        for (let v = s.initialPct; v <= s.rampMaxPct; v += s.rampStepPct) {
+          L(`      ${v > 0 ? `tc qdisc replace dev ${tgt} root netem limit ${NETEM_LIMIT} loss ${v}%` : `tc qdisc del dev ${tgt} root   (0%)`}`);
+        }
+      } else if (tc.plType === "periodic") {
+        L(`      ${s.initialPct}% -> ${s.ceilingPct}% in +${s.stepPct}% steps, ON ${s.onSec}s / OFF ${s.offSec}s per cycle`);
+      } else {
+        L(`      ${s.initialPct}% -> ${s.ceilingPct}% in +${s.stepPct}% steps, gap ${s.randomMinGapSec}-${s.randomMaxGapSec}s, duration ${s.randomMinDurSec}-${s.randomMaxDurSec}s`);
+      }
+      L(`      end on switch: ${!!s.endOnSwitch}`);
+    }
+    L(`   ends: first link switch (+${(tc.stabilizeAfterSwitchMs || 0) / 1000}s stabilise) OR window ${caseWindowSec(c, params)}s`);
+    L("");
+  }
+  L("Nothing was contacted or changed — dry run only.");
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const resume = args.includes("--resume");
@@ -1422,6 +1500,11 @@ async function main() {
   const check = engine.validateParams(params);
   if (!check.ok) { console.error(`invalid params: ${JSON.stringify(check.errors)}`); process.exit(1); }
   const cfg = engine.buildConfig(params);
+
+  // --dryrun: print exactly what WOULD run (SSH targets, link groups, iperf and
+  // tc commands, hourLog source, class match, windows) and exit. Touches nothing,
+  // so the configuration can be reviewed without a live testbed.
+  if (args.includes("--dryrun")) { printDryRun(cfg, params); process.exit(0); }
 
   const summary = stateSummary();
   if (summary && !summary.done && !resume && !restart) {

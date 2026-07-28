@@ -2200,6 +2200,10 @@ async function validateRegressionPreflight(cfg, { onStep = () => {} } = {}) {
           const n = parseInt(cntRaw, 10) || 0;
           return `${HOURLOG_DIR} exists, ${n} hourLog file(s)`;
         });
+        // NON-FATAL: an IDLE lab legitimately produces no hourLog records — DMTS
+        // writes scoring records when it has traffic to measure. Record flow is
+        // therefore verified for real by the traffic-validation gate once iperf is
+        // running (validateTrafficFlowing). Here it is only a heads-up.
         await step(`${label} DMTS live records`, async () => {
           // newest record CONTENT time across the two newest hourLog buckets
           const recMs = await (async () => {
@@ -2219,23 +2223,23 @@ async function validateRegressionPreflight(cfg, { onStep = () => {} } = {}) {
           const { stdout: hostNow } = await sshExec(conns[label], "date -u +%s");
           const nowMs = (parseInt(String(hostNow).trim(), 10) || 0) * 1000;
           if (recMs == null) {
-            throw new Error(`hourLog holds no records on ${label} — DMTS is not writing scoring records ` +
-              `(historical logs may still exist in curLog/ubd). Restart dmts.service.`);
+            throw new Error(`no records yet (lab idle?) — re-checked after traffic starts`);
           }
           const age = Math.round((nowMs - recMs) / 1000);
           if (age > MAX_RECORD_AGE_SEC) {
-            throw new Error(`newest hourLog RECORD is ${age}s old on ${label} — log files exist but DMTS ` +
-              `has stopped generating fresh records. Restart dmts.service.`);
+            throw new Error(`newest record ${age}s old (lab idle?) — re-checked after traffic starts`);
           }
           return `newest record ${age}s old — DMTS generating live records`;
-        });
+        }, { fatal: false });
       }
     }
   } finally {
     for (const c of Object.values(conns)) { try { c.end(); } catch (e) { /* ignore */ } }
   }
 
-  return { ok: failures.length === 0, failures };
+  // Items marked fatal:false are WARNINGS — they never block the run.
+  const fatal = failures.filter((f) => f.fatal !== false);
+  return { ok: fatal.length === 0, failures: fatal, warnings: failures.filter((f) => f.fatal === false) };
 }
 
 /**
