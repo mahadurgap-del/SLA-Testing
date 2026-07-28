@@ -1058,14 +1058,15 @@ async function runRegression(cfg, params, opts = {}) {
   const lb = splitIfaces(params && params.linkB);
   if (la.length) cfg.linkA = la;
   if (lb.length) cfg.linkB = lb;
-  cfg.plTargetLink = String((params && params.plTargetLink) || "A").toUpperCase() === "B" ? "B" : "A";
+  { const t = String((params && params.plTargetLink) || "active").toUpperCase();
+    cfg.plTargetLink = (t === "A" || t === "B") ? t : "active"; }
   if ((!cfg.netemCandidates || !cfg.netemCandidates.length) && (la.length || lb.length)) {
     cfg.netemCandidates = [...la, ...lb];
   }
   if (!cfg.netemCandidates || !cfg.netemCandidates.length) {
     log("WARN: no Link A / Link B interfaces configured — the engine will auto-detect bridged NICs on the netem VM");
   }
-  log(`link configuration — Link A: ${la.join("+") || "(auto)"} | Link B: ${lb.join("+") || "(auto)"} | packet loss targets Link ${cfg.plTargetLink}`);
+  log(`link configuration — Link A: ${la.join("+") || "(auto)"} | Link B: ${lb.join("+") || "(auto)"} | packet loss targets ${cfg.plTargetLink === "active" ? "the ACTIVE link (carrying traffic)" : "Link " + cfg.plTargetLink}`);
 
   // ---- state: load FIRST so a resume drives mode/ToS from the SAVED run, not
   // from whatever flags this invocation happens to carry. ----

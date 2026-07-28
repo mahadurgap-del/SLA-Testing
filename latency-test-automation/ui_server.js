@@ -343,7 +343,8 @@ const server = http.createServer(async (req, res) => {
       const str = (v) => String(v ?? "").trim();
       if (str(body.linkA)) p.linkA = str(body.linkA);
       if (str(body.linkB)) p.linkB = str(body.linkB);
-      p.plTargetLink = str(body.plTargetLink).toUpperCase() === "B" ? "B" : "A";
+      { const t = str(body.plTargetLink).toUpperCase();
+        p.plTargetLink = (t === "A" || t === "B") ? t : "active"; }
       if (str(body.regDirection)) p.regDirection = str(body.regDirection);
       if (str(body.iptvResetSettleSec)) {
         const s = parseInt(str(body.iptvResetSettleSec), 10);
@@ -666,9 +667,11 @@ const PAGE = (d, profileNames) => `<!doctype html>
         <input name="linkB" value="${esc(d.linkB)}" placeholder="e.g. ens224,ens225"><div class="errmsg"></div></div>
       <div><label>Packet loss target link</label>
         <select name="plTargetLink">
-          <option value="A"${d.plTargetLink === "B" ? "" : " selected"}>Link A (Link B stays clean)</option>
-          <option value="B"${d.plTargetLink === "B" ? " selected" : ""}>Link B (Link A stays clean)</option>
-        </select><div class="errmsg"></div></div>
+          <option value="active"${d.plTargetLink === "A" || d.plTargetLink === "B" ? "" : " selected"}>Active link — the one carrying traffic (recommended)</option>
+          <option value="A"${d.plTargetLink === "A" ? " selected" : ""}>Pin to Link A</option>
+          <option value="B"${d.plTargetLink === "B" ? " selected" : ""}>Pin to Link B</option>
+        </select><div class="errmsg"></div>
+        <div class="hint" style="margin:3px 0 0;">Loss must hit the traffic's own link to trigger a switch; the other link stays clean. Latency cases always set both links explicitly.</div></div>
       <div><label>Reset settle time (s)</label>
         <input name="iptvResetSettleSec" value="${esc(d.iptvResetSettleSec)}" placeholder="3"><div class="errmsg"></div></div>
     </div>

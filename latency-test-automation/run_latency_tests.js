@@ -1571,18 +1571,28 @@ async function calibrateNetemLinkMap(cfg, monCreds, { signatureMs = 400, settleS
  * back to the busiest-pps link (legacy behaviour) whenever anything is missing.
  */
 /**
- * Which link group the packet-loss schedules impair. When the operator has
- * configured Link A / Link B, use the chosen target (cfg.plTargetLink, "A" or
- * "B", default "A") and leave the other link clean — no active/standby guessing.
- * Falls back to the legacy resolver only when link groups are not configured.
+ * Which link group the packet-loss schedules impair.
+ *
+ * cfg.plTargetLink:
+ *   "active" (DEFAULT) — the link that is actually CARRYING THE TRAFFIC, resolved
+ *       per case from DMTS (the monitored traffic class's current link, mapped to
+ *       netem ports) with a busiest-pps fallback. Loss must hit the traffic's own
+ *       link: impairing an idle link cannot trigger a switch and yields a
+ *       meaningless "no switch" result.
+ *   "A" / "B" — pin loss to that configured group instead (manual override).
+ * The other link is always left clean.
  */
 async function plTargetPorts(cfg) {
-  if (cfg.linkA && cfg.linkA.length && cfg.linkB && cfg.linkB.length) {
-    const which = String(cfg.plTargetLink || "A").toUpperCase() === "B" ? "B" : "A";
+  const which = String(cfg.plTargetLink || "active").toUpperCase();
+  if ((which === "A" || which === "B") && cfg.linkA && cfg.linkA.length && cfg.linkB && cfg.linkB.length) {
     const ports = which === "B" ? cfg.linkB : cfg.linkA;
-    return { bridge: `Link ${which}`, ports, source: "configured" };
+    return { bridge: `Link ${which} (pinned)`, ports, source: "configured" };
   }
-  return impairTargetPorts(cfg);
+  // follow the traffic: DMTS-reported link for the class under test, else pps
+  const det = await impairTargetPorts(cfg);
+  const named = (cfg.linkA && cfg.linkA.join("+") === (det.ports || []).join("+")) ? "Link A"
+    : (cfg.linkB && cfg.linkB.join("+") === (det.ports || []).join("+")) ? "Link B" : det.bridge;
+  return { ...det, bridge: `${named} (active — carrying traffic)` };
 }
 
 async function impairTargetPorts(cfg) {
