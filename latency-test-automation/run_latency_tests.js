@@ -2350,16 +2350,31 @@ async function validateRegressionPreflight(cfg, { onStep = () => {} } = {}) {
  * configured order when the active link cannot be determined.
  * @returns {{active, standby, swapped:boolean, how:string}}
  */
-async function orderGroupsByActive(cfg, gA, gB) {
+async function orderGroupsByActive(cfg, gA, gB, { sampleSeconds = 4 } = {}) {
+  // NETEM ONLY: compare packet counters on the two configured bridges and treat
+  // the busier one as the link carrying traffic. DMTS is deliberately not consulted
+  // for impairment targeting — netem interfaces are the thing being impaired, so
+  // the decision is made from their own counters.
   try {
-    const det = await impairTargetPorts(cfg);      // DMTS class link, else busiest pps
-    const key = (g) => (g.ports || []).join("+");
-    if (key(det) === key(gB)) return { active: gB, standby: gA, swapped: true, how: det.source || "detected" };
-    if (key(det) === key(gA)) return { active: gA, standby: gB, swapped: false, how: det.source || "detected" };
-    log(`WARN: traffic link ${det.bridge} (${key(det)}) is neither Link A nor Link B — ` +
-        `latency will be applied to the configured groups as-is`);
+    const conn = await sshConnect(cfg.netemSsh);
+    let sum;
+    try {
+      const read = async () => parsePacketCounters((await sshExec(conn, "cat /proc/net/dev")).stdout);
+      const t0 = await read();
+      await sleep(sampleSeconds * 1000);
+      const t1 = await read();
+      sum = (ports) => (ports || []).reduce((n, i) => {
+        const a = t0[i] || { rxPkts: 0, txPkts: 0 }, b = t1[i] || { rxPkts: 0, txPkts: 0 };
+        return n + Math.max(0, (b.rxPkts - a.rxPkts) + (b.txPkts - a.txPkts));
+      }, 0);
+    } finally { conn.end(); }
+    const ppsA = Math.round(sum(gA.ports) / sampleSeconds);
+    const ppsB = Math.round(sum(gB.ports) / sampleSeconds);
+    log(`active-link check (netem counters): ${gA.ports.join("+")}=${ppsA} pps, ${gB.ports.join("+")}=${ppsB} pps`);
+    if (ppsB > ppsA) return { active: gB, standby: gA, swapped: true, how: `netem ${ppsB} vs ${ppsA} pps` };
+    return { active: gA, standby: gB, swapped: false, how: `netem ${ppsA} vs ${ppsB} pps` };
   } catch (e) {
-    log(`WARN: could not determine the active link (${e.message}) — using the configured order`);
+    log(`WARN: could not sample netem counters (${e.message}) — using the configured order`);
   }
   return { active: gA, standby: gB, swapped: false, how: "configured order" };
 }
@@ -3217,7 +3232,9 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   // is already on the better path and no switch can occur).
   if (tc._preImpaired && tc._preOrder) {
     try {
-      const det = await impairTargetPorts(cfg);
+      // netem counters only — same rule as the initial assignment
+      const re = await orderGroupsByActive(cfg, tc._preOrder.active, tc._preOrder.standby);
+      const det = re.active;
       const key = (g) => (g.ports || []).join("+");
       if (key(det) && key(det) === key(tc._preOrder.standby)) {
         const aMs = tc.pairPlan.linkA.fixedMs;                  // better value
