@@ -2160,15 +2160,18 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
   // 4. DMTS classifies the traffic + hourLog is updating.
   // Only meaningful while traffic flows — DMTS reports pre-existing classes too.
   if (monCreds) {
+    // Informational: the monitor keeps polling for the whole window, so a class
+    // that is not visible right now may still appear. A silent DMTS means "no
+    // switch observed", which is a valid observation — not a reason to abort.
     await step("DMTS traffic class detected", async () => {
       if (!trafficFlowing) return "SKIPPED — traffic is not flowing, so DMTS classification proves nothing";
       const conn = await sshConnect(monCreds);
       try {
         const tl = await readTcActiveLink(conn, tcMatch);
-        if (!tl) throw new Error("DMTS did not classify any active traffic class — check the ToS→class mapping");
+        if (!tl) throw new Error("no class visible yet — the monitor will keep watching for the whole window");
         return `${tl.name} on ${tl.linkName || "link " + tl.linkId}`;
       } finally { conn.end(); }
-    });
+    }, { fatal: false });
     // Kept SHORT: pre-flight already proved DMTS is writing live records, and the
     // monitor re-checks continuously. Waiting long here only delays impairment,
     // eating into the case window. Informational — never blocks the run.
