@@ -3209,6 +3209,36 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     log(`${tc.name}: traffic validation passed (${tv.checks.length} checks)`);
   }
 
+  // ---- CORRECT the pre-impairment assignment now that traffic exists ----
+  // TC3/TC4 apply latency BEFORE traffic starts, so at that moment the active link
+  // can only be guessed. With the flow now running, netem counters show where it
+  // really landed: if the DEGRADED value ended up on the idle link, swap the two
+  // values so the degraded one sits on the traffic's own link (otherwise the flow
+  // is already on the better path and no switch can occur).
+  if (tc._preImpaired && tc._preOrder) {
+    try {
+      const det = await impairTargetPorts(cfg);
+      const key = (g) => (g.ports || []).join("+");
+      if (key(det) && key(det) === key(tc._preOrder.standby)) {
+        const aMs = tc.pairPlan.linkA.fixedMs;                  // better value
+        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;   // degraded value
+        log(`${tc.name}: traffic landed on ${key(det)} which holds the BETTER value — ` +
+            `swapping so ${bMs}ms sits on the traffic's link`);
+        if (bMs > 0) await applyToLink(cfg, tc._preOrder.standby.ports, { delayMs: bMs }, impairedIfaces);
+        if (aMs > 0) await applyToLink(cfg, tc._preOrder.active.ports, { delayMs: aMs }, impairedIfaces);
+        else await clearLink(cfg, tc._preOrder.active.ports);
+        tc._preOrder = { active: tc._preOrder.standby, standby: tc._preOrder.active,
+                         swapped: true, how: "corrected after traffic started" };
+        checkpoint(true, `${tc.name} impairment re-targeted`,
+          `${bMs}ms now on the active link ${key(det)}`);
+      } else {
+        log(`${tc.name}: pre-impairment already correct — degraded value is on the traffic's link`);
+      }
+    } catch (e) {
+      log(`WARN: ${tc.name}: could not re-check the pre-impairment target (${e.message})`);
+    }
+  }
+
   await stageGate(cfg, `${tc.name}: traffic validated`);
   setStatus({ stage: "Monitoring", operation: "Traffic verified — monitoring DMTS for a link switch",
     switchObserved: false, stabilizeUntil: null, switchFrom: null, switchTo: null });
