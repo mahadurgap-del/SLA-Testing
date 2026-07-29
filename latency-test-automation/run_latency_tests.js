@@ -3149,23 +3149,73 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     }
   }
 
-  await startTraffic();
+  // ---- START TRAFFIC WITH RETRIES ----
+  // iperf can die early (observed under high pre-impairment latency: the client
+  // exits ~30s in despite -t). Rather than failing the case, kill iperf on BOTH
+  // hosts and start again, up to TRAFFIC_ATTEMPTS times. Only when every attempt
+  // fails is the alarm raised and the run stopped.
+  const TRAFFIC_ATTEMPTS = parseInt(envOr("TRAFFIC_START_ATTEMPTS", "10"), 10) || 10;
+  const killIperfBothSides = async () => {
+    for (const [name, creds] of [["client", cfg.clientSsh], ["server", cfg.serverSsh]]) {
+      if (!creds) continue;
+      try {
+        const conn = await sshConnect(creds);
+        try { await sshExec(conn, "pkill -9 -x iperf3 2>/dev/null; true", { timeoutMs: 15000 }); }
+        finally { conn.end(); }
+      } catch (e) { log(`WARN: ${tc.name}: kill iperf on ${name}: ${(e.message || "").split("\n")[0]}`); }
+    }
+  };
 
-  try {
+  let trafficErr = null;
+  for (let attempt = 1; attempt <= TRAFFIC_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      log(`${tc.name}: traffic attempt ${attempt}/${TRAFFIC_ATTEMPTS} — killing iperf on both hosts and restarting`);
+      setStatus({ stage: "Traffic Validation",
+        operation: `Traffic did not hold — retry ${attempt}/${TRAFFIC_ATTEMPTS}` });
+      await killIperfBothSides();
+      await sleep(4000);
+      trafficStopped = false;
+    }
+    try {
+      await startTraffic();
+      result.trafficVerifiedBps = await verifyTrafficFlowingScaled();
+      if (attempt > 1) {
+        log(`${tc.name}: traffic verified on attempt ${attempt}/${TRAFFIC_ATTEMPTS}`);
+        checkpoint(true, "Traffic verified after retry", `attempt ${attempt} of ${TRAFFIC_ATTEMPTS}`);
+      }
+      trafficErr = null;
+      break;
+    } catch (e) {
+      trafficErr = e;
+      log(`WARN: ${tc.name}: traffic attempt ${attempt}/${TRAFFIC_ATTEMPTS} failed — ${e.message.split("\n")[0]}`);
+      try { await stopTraffic(); } catch (e2) { /* ignore */ }
+    }
+  }
+
+  // scaled-threshold wrapper, used by every attempt above
+  async function verifyTrafficFlowingScaled() {
     // expected pps from the ACTUAL client command: flows × per-flow bw ÷ pkt len.
     // Require 25% of it so background bridge chatter can never pass the check.
     const cc = String(traffic.clientCmd || "");
     const flows = parseInt((cc.match(/-P\s+(\d+)/) || [])[1], 10) || 1;
     const pktLen = parseInt((cc.match(/-l\s+(\d+)/) || [])[1], 10) || 1200;
-    const perFlowBps = traffic.bandwidth || 0; // bits/s per flow
+    // -b carries a suffixed rate ("1M", "500K"); parseBandwidth keeps it as a
+    // STRING, so it must be converted to bits/s here or the arithmetic yields NaN
+    // and the threshold silently falls back to the 50-pps floor.
+    const bwStr = (cc.match(/-b\s+(\S+)/) || [])[1] || String(traffic.bandwidth || "");
+    const bwm = String(bwStr).match(/^([\d.]+)\s*([kKmMgG])?/);
+    const mult = { k: 1e3, m: 1e6, g: 1e9 };
+    const perFlowBps = bwm ? parseFloat(bwm[1]) * (mult[String(bwm[2] || "").toLowerCase()] || 1) : 0;
     const expectedPps = Math.floor((perFlowBps * flows) / 8 / pktLen);
-    result.trafficVerifiedBps = await verifyTrafficFlowing(cfg, sshHandles,
+    return await verifyTrafficFlowing(cfg, sshHandles,
       { minPps: expectedPps > 0 ? Math.max(50, Math.floor(expectedPps * 0.25)) : null });
-  } catch (e) {
-    // TRAFFIC IS NOT FLOWING — a run-stopping condition. Impairment is pointless
-    // and every later case would fail the same way, so raise the alarm (visual +
-    // audible in the panel) and abort the whole run rather than marching on.
-    result.errors.push(e.message);
+  }
+
+  if (trafficErr) {
+    // EVERY attempt failed — now it is a run-stopping condition. Raise the alarm
+    // (visual + audible in the panel) and abort rather than marching on.
+    const e = trafficErr;
+    result.errors.push(`${e.message} (after ${TRAFFIC_ATTEMPTS} attempts)`);
     await shot("99_traffic_not_flowing");
     try { await stopTraffic(); } catch (e2) { result.errors.push(`stop traffic: ${e2.message}`); }
     // still collect DMTS evidence so the failed case can be analysed
@@ -3180,8 +3230,9 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       errorDetail: {
         stage: "Traffic Validation", testcase: tc.name,
         operation: "Traffic generation check",
-        reason: e.message,
-        suggestion: "No traffic is reaching the netem links, so no impairment test is valid. " +
+        reason: `${e.message} — still failing after ${TRAFFIC_ATTEMPTS} attempts ` +
+          `(iperf was killed on both hosts and restarted each time)`,
+        suggestion: `Traffic could not be sustained across ${TRAFFIC_ATTEMPTS} restarts, so no impairment test is valid. ` +
           "Check that the Server traffic IP is the server's DATA-plane address and is reachable " +
           "from the client (ping it), that iperf3 is listening on the configured port, and that " +
           "the overlay path between spoke and hub is up. The run was stopped — fix this, then start again.",
