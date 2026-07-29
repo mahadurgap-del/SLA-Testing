@@ -1113,7 +1113,11 @@ async function ifaceByteTotals(conn) {
   return total;
 }
 
-async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, sampleSeconds = 5 } = {}) {
+async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, sampleSeconds = 5, minPps = null } = {}) {
+  // The pass threshold must scale with the CONFIGURED load: the static 50-pps
+  // floor let ~68 pps of background chatter (DMTS probes/keepalives) count as
+  // "traffic verified" while the actual iperf load (thousands of pps) was absent.
+  const effMinPps = Math.max(cfg.trafficMinPps || 50, minPps || 0);
   // 1. is the generator process even alive? (catches bad binds, bad options)
   if (sshHandles) {
     const c = await checkTrafficClient(cfg, sshHandles);
@@ -1135,8 +1139,8 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
       if (isAborted()) throw new Error("aborted by user during traffic verification");
       const best = await netemCandidatePps(cfg, sampleSeconds);
       log(`traffic check ${i}/${attempts}: ${best.pps} pps on netem link ` +
-          `${best.iface ?? "(none)"} (threshold ${cfg.trafficMinPps} pps, scope: ${scope})`);
-      if (best.pps >= cfg.trafficMinPps) {
+          `${best.iface ?? "(none)"} (threshold ${effMinPps} pps, scope: ${scope})`);
+      if (best.pps >= effMinPps) {
         checkpoint(true, "Traffic verified", `${best.pps} pps over ${best.iface}`);
         setStatus({ trafficVerified: best.pps });
         return best.pps;
@@ -1144,9 +1148,9 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
     }
     const c2 = sshHandles ? await checkTrafficClient(cfg, sshHandles) : null;
     checkpoint(false, "Traffic verified",
-      `below ${cfg.trafficMinPps} pps on ${scope} after ${attempts} checks`);
+      `below ${effMinPps} pps on ${scope} after ${attempts} checks`);
     throw new Error(
-      `traffic is NOT crossing the netem links (below ${cfg.trafficMinPps} pps on ` +
+      `traffic is NOT crossing the netem links (below ${effMinPps} pps on ` +
       `${scope} after ${attempts} checks). Check the traffic ` +
       `destination is the server's DATA-plane IP, not its mgmt IP.` +
       (c2?.tail ? ` Client output: ${c2.tail}` : ""));
@@ -2001,7 +2005,7 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
  *
  * @returns {ok, checks:[{name,status,detail}], failures:[{name,detail}]}
  */
-async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles, onStep = () => {} } = {}) {
+async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles, targetIp, onStep = () => {} } = {}) {
   const checks = [], failures = [];
   const step = async (name, fn) => {
     onStep(name, "run", "");
@@ -2016,6 +2020,28 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
       onStep(name, "fail", detail);
     }
   };
+
+  // 0. the traffic target must be an address the SERVER actually owns. If it
+  //    belongs to another node (e.g. a VPP gateway like 10.40.1.1), the client's
+  //    control connection is answered by that node instead, iperf hangs with no
+  //    data, and every later check fails confusingly. Catch it by name here.
+  if (targetIp && cfg.serverSsh) {
+    await step(`Server owns traffic IP ${targetIp}`, async () => {
+      const conn = await sshConnect(cfg.serverSsh);
+      try {
+        const { stdout } = await sshExec(conn, `ip -o -4 addr show | grep -c "${targetIp}/" || true`);
+        if ((parseInt(String(stdout).trim(), 10) || 0) < 1) {
+          const { stdout: owned } = await sshExec(conn, `ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | tr '\\n' ' '`);
+          throw new Error(`Server traffic IP ${targetIp} is NOT configured on the server VM — ` +
+            `iperf will handshake with whatever owns it (a gateway?) and hang. ` +
+            `Server's addresses: ${String(owned).trim()}. Use the server's data-plane IP.`);
+        }
+        return `${targetIp} is on the server VM`;
+      } finally { conn.end(); }
+    });
+    // a wrong target makes every later check meaningless — stop here
+    if (failures.length) return { ok: false, checks, failures, warnings: [] };
+  }
 
   // 1. iperf alive on both traffic hosts
   for (const [label, creds] of [["client", cfg.clientSsh], ["server", cfg.serverSsh]]) {
@@ -2055,24 +2081,32 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
     } finally { conn.end(); }
   };
   const MIN_BPS = 20000; // ~20 KB/s — well under any real test load
+  // Once we know traffic is not actually flowing, the downstream checks (ToS on
+  // the wire, DMTS classification) cannot be trusted: a trickle of stray packets
+  // or a pre-existing traffic class makes them report OK and mask the real fault.
+  // They are reported as SKIPPED instead of a misleading pass.
+  let trafficFlowing = true;
   if (cfg.clientSsh) {
     await step("Bandwidth transmitted", async () => {
       const r = await bpsOn(cfg.clientSsh, cfg.clientIface || null);
-      if (r.tx < MIN_BPS) throw new Error(`no meaningful transmit on the client (${Math.round(r.tx)} B/s) — traffic is not being generated`);
+      if (r.tx < MIN_BPS) { trafficFlowing = false; throw new Error(`no meaningful transmit on the client (${Math.round(r.tx)} B/s) — traffic is not being generated`); }
       return `${(r.tx / 125000).toFixed(1)} Mbps out${r.iface ? ` on ${r.iface}` : ""}`;
     });
   }
   if (cfg.serverSsh) {
     await step("Bandwidth received", async () => {
       const r = await bpsOn(cfg.serverSsh, cfg.serverIface || null);
-      if (r.rx < MIN_BPS) throw new Error(`no meaningful receive on the server (${Math.round(r.rx)} B/s) — no UDP packets are arriving`);
+      if (r.rx < MIN_BPS) { trafficFlowing = false; throw new Error(`no meaningful receive on the server (${Math.round(r.rx)} B/s) — no UDP packets are arriving`); }
       return `${(r.rx / 125000).toFixed(1)} Mbps in${r.iface ? ` on ${r.iface}` : ""}`;
     });
   }
 
-  // 3. the configured ToS is actually on the wire (server-side capture)
+  // 3. the configured ToS is actually on the wire (server-side capture).
+  // Requires a RATE, not merely a packet: a couple of stray packets with matching
+  // DSCP bits would otherwise pass while the real traffic is absent.
   if (tosHex && cfg.serverSsh) {
     await step(`ToS ${tosHex} visible in traffic`, async () => {
+      if (!trafficFlowing) return "SKIPPED — traffic is not flowing, so this cannot be verified";
       const conn = await sshConnect(cfg.serverSsh);
       try {
         const dec = parseInt(String(tosHex).replace(/^0x/i, ""), 16);
@@ -2080,19 +2114,25 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
         // tcpdump is optional on the host; treat absence as "not verifiable"
         const has = await sshExec(conn, "command -v tcpdump || echo MISSING");
         if (/MISSING/.test(has.stdout)) return "skipped — tcpdump not installed on the server";
+        const SECS = 5, MIN_PKTS = 50; // a real test load is thousands of pkt/s
         const r = await sudoExec(conn, cfg.serverSsh,
-          `timeout 6 tcpdump -n -c 3 "ip and (ip[1] & 0xfc) == ${dec & 0xfc}" 2>/dev/null | wc -l`,
-          { timeoutMs: 20000 });
+          `timeout ${SECS} tcpdump -n -c 400 "ip and (ip[1] & 0xfc) == ${dec & 0xfc}" 2>/dev/null | wc -l`,
+          { timeoutMs: 25000 });
         const n = parseInt(String(r.stdout).replace(/[^\d]/g, " ").trim().split(/\s+/).pop(), 10) || 0;
-        if (n < 1) throw new Error(`no packets seen with ToS ${tosHex} — the ToS value does not match the traffic`);
-        return `${n} packet(s) matched`;
+        if (n < MIN_PKTS) {
+          throw new Error(`only ${n} packet(s) with ToS ${tosHex} in ${SECS}s (need >=${MIN_PKTS}) — ` +
+            `the configured ToS is not present in the test traffic`);
+        }
+        return `${n} packets in ${SECS}s (~${Math.round(n / SECS)} pkt/s)`;
       } finally { conn.end(); }
     });
   }
 
-  // 4. DMTS classifies the traffic + hourLog is updating
+  // 4. DMTS classifies the traffic + hourLog is updating.
+  // Only meaningful while traffic flows — DMTS reports pre-existing classes too.
   if (monCreds) {
     await step("DMTS traffic class detected", async () => {
+      if (!trafficFlowing) return "SKIPPED — traffic is not flowing, so DMTS classification proves nothing";
       const conn = await sshConnect(monCreds);
       try {
         const tl = await readTcActiveLink(conn, tcMatch);
@@ -2970,7 +3010,15 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   await startTraffic();
 
   try {
-    result.trafficVerifiedBps = await verifyTrafficFlowing(cfg, sshHandles);
+    // expected pps from the ACTUAL client command: flows × per-flow bw ÷ pkt len.
+    // Require 25% of it so background bridge chatter can never pass the check.
+    const cc = String(traffic.clientCmd || "");
+    const flows = parseInt((cc.match(/-P\s+(\d+)/) || [])[1], 10) || 1;
+    const pktLen = parseInt((cc.match(/-l\s+(\d+)/) || [])[1], 10) || 1200;
+    const perFlowBps = traffic.bandwidth || 0; // bits/s per flow
+    const expectedPps = Math.floor((perFlowBps * flows) / 8 / pktLen);
+    result.trafficVerifiedBps = await verifyTrafficFlowing(cfg, sshHandles,
+      { minPps: expectedPps > 0 ? Math.max(50, Math.floor(expectedPps * 0.25)) : null });
   } catch (e) {
     // TRAFFIC IS NOT FLOWING — a run-stopping condition. Impairment is pointless
     // and every later case would fail the same way, so raise the alarm (visual +
@@ -3012,6 +3060,7 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     setStatus({ stage: "Traffic Validation", operation: "Verifying traffic is flowing", trafficChecks: [] });
     const tv = await validateTrafficFlowing(cfg, {
       tosHex: tc.tosHex || null,
+      targetIp: (String(traffic.clientCmd || "").match(/-c\s+(\S+)/) || [])[1] || null,
       monCreds, tcMatch: tc.monitorTcMatch || undefined, handles: sshHandles,
       onStep: (name, status, detail) => {
         const i = tvSteps.findIndex((s) => s.name === name);
@@ -4058,6 +4107,7 @@ module.exports = {
   // traffic generation + interface discovery
   buildTrafficCommands, toolBinary, parseInterfaces, listRemoteInterfaces,
   checkTrafficClient, netemCandidatePps, parseIfaceMasters,
+  startTrafficViaSsh, stopTrafficViaSsh, verifyTrafficFlowing,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
   resetLabBetweenCases, resolveLinkGroups, plTargetPorts, validateRegressionPreflight, validateTrafficFlowing, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
