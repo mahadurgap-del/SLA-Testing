@@ -673,13 +673,9 @@ const PAGE = (d, profileNames) => `<!doctype html>
         <input name="linkA" value="${esc(d.linkA)}" placeholder="e.g. ens192,ens193"><div class="errmsg"></div></div>
       <div><label>Link B interfaces <span class="req">*</span></label>
         <input name="linkB" value="${esc(d.linkB)}" placeholder="e.g. ens224,ens225"><div class="errmsg"></div></div>
-      <div><label>Packet loss target link</label>
-        <select name="plTargetLink">
-          <option value="active"${d.plTargetLink === "A" || d.plTargetLink === "B" ? "" : " selected"}>Active link — the one carrying traffic (recommended)</option>
-          <option value="A"${d.plTargetLink === "A" ? " selected" : ""}>Pin to Link A</option>
-          <option value="B"${d.plTargetLink === "B" ? " selected" : ""}>Pin to Link B</option>
-        </select><div class="errmsg"></div>
-        <div class="hint" style="margin:3px 0 0;">Loss must hit the traffic's own link to trigger a switch; the other link stays clean. Latency cases always set both links explicitly.</div></div>
+      <div class="full hint" style="margin:2px 0 0;">The link carrying traffic is detected from <b>netem packet counters</b> on these
+        interfaces. Impairment always targets that link (packet loss on it, the degraded latency value on it) and leaves the
+        other one clean &mdash; there is nothing to choose.</div>
       <div><label>Results folder name <span style="font-weight:400;color:#6b7280">(optional)</span></label>
         <input name="runLabel" value="${esc(d.runLabel)}" placeholder="e.g. smoke_tc2_pl1"><div class="errmsg"></div>
         <div class="hint" style="margin:3px 0 0;">Saved under SLA_Regression/&lt;name&gt;/ — blank uses the root.</div></div>
