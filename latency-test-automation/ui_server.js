@@ -692,9 +692,15 @@ const PAGE = (d, profileNames) => `<!doctype html>
   <fieldset class="reg-only sec-traffic"><legend>Traffic Configuration</legend>
     <div class="grid3">
       <div><label>Server traffic IP <span class="req">*</span></label>
-        <input name="iptvServerIp" value="${esc(d.iptvServerIp)}" placeholder="data-plane IP"><div class="errmsg"></div></div>
+        <input name="iptvServerIp" value="${esc(d.iptvServerIp)}" placeholder="data-plane IP"><div class="errmsg"></div>
+        <div class="hint">Must be an address the <b>server VM itself owns</b> (checked at start) — not a gateway.</div></div>
       <div><label>Server port <span class="req">*</span></label>
         <input name="iptvPort" value="${esc(d.iptvPort)}" placeholder="5201"><div class="errmsg"></div></div>
+      <div><label>Protocol</label>
+        <select name="trafficType">
+          <option value="UDP"${d.trafficType === "TCP" ? "" : " selected"}>UDP (adds -u)</option>
+          <option value="TCP"${d.trafficType === "TCP" ? " selected" : ""}>TCP</option>
+        </select><div class="errmsg"></div></div>
       <div><label>Parallel streams (-P) <span class="req">*</span></label>
         <input name="iptvFlows" value="${esc(d.iptvFlows)}" placeholder="10"><div class="errmsg"></div></div>
       <div><label>Packet length (-l bytes) <span class="req">*</span></label>
@@ -816,9 +822,6 @@ const PAGE = (d, profileNames) => `<!doctype html>
     </div>`; }).join("")}
     </div>
     <div class="grid3" style="margin-top:14px;">
-      <div><label>Protocol</label><select name="trafficType">
-        <option${d.trafficType === "UDP" ? " selected" : ""}>UDP</option>
-        <option${d.trafficType === "TCP" ? " selected" : ""}>TCP</option></select><div class="errmsg"></div></div>
       <div class="custom-only"><label>Client port</label><input name="clientPort" value="${esc(d.clientPort)}" placeholder="auto"><div class="errmsg"></div></div>
       <div class="custom-only"><label>Server port</label><input name="serverPort" value="${esc(d.serverPort)}"><div class="errmsg"></div></div>
       <div class="full hint">Netem is controlled over <b>SSH</b> (<code>tc qdisc</code> on the netem VM) and traffic is generated over <b>SSH</b> (<code>iperf3</code>). The netem web UI is not used and is not required.</div>
