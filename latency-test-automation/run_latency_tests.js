@@ -2006,8 +2006,11 @@ async function applyLatencyViaTc(cfg, tc, impairedIfaces) {
  * @returns {ok, checks:[{name,status,detail}], failures:[{name,detail}]}
  */
 async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles, targetIp, onStep = () => {} } = {}) {
-  const checks = [], failures = [];
-  const step = async (name, fn) => {
+  const checks = [], failures = [], warnings = [];
+  // fatal:false => informational only. It is recorded and shown, but it never
+  // stops the run: some checks (DSCP visible at the far end) can legitimately
+  // fail on a working path, e.g. when the overlay rewrites/tunnels the ToS bits.
+  const step = async (name, fn, { fatal = true } = {}) => {
     onStep(name, "run", "");
     try {
       const detail = await fn();
@@ -2015,9 +2018,9 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
       onStep(name, "ok", detail || "");
     } catch (e) {
       const detail = (e.message || String(e)).split("\n")[0];
-      checks.push({ name, status: "fail", detail });
-      failures.push({ name, detail });
-      onStep(name, "fail", detail);
+      checks.push({ name, status: fatal ? "fail" : "warn", detail });
+      (fatal ? failures : warnings).push({ name, detail });
+      onStep(name, fatal ? "fail" : "warn", detail);
     }
   };
 
@@ -2120,12 +2123,12 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
           { timeoutMs: 25000 });
         const n = parseInt(String(r.stdout).replace(/[^\d]/g, " ").trim().split(/\s+/).pop(), 10) || 0;
         if (n < MIN_PKTS) {
-          throw new Error(`only ${n} packet(s) with ToS ${tosHex} in ${SECS}s (need >=${MIN_PKTS}) — ` +
-            `the configured ToS is not present in the test traffic`);
+          throw new Error(`only ${n} packet(s) with ToS ${tosHex} seen at the server in ${SECS}s — ` +
+            `the overlay may rewrite or tunnel the DSCP bits, so this is informational only`);
         }
         return `${n} packets in ${SECS}s (~${Math.round(n / SECS)} pkt/s)`;
       } finally { conn.end(); }
-    });
+    }, { fatal: false });   // DSCP can legitimately be rewritten in transit
   }
 
   // 4. DMTS classifies the traffic + hourLog is updating.
@@ -2140,15 +2143,18 @@ async function validateTrafficFlowing(cfg, { tosHex, monCreds, tcMatch, handles,
         return `${tl.name} on ${tl.linkName || "link " + tl.linkId}`;
       } finally { conn.end(); }
     });
+    // Kept SHORT: pre-flight already proved DMTS is writing live records, and the
+    // monitor re-checks continuously. Waiting long here only delays impairment,
+    // eating into the case window. Informational — never blocks the run.
     await step("hourLog updating", async () => {
       const before = await getHourlogRecordTime(monCreds);
-      const cov = await waitForHourlogCoverage(monCreds, before, 1000, { maxWaitMs: 90000 });
-      if (!cov.covered) throw new Error("the DMTS hourLog is not advancing — DMTS may have stopped");
+      const cov = await waitForHourlogCoverage(monCreds, before, 1000, { maxWaitMs: 25000 });
+      if (!cov.covered) throw new Error("hourLog did not advance within 25s — the monitor will keep watching");
       return "advancing";
-    });
+    }, { fatal: false });
   }
 
-  return { ok: failures.length === 0, checks, failures };
+  return { ok: failures.length === 0, checks, failures, warnings };
 }
 
 /**
@@ -3085,7 +3091,12 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       err.caseResult = result;
       throw err;
     }
-    log(`${tc.name}: traffic validation passed (${tv.checks.length} checks)`);
+    for (const w of (tv.warnings || [])) {
+      log(`WARN: ${tc.name}: ${w.name} — ${w.detail} (informational; run continues)`);
+      result.errors.push(`warning: ${w.name} — ${w.detail}`);
+    }
+    log(`${tc.name}: traffic validation passed (${tv.checks.length} checks` +
+        `${(tv.warnings || []).length ? `, ${tv.warnings.length} warning(s)` : ""})`);
   }
 
   await stageGate(cfg, `${tc.name}: traffic validated`);
