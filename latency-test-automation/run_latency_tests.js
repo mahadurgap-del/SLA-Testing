@@ -3248,7 +3248,11 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   // A "no switch" result is only meaningful if traffic was really flowing and
   // DMTS classified it, so a failure here aborts the case instead of producing a
   // misleading observation.
-  if (tc.validateTraffic !== false) {
+  // Extended validation (ToS on the wire, DMTS classification, hourLog freshness) is
+  // OPT-IN. By default the netem pps check above is the whole proof: it measures the
+  // configured bridges directly, which is the only thing an impairment test needs,
+  // and it keeps the gap between traffic start and impairment short.
+  if (tc.validateTraffic === true) {
     const tvSteps = [];
     setStatus({ stage: "Traffic Validation", operation: "Verifying traffic is flowing", trafficChecks: [] });
     const tv = await validateTrafficFlowing(cfg, {

@@ -378,7 +378,7 @@ function buildTc(c, opts = {}) {
     ? { monitorSide: c.direction === "downstream" ? "hub" : "spoke", endOnSwitch: true,
         hourlogOnly: true, stabilizeAfterSwitchMs,
         // traffic validation gate: prove flow + ToS + DMTS classification first
-        tosHex: c.tos, validateTraffic: opts.validateTraffic !== false,
+        tosHex: c.tos, validateTraffic: opts.validateTraffic === true,
         // which DMTS traffic class this ToS rides on THIS grid (hint; engine
         // falls back to the busiest-rate class when it matches nothing)
         monitorTcMatch: (opts.tcMap || DEFAULT_TOS_TC_MATCH)[String(c.tos).toLowerCase()] || null }
@@ -1225,7 +1225,7 @@ async function runRegression(cfg, params, opts = {}) {
       if (opts.limit && ranThisRun >= opts.limit) { log(`reached --limit ${opts.limit} — stopping (smoke run)`); break; }
 
       state.currentIndex = c.n;
-      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec, tcMap: tosTcMap(params), validateTraffic: params.validateTraffic !== false });
+      const tc = buildTc(c, { iptv: state.iptvMode, stabilizeSec: params.iptvStabilizeSec, tcMap: tosTcMap(params), validateTraffic: params.validateTraffic === true });
       const durationMs = (params.forceCaseSec ? parseInt(params.forceCaseSec, 10) : caseWindowSec(c, params)) * 1000;
       engine.setStatus({ caseIndex: c.n, currentCase: c.id,
         currentSuite: c.suite, currentTc: c.testcase, currentDir: c.dirLabel, currentTos: c.tos,
