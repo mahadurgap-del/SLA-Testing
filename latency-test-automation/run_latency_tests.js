@@ -2421,22 +2421,25 @@ async function runLatencyPairSchedule(cfg, tc, durationMs, impairedIfaces, sync)
     log(`ERROR: ${msg}`);
     throw new Error(msg);
   }
-  // The DEGRADED value (Link B / the higher class) must go on the link the flow is
-  // actually using, and the BETTER value on the alternative — otherwise the flow is
-  // already on the good path and the case cannot produce a switch.
   let gA = cfgA, gB = cfgB;
   if (tc._preImpaired && tc._preOrder) {
-    // reuse the exact ordering pre-impairment used, so we report the real wire state
-    gA = tc._preOrder.standby; gB = tc._preOrder.active;
+    // CLASS-vs-CLASS (TC3/TC4): fixed Link A / Link B assignment, already on the
+    // wire from pre-impairment. Traffic is free to sit on either link — nothing is
+    // re-targeted, we just report the state as applied.
+    gA = tc._preOrder.active; gB = tc._preOrder.standby;
+    log(`${tc.name}: class-vs-class — Link A=${gA.ports.join("+")} Link B=${gB.ports.join("+")} ` +
+        `(fixed assignment; traffic may sit on either)`);
   } else {
+    // ONE-SIDED (TC2: clean vs a class): the impaired value must land on the link
+    // the flow is using, otherwise it is already on the clean path and cannot move.
     const ord = await orderGroupsByActive(cfg, cfgA, cfgB);
-    gB = ord.active;    // degraded / progression value -> the traffic's own link
-    gA = ord.standby;   // better value -> the alternative link
-    log(`${tc.name}: degraded value targets the ACTIVE link ${gB.ports.join("+")} ` +
+    gB = ord.active;    // impaired value -> the traffic's own link
+    gA = ord.standby;   // clean -> the alternative link
+    log(`${tc.name}: impaired value targets the ACTIVE link ${gB.ports.join("+")} ` +
         `(${ord.how}${ord.swapped ? ", Link A/B swapped to follow the traffic" : ""}); ` +
-        `better value on ${gA.ports.join("+")}`);
+        `clean on ${gA.ports.join("+")}`);
   }
-  log(`${tc.name}: link groups (${source}) — better=${gA.ports.join("+")} degraded=${gB.ports.join("+")}`);
+  log(`${tc.name}: link groups (${source}) — A=${gA.ports.join("+")} B=${gB.ports.join("+")}`);
   sync.linkA = label(gA); sync.linkB = label(gB);
 
   // ---- Link A: fixed value, applied once ----
@@ -3117,22 +3120,25 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   // link is clean (TC1, TC2) keep the original order. ----
   if (tc.pairPlan && !tc.baseline && (tc.pairPlan.linkA.fixedMs || 0) > 0) {
     try {
-      const { a: cfgA, b: cfgB } = await resolveLinkGroups(cfg);
-      if (cfgA && cfgB) {
-        const aMs = tc.pairPlan.linkA.fixedMs;                     // better class
-        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;      // degraded class
-        // the degraded value goes on the link the traffic is on, so the flow has a
-        // reason to move to the better one
-        const ord = await orderGroupsByActive(cfg, cfgA, cfgB);
-        log(`${tc.name}: pre-impairing BEFORE traffic — ${bMs}ms (${tc.pairPlan.linkB.cls}) on the ACTIVE link ` +
-            `${ord.active.ports.join("+")}, ${aMs}ms (${tc.pairPlan.linkA.cls}) on ${ord.standby.ports.join("+")} (${ord.how})`);
+      const { a: gA, b: gB } = await resolveLinkGroups(cfg);
+      if (gA && gB) {
+        const aMs = tc.pairPlan.linkA.fixedMs;                     // e.g. LEO for TC3
+        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;      // e.g. MEO for TC3
+        // CLASS-vs-CLASS: each link simply gets its own class value on a fixed
+        // Link A / Link B assignment. There is no "degrade the active link" here —
+        // the whole point is to observe WHICH class DMTS prefers, and traffic is
+        // free to sit on either link. No active-link detection, no swapping.
+        log(`${tc.name}: pre-impairing BEFORE traffic — Link A ${gA.ports.join("+")} = ${aMs}ms ` +
+            `(${tc.pairPlan.linkA.cls}), Link B ${gB.ports.join("+")} = ${bMs}ms (${tc.pairPlan.linkB.cls}); ` +
+            `traffic may settle on either link`);
         setStatus({ stage: "Applying Impairment", operation: "Pre-impairing both links before traffic starts" });
-        if (bMs > 0) await applyToLink(cfg, ord.active.ports, { delayMs: bMs }, impairedIfaces);
-        if (aMs > 0) await applyToLink(cfg, ord.standby.ports, { delayMs: aMs }, impairedIfaces);
+        if (aMs > 0) await applyToLink(cfg, gA.ports, { delayMs: aMs }, impairedIfaces);
+        if (bMs > 0) await applyToLink(cfg, gB.ports, { delayMs: bMs }, impairedIfaces);
         checkpoint(true, `${tc.name} pre-impairment applied`,
-          `${bMs}ms on active ${ord.active.ports.join("+")}, ${aMs}ms on ${ord.standby.ports.join("+")}`);
+          `Link A ${aMs}ms (${tc.pairPlan.linkA.cls}) on ${gA.ports.join("+")}, ` +
+          `Link B ${bMs}ms (${tc.pairPlan.linkB.cls}) on ${gB.ports.join("+")}`);
         tc._preImpaired = true;
-        tc._preOrder = ord;   // the schedule reports this exact wire state
+        tc._preOrder = { active: gA, standby: gB, swapped: false, how: "fixed Link A/B (class-vs-class)" };
         await sleep(3000);    // let the qdiscs settle before the flow is placed
       }
     } catch (e) {
@@ -3224,35 +3230,22 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     log(`${tc.name}: traffic validation passed (${tv.checks.length} checks)`);
   }
 
-  // ---- CORRECT the pre-impairment assignment now that traffic exists ----
-  // TC3/TC4 apply latency BEFORE traffic starts, so at that moment the active link
-  // can only be guessed. With the flow now running, netem counters show where it
-  // really landed: if the DEGRADED value ended up on the idle link, swap the two
-  // values so the degraded one sits on the traffic's own link (otherwise the flow
-  // is already on the better path and no switch can occur).
+  // ---- CLASS-vs-CLASS: record which link the traffic settled on ----
+  // TC3/TC4 leave both links impaired with their class values and let DMTS choose.
+  // Nothing is re-applied or swapped; we only observe and report the placement, so
+  // the result shows whether the traffic prefers the better class.
   if (tc._preImpaired && tc._preOrder) {
     try {
-      // netem counters only — same rule as the initial assignment
-      const re = await orderGroupsByActive(cfg, tc._preOrder.active, tc._preOrder.standby);
-      const det = re.active;
+      const obs = await orderGroupsByActive(cfg, tc._preOrder.active, tc._preOrder.standby);
       const key = (g) => (g.ports || []).join("+");
-      if (key(det) && key(det) === key(tc._preOrder.standby)) {
-        const aMs = tc.pairPlan.linkA.fixedMs;                  // better value
-        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;   // degraded value
-        log(`${tc.name}: traffic landed on ${key(det)} which holds the BETTER value — ` +
-            `swapping so ${bMs}ms sits on the traffic's link`);
-        if (bMs > 0) await applyToLink(cfg, tc._preOrder.standby.ports, { delayMs: bMs }, impairedIfaces);
-        if (aMs > 0) await applyToLink(cfg, tc._preOrder.active.ports, { delayMs: aMs }, impairedIfaces);
-        else await clearLink(cfg, tc._preOrder.active.ports);
-        tc._preOrder = { active: tc._preOrder.standby, standby: tc._preOrder.active,
-                         swapped: true, how: "corrected after traffic started" };
-        checkpoint(true, `${tc.name} impairment re-targeted`,
-          `${bMs}ms now on the active link ${key(det)}`);
-      } else {
-        log(`${tc.name}: pre-impairment already correct — degraded value is on the traffic's link`);
-      }
+      const onA = key(obs.active) === key(tc._preOrder.active);
+      const cls = onA ? tc.pairPlan.linkA.cls : tc.pairPlan.linkB.cls;
+      const ms = onA ? tc.pairPlan.linkA.fixedMs : ((tc.pairPlan.linkB.steps || [0])[0] || 0);
+      result.trafficSettledOn = { ports: key(obs.active), cls, delayMs: ms };
+      log(`${tc.name}: traffic settled on ${key(obs.active)} = ${ms}ms (${cls}) — ${obs.how}`);
+      setStatus({ operation: `Traffic on ${key(obs.active)} (${String(cls).toUpperCase()} ${ms} ms) — monitoring` });
     } catch (e) {
-      log(`WARN: ${tc.name}: could not re-check the pre-impairment target (${e.message})`);
+      log(`WARN: ${tc.name}: could not observe which link the traffic settled on (${e.message})`);
     }
   }
 
