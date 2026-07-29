@@ -2362,8 +2362,13 @@ async function runLatencyPairSchedule(cfg, tc, durationMs, impairedIfaces, sync)
   sync.linkA = label(gA); sync.linkB = label(gB);
 
   // ---- Link A: fixed value, applied once ----
+  // Skipped when it was already applied BEFORE traffic started (pre-impairment,
+  // used for the class-vs-class cases so the flow is placed on an already-
+  // impaired grid rather than reacting after the fact).
   const aMs = plan.linkA.fixedMs || 0;
-  if (aMs > 0) {
+  if (tc._preImpaired) {
+    note(label(gA), `fixed delay ${aMs}ms (${plan.linkA.cls}) — applied before traffic started`);
+  } else if (aMs > 0) {
     await applyToLink(cfg, gA.ports, { delayMs: aMs }, impairedIfaces);
     note(label(gA), `fixed delay ${aMs}ms (${plan.linkA.cls})`);
   } else {
@@ -2375,6 +2380,15 @@ async function runLatencyPairSchedule(cfg, tc, durationMs, impairedIfaces, sync)
   setStatus({ currentLinkA: `${String(plan.linkA.cls).toUpperCase()} ${aMs} ms`, progressionTotal: steps.length });
   for (let i = 0; i < steps.length && Date.now() < deadline && !isAborted() && !sync.switched; i++) {
     const v = steps[i];
+    // first value already on the wire from pre-impairment — report, do not re-apply
+    if (i === 0 && tc._preImpaired) {
+      note(label(gB), `delay ${v}ms (${plan.linkB.cls} 1/${steps.length}) — applied before traffic started`);
+      sync.currentMs = v;
+      setStatus({ currentLinkB: `${String(plan.linkB.cls).toUpperCase()} ${v} ms`, progressionStep: 1,
+        operation: `Link B at ${v} ms (pre-impaired) — monitoring` });
+      if (steps.length > 1 && !(await sleepWithin(deadline, plan.intervalSec * 1000, () => sync.switched))) break;
+      continue;
+    }
     try {
       if (v > 0) {
         await applyToLink(cfg, gB.ports, { delayMs: v }, impairedIfaces);
@@ -3013,6 +3027,37 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
     }
   };
 
+  // Declared before pre-impairment so both it and the schedule track the same
+  // set of impaired interfaces (the teardown clears everything in here).
+  const impairedIfaces = new Set();
+
+  // ---- PRE-IMPAIRMENT: class-vs-class latency cases (both links carry a real
+  // value, e.g. TC3 LEO-vs-MEO and TC4 MEO-vs-GEO) put the latency on the wire
+  // BEFORE traffic starts. DMTS then places the flow on an already-impaired grid
+  // and picks the better link from the outset, instead of settling on a clean
+  // link and only reacting once impairment appears mid-flight. Cases where one
+  // link is clean (TC1, TC2) keep the original order. ----
+  if (tc.pairPlan && !tc.baseline && (tc.pairPlan.linkA.fixedMs || 0) > 0) {
+    try {
+      const { a: gA, b: gB } = await resolveLinkGroups(cfg);
+      if (gA && gB) {
+        const aMs = tc.pairPlan.linkA.fixedMs;
+        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;
+        log(`${tc.name}: pre-impairing BEFORE traffic — Link A ${aMs}ms (${tc.pairPlan.linkA.cls}) / ` +
+            `Link B ${bMs}ms (${tc.pairPlan.linkB.cls})`);
+        setStatus({ stage: "Applying Impairment", operation: `Pre-impairing both links before traffic starts` });
+        if (aMs > 0) await applyToLink(cfg, gA.ports, { delayMs: aMs }, impairedIfaces);
+        if (bMs > 0) await applyToLink(cfg, gB.ports, { delayMs: bMs }, impairedIfaces);
+        checkpoint(true, `${tc.name} pre-impairment applied`,
+          `Link A ${aMs}ms on ${gA.ports.join("+")}, Link B ${bMs}ms on ${gB.ports.join("+")}`);
+        tc._preImpaired = true;
+        await sleep(3000); // let the qdiscs settle before the flow is placed
+      }
+    } catch (e) {
+      log(`WARN: ${tc.name}: pre-impairment failed (${e.message}) — the schedule will apply it after traffic starts`);
+    }
+  }
+
   await startTraffic();
 
   try {
@@ -3091,19 +3136,16 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
       err.caseResult = result;
       throw err;
     }
-    for (const w of (tv.warnings || [])) {
-      log(`WARN: ${tc.name}: ${w.name} — ${w.detail} (informational; run continues)`);
-      result.errors.push(`warning: ${w.name} — ${w.detail}`);
-    }
-    log(`${tc.name}: traffic validation passed (${tv.checks.length} checks` +
-        `${(tv.warnings || []).length ? `, ${tv.warnings.length} warning(s)` : ""})`);
+    // Non-fatal items are logged only — not pushed into result.errors, so they
+    // do not clutter the case report or the UI.
+    for (const w of (tv.warnings || [])) log(`note: ${tc.name}: ${w.name} — ${w.detail}`);
+    log(`${tc.name}: traffic validation passed (${tv.checks.length} checks)`);
   }
 
   await stageGate(cfg, `${tc.name}: traffic validated`);
   setStatus({ stage: "Monitoring", operation: "Traffic verified — monitoring DMTS for a link switch",
     switchObserved: false, stabilizeUntil: null, switchFrom: null, switchTo: null });
 
-  const impairedIfaces = new Set();
   // latency ramp (TC2-4 via tc) runs CONCURRENTLY with the monitor so a
   // detected switch stops the ramp; shared via `sync`
   // satellite-class transition (explicit per-link values, no active/standby
