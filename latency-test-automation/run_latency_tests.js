@@ -1147,12 +1147,29 @@ async function verifyTrafficFlowing(cfg, sshHandles = null, { attempts = 4, samp
       }
     }
     const c2 = sshHandles ? await checkTrafficClient(cfg, sshHandles) : null;
+    // Distinguish "no traffic at all" from "traffic exists, but on a link that is
+    // not configured as Link A / Link B" — the latter is a configuration mismatch,
+    // not a traffic failure, and needs a completely different fix.
+    const last = await netemCandidatePps(cfg, 3);
+    const busy = last.busiest;
+    const configured = (cfg.netemCandidates || []).join(",") || "(none)";
+    if (busy && busy.pps >= effMinPps && !(cfg.netemCandidates || []).includes(busy.ports?.[0])) {
+      checkpoint(false, "Traffic on a non-configured link",
+        `${busy.pps} pps on ${busy.bridge} (${(busy.ports || []).join("+")}) — not in Link A/Link B`);
+      throw new Error(
+        `traffic IS flowing (${busy.pps} pps on ${busy.bridge} = ${(busy.ports || []).join("+")}), ` +
+        `but that link is NOT configured as Link A or Link B (you configured: ${configured}). ` +
+        `Impairment would be applied to links the traffic never uses, so no switch could occur. ` +
+        `Set Link A / Link B to the links this traffic class actually uses — one of them must be ` +
+        `${(busy.ports || []).join(",")}.`);
+    }
     checkpoint(false, "Traffic verified",
       `below ${effMinPps} pps on ${scope} after ${attempts} checks`);
     throw new Error(
       `traffic is NOT crossing the netem links (below ${effMinPps} pps on ` +
-      `${scope} after ${attempts} checks). Check the traffic ` +
-      `destination is the server's DATA-plane IP, not its mgmt IP.` +
+      `${scope} after ${attempts} checks` +
+      (busy && busy.pps > 0 ? `; busiest link overall is ${busy.bridge} at ${busy.pps} pps` : "") +
+      `). Check the traffic destination is the server's DATA-plane IP, not its mgmt IP.` +
       (c2?.tail ? ` Client output: ${c2.tail}` : ""));
   }
 
@@ -1356,7 +1373,16 @@ async function netemCandidatePps(cfg, sampleSeconds = 5) {
     // measure the busiest LINK (bridge) — same model as detection
     const groups = rankLinkGroups(delta, masters, cfg.netemCandidates, cfg.netemExclude);
     const top = groups[0];
-    return top ? { iface: top.bridge, pps: top.pps } : { iface: null, pps: 0 };
+    // ALSO scan every bridge, ignoring the configured candidate filter. Traffic
+    // can legitimately ride a link the operator has not listed as Link A/B, and
+    // then the scoped result reads 0 while the flow is plainly running. Reporting
+    // the unscoped busiest link turns a misleading "no traffic" into an
+    // actionable "traffic is on <bridge>, which is not your Link A/B".
+    const allGroups = rankLinkGroups(delta, masters, [], cfg.netemExclude);
+    const busiest = allGroups[0] || null;
+    return top
+      ? { iface: top.bridge, pps: top.pps, busiest }
+      : { iface: null, pps: 0, busiest };
   } finally {
     conn.end();
   }
