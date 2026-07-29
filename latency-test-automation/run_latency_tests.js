@@ -2316,6 +2316,28 @@ async function validateRegressionPreflight(cfg, { onStep = () => {} } = {}) {
  * bridges on the netem VM, in a DETERMINISTIC order (sorted by bridge name).
  * Nothing here depends on which link currently carries traffic.
  */
+/**
+ * Order the two configured link groups so the FIRST one returned is the link the
+ * traffic is currently using. A latency comparison only tests anything if the
+ * WORSE value lands on the link the flow is on — impairing the idle link leaves
+ * the flow on an already-better path and nothing can happen. Falls back to the
+ * configured order when the active link cannot be determined.
+ * @returns {{active, standby, swapped:boolean, how:string}}
+ */
+async function orderGroupsByActive(cfg, gA, gB) {
+  try {
+    const det = await impairTargetPorts(cfg);      // DMTS class link, else busiest pps
+    const key = (g) => (g.ports || []).join("+");
+    if (key(det) === key(gB)) return { active: gB, standby: gA, swapped: true, how: det.source || "detected" };
+    if (key(det) === key(gA)) return { active: gA, standby: gB, swapped: false, how: det.source || "detected" };
+    log(`WARN: traffic link ${det.bridge} (${key(det)}) is neither Link A nor Link B — ` +
+        `latency will be applied to the configured groups as-is`);
+  } catch (e) {
+    log(`WARN: could not determine the active link (${e.message}) — using the configured order`);
+  }
+  return { active: gA, standby: gB, swapped: false, how: "configured order" };
+}
+
 async function resolveLinkGroups(cfg) {
   if (cfg.linkA && cfg.linkA.length && cfg.linkB && cfg.linkB.length) {
     return {
@@ -2352,13 +2374,28 @@ async function runLatencyPairSchedule(cfg, tc, durationMs, impairedIfaces, sync)
   };
   const label = (g) => `${g.bridge} (${g.ports.join("+")})`;
 
-  const { a: gA, b: gB, source } = await resolveLinkGroups(cfg);
-  if (!gA || !gB) {
+  const { a: cfgA, b: cfgB, source } = await resolveLinkGroups(cfg);
+  if (!cfgA || !cfgB) {
     const msg = `${tc.name}: need TWO link groups for a latency comparison — configure Link A and Link B interfaces`;
     log(`ERROR: ${msg}`);
     throw new Error(msg);
   }
-  log(`${tc.name}: link groups (${source}) — A=${gA.ports.join("+")} B=${gB.ports.join("+")}`);
+  // The DEGRADED value (Link B / the higher class) must go on the link the flow is
+  // actually using, and the BETTER value on the alternative — otherwise the flow is
+  // already on the good path and the case cannot produce a switch.
+  let gA = cfgA, gB = cfgB;
+  if (tc._preImpaired && tc._preOrder) {
+    // reuse the exact ordering pre-impairment used, so we report the real wire state
+    gA = tc._preOrder.standby; gB = tc._preOrder.active;
+  } else {
+    const ord = await orderGroupsByActive(cfg, cfgA, cfgB);
+    gB = ord.active;    // degraded / progression value -> the traffic's own link
+    gA = ord.standby;   // better value -> the alternative link
+    log(`${tc.name}: degraded value targets the ACTIVE link ${gB.ports.join("+")} ` +
+        `(${ord.how}${ord.swapped ? ", Link A/B swapped to follow the traffic" : ""}); ` +
+        `better value on ${gA.ports.join("+")}`);
+  }
+  log(`${tc.name}: link groups (${source}) — better=${gA.ports.join("+")} degraded=${gB.ports.join("+")}`);
   sync.linkA = label(gA); sync.linkB = label(gB);
 
   // ---- Link A: fixed value, applied once ----
@@ -3039,19 +3076,23 @@ async function runTestCase(cfg, browser, page, tc, traffic, baseDir, durationMs)
   // link is clean (TC1, TC2) keep the original order. ----
   if (tc.pairPlan && !tc.baseline && (tc.pairPlan.linkA.fixedMs || 0) > 0) {
     try {
-      const { a: gA, b: gB } = await resolveLinkGroups(cfg);
-      if (gA && gB) {
-        const aMs = tc.pairPlan.linkA.fixedMs;
-        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;
-        log(`${tc.name}: pre-impairing BEFORE traffic — Link A ${aMs}ms (${tc.pairPlan.linkA.cls}) / ` +
-            `Link B ${bMs}ms (${tc.pairPlan.linkB.cls})`);
-        setStatus({ stage: "Applying Impairment", operation: `Pre-impairing both links before traffic starts` });
-        if (aMs > 0) await applyToLink(cfg, gA.ports, { delayMs: aMs }, impairedIfaces);
-        if (bMs > 0) await applyToLink(cfg, gB.ports, { delayMs: bMs }, impairedIfaces);
+      const { a: cfgA, b: cfgB } = await resolveLinkGroups(cfg);
+      if (cfgA && cfgB) {
+        const aMs = tc.pairPlan.linkA.fixedMs;                     // better class
+        const bMs = (tc.pairPlan.linkB.steps || [0])[0] || 0;      // degraded class
+        // the degraded value goes on the link the traffic is on, so the flow has a
+        // reason to move to the better one
+        const ord = await orderGroupsByActive(cfg, cfgA, cfgB);
+        log(`${tc.name}: pre-impairing BEFORE traffic — ${bMs}ms (${tc.pairPlan.linkB.cls}) on the ACTIVE link ` +
+            `${ord.active.ports.join("+")}, ${aMs}ms (${tc.pairPlan.linkA.cls}) on ${ord.standby.ports.join("+")} (${ord.how})`);
+        setStatus({ stage: "Applying Impairment", operation: "Pre-impairing both links before traffic starts" });
+        if (bMs > 0) await applyToLink(cfg, ord.active.ports, { delayMs: bMs }, impairedIfaces);
+        if (aMs > 0) await applyToLink(cfg, ord.standby.ports, { delayMs: aMs }, impairedIfaces);
         checkpoint(true, `${tc.name} pre-impairment applied`,
-          `Link A ${aMs}ms on ${gA.ports.join("+")}, Link B ${bMs}ms on ${gB.ports.join("+")}`);
+          `${bMs}ms on active ${ord.active.ports.join("+")}, ${aMs}ms on ${ord.standby.ports.join("+")}`);
         tc._preImpaired = true;
-        await sleep(3000); // let the qdiscs settle before the flow is placed
+        tc._preOrder = ord;   // the schedule reports this exact wire state
+        await sleep(3000);    // let the qdiscs settle before the flow is placed
       }
     } catch (e) {
       log(`WARN: ${tc.name}: pre-impairment failed (${e.message}) — the schedule will apply it after traffic starts`);
@@ -4163,7 +4204,7 @@ module.exports = {
   startTrafficViaSsh, stopTrafficViaSsh, verifyTrafficFlowing,
   // netem impairment + dynamic packet loss
   parsePacketCounters, detectActiveLink, applyNetemImpairment, clearNetemImpairment,
-  resetLabBetweenCases, resolveLinkGroups, plTargetPorts, validateRegressionPreflight, validateTrafficFlowing, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
+  resetLabBetweenCases, resolveLinkGroups, orderGroupsByActive, plTargetPorts, validateRegressionPreflight, validateTrafficFlowing, waitForHourlogCoverage, getHourlogRecordTime, newestHourlogRecordTimeMs,
   parseDmtsTime, lastCompleteRecord, activeTcs, readTcActiveLink, calibrateNetemLinkMap,
   collectHourlogSnapshot, collectDayLog,
   parseNetemIfaces, sanitizeNetem, rankLinkGroups, applyToLink, clearLink,
