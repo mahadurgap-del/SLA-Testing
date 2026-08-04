@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testbed Troubleshooter — L2 / L3 fault isolation</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%F0%9F%94%8D%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <h1>Testbed Troubleshooter</h1>
+  <p>Finds out whether the hub&ndash;spoke testbed is broken at layer&nbsp;2 (portgroup / VLAN / MAC) or
+     layer&nbsp;3 (routing), and says exactly where. Read-only: it reads ESXi and the guests and sends
+     ARP/ICMP probes &mdash; it changes nothing.</p>
+</header>
+
+<nav class="steps">
+  <button class="stepbtn on" data-goto="1"><b>1</b> ESXi host</button>
+  <button class="stepbtn" data-goto="2" disabled><b>2</b> Testbed nodes</button>
+  <button class="stepbtn" data-goto="3" disabled><b>3</b> Diagnose</button>
+</nav>
+
+<!-- ------------------------------------------------------------ step 1 -->
+<section class="step on" id="step1">
+  <fieldset>
+    <legend>ESXi host</legend>
+    <p class="hint">The host that runs the testbed VMs. SSH must be enabled
+      (Host &rarr; Actions &rarr; Services &rarr; Enable Secure Shell). Used to read vSwitches,
+      portgroups, VLAN IDs and vNIC MACs &mdash; that is what makes an L2 verdict possible.</p>
+    <div class="grid4">
+      <div><label>ESXi IP / hostname</label><input id="esxiHost" placeholder="172.16.226.10"><div class="err"></div></div>
+      <div><label>Username</label><input id="esxiUser" value="root"><div class="err"></div></div>
+      <div><label>Password</label><input id="esxiPass" type="password" placeholder="—"><div class="err"></div></div>
+      <div><label>or private key path</label><input id="esxiKey" placeholder="/home/user/.ssh/id_rsa"><div class="err"></div></div>
+    </div>
+    <div class="row">
+      <button id="esxiConnect">Connect &amp; read host</button>
+      <button id="esxiSkip" class="grey">Skip &mdash; guest-only checks</button>
+      <span id="esxiMsg" class="msg"></span>
+    </div>
+  </fieldset>
+
+  <div id="esxiPanel" class="panel hidden">
+    <h2>Virtual networking on <span id="esxiTitle"></span></h2>
+    <div id="esxiSummary" class="mono"></div>
+    <table id="esxiTable"></table>
+    <div class="row"><button id="toStep2">Next: testbed nodes &rarr;</button></div>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------ step 2 -->
+<section class="step" id="step2">
+  <fieldset>
+    <legend>Saved configuration</legend>
+    <div class="grid4">
+      <div><label>Profile</label><select id="profSel"><option value="">&mdash; select &mdash;</option></select></div>
+      <div><label>&nbsp;</label><button class="small grey" id="profLoad">Load</button></div>
+      <div><label>&nbsp;</label><button class="small grey" id="profSave">Save as&hellip;</button></div>
+      <div><label>&nbsp;</label><button class="small grey" id="profDel">Delete</button></div>
+    </div>
+    <div class="err" id="profErr"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Testbed nodes &mdash; client &rarr; spoke &rarr; netem &rarr; hub &rarr; server</legend>
+    <p class="hint">Management IP is what this tool SSHes into. The <b>data-plane IP</b> is the address the
+      test traffic actually uses; leave it blank and the tool picks the non-management address it finds.
+      VM name lets it tie a guest interface to its ESXi vNIC even when the guest rewrites its MAC.</p>
+    <div id="nodeCards" class="nodegrid"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Probe options</legend>
+    <div class="grid4">
+      <div><label>Traceroute max hops</label><input id="optHops" value="12"></div>
+      <div><label>MTU probe size (bytes)</label><input id="optMtu" value="1500"></div>
+      <div><label>&nbsp;</label><label class="inline"><input type="checkbox" id="optActive" checked>
+        Send ARP / ICMP probes</label></div>
+      <div><label>&nbsp;</label><span class="hint">Uncheck for a configuration-only review.</span></div>
+    </div>
+  </fieldset>
+
+  <div class="err" id="globalErr"></div>
+  <div class="row">
+    <button class="grey" data-goto="1">&larr; Back</button>
+    <button id="runBtn">Run diagnosis</button>
+  </div>
+</section>
+
+<!-- ------------------------------------------------------------ step 3 -->
+<section class="step" id="step3">
+  <div id="verdict" class="verdict idle">
+    <span id="verdictText">Waiting&hellip;</span>
+    <span class="sub" id="verdictSummary"></span>
+  </div>
+
+  <div class="panel">
+    <h2>Path</h2>
+    <div id="pathView" class="path">&mdash;</div>
+    <div class="stat">
+      <b>Phase</b><span id="sPhase">idle</span>
+      <b>Step</b><span id="sStep">&mdash;</span>
+      <b>Test flow</b><span id="sFlow">&mdash;</span>
+      <b>Report</b><span id="sReport">&mdash;</span>
+    </div>
+  </div>
+
+  <div class="panel" id="findingsPanel">
+    <h2>Findings <span id="findCount" class="mut"></span></h2>
+    <div id="findings">Nothing yet.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Segments</h2>
+    <div class="scroll"><table id="segTable"><tr><td class="mut">Nothing yet.</td></tr></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>Nodes as discovered</h2>
+    <div class="scroll"><table id="nodeTable"><tr><td class="mut">Nothing yet.</td></tr></table></div>
+  </div>
+
+  <div class="row">
+    <button class="grey" data-goto="2">&larr; Change inputs</button>
+    <button id="rerunBtn">Run again</button>
+    <button id="abortBtn" class="red" disabled>Stop</button>
+    <a id="reportLink" class="btnlink hidden" href="/report" target="_blank">Open full report</a>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</section>
+
+<datalist id="vmlist"></datalist>
+<script src="/app.js"></script>
+</body>
+</html>
