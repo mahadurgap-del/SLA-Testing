@@ -38,4 +38,4 @@ Both tools log every step and never modify Confluence pages other than the confi
 
 L2/L3 fault isolation for the same testbed — portgroup / VLAN / MAC mismatches versus
 missing routes — lives in its own repository:
-[`testbed-troubleshooter`](https://github.com/mahadurgap-del/testbed-troubleshooter).
+[`Testbed-Troubleshoot`](https://github.com/mahadurgap-del/Testbed-Troubleshoot).
