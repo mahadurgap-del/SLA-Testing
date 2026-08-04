@@ -6,12 +6,6 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["latency-test-automation/ui_server.js"],
       "port": 8790
-    },
-    {
-      "name": "testbed-troubleshooter",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["testbed-troubleshooter/server.js"],
-      "port": 8791
     }
   ]
 }

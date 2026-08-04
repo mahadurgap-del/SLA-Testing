@@ -1,7 +1,0 @@
-node_modules/
-package-lock.json
-profiles.json
-reports/
-*.log
-testbed*.json
-!package.json
